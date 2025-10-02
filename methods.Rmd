@@ -26,6 +26,7 @@ While this fusion of forecast and new data is an incredibly powerful concept, as
 
 ```{r enkf, echo=FALSE, fig.cap="Example assimilation of a disturbance event shows that conventional assimilation approaches, such as EnKF, take time to converge to new states after disturbance (orange). By modeling the probability of disturbance (black) our Multinomial assimilation (blue) can correctly jump between states during disturbance events (e.g. P(disturbance) = 0.977 at time 10) while remaining resilient to potential false-positive events (e.g. time 12 and 15)."}
 SSSD_figure <- function(){
+  print(getwd())
   load("SSSD.RData")      ## simulation from SingleSite_SingleDisturbance.Rmd
 #  layout(matrix(c(1,1,1,2),nrow=4,ncol=1))
   plot(data$Y,ylim = range(rbind(CI.fN,data$Y)),xlim=xlim,type='n',

@@ -21,19 +21,23 @@ set.seed(42)
 ```{r}
 source("multi.ens.adj.R")
 
+## set values of state less than zero to be 0 
 tobit <- function(x){
   x[x < 0] <- 0
   x
 }
 
-disturbance <- function(x){ ## x = Bleaf, Bsoil, Bstem
+## parameters: x = (Cleaf, Csoil, Cstem) biomass amounts
+## returns: x with disturbance applied. Subtract from all values, with the soil 
+##          preserving some of the removed biomass
+disturbance <- function(x){ ## x = (Cleaf, Csoil, Cstem)
   old.biomass <- x[c(1,3)]
   new.biomass <- tobit(mvtnorm::rmvnorm(1,mu0,V0)) ## draw disturbed leaf and stem
   check.max <- which(new.biomass > old.biomass)
   if(length(check.max)>0) new.biomass[check.max] = old.biomass[check.max]
   residual = sum(old.biomass-new.biomass)
   x[c(1,3)] <- new.biomass
-  x[2] <- x[2] + residual*alloc.soil
+  x[2] <- x[2] + residual*alloc.soil ## soil gets some biomass
   removal <- residual*(1-alloc.soil)
   return(x)
 }
@@ -43,11 +47,11 @@ disturbance <- function(x){ ## x = Bleaf, Bsoil, Bstem
 ## drivers
 
 ```{r}
-NT = 25
-nt = 365*NT
-time = 1:nt
+NT = 25 # 25 year burn-in
+nt = 365*NT # final timestep
+time = 1:nt 
 nd   = 31 ## number of driver ensembles
-PAR <- matrix(NA,nd,nt)
+PAR <- matrix(NA,nd,nt) # [nd = number of drivers x nt = total number of days], PAR = Photosynthetic active radiation
 for(i in 1:nd){
   PAR[i,] <- VSEMcreatePAR(time)  
 }
@@ -57,14 +61,15 @@ plot(PAR[1,], main = "PAR (driving the model)", xlab = "Day",cex=0.35)
 ## Parameters
 
 ```{r}
-refPars <- VSEMgetDefaults()
+refPars <- VSEMgetDefaults() # VSEM reference params
+print(refPars)
 refPars$lower[9:11] = 1
 np = 50
 sigmaP = diag((refPars$upper - refPars$lower)/10)^2 ## assume range is +/- 5 SD
-Theta <- as.data.frame(mvtnorm::rmvnorm(np,refPars$best,sigmaP))
+Theta <- as.data.frame(mvtnorm::rmvnorm(np,refPars$best,sigmaP)) # Theta = [50 (# param samples) x 11 (# state variables)], param samples of \theta (reference parameters with added noise)
 colnames(Theta) <- rownames(refPars)
 par(mfrow=c(3,4))
-for(i in 1:11){
+for(i in 1:11){ # fix theta values within lower and upper bounds of the ref pars
   Theta[Theta[,i] < refPars$lower[i] , i] <- refPars$lower[i]
   Theta[Theta[,i] > refPars$upper[i] , i] <- refPars$upper[i]
   hist(Theta[,i],main=colnames(Theta)[i])
@@ -75,12 +80,16 @@ for(i in 1:11){
 
 ```{r}
 ## spin up
-ne = 200
-met = sample.int(nd,ne,replace=TRUE)
-par = sample.int(np,ne,replace=TRUE)
-Na <- matrix(NA,ne,3)
+ne = 200. # number of ensemble members
+met = sample.int(nd,ne,replace=TRUE)  # [1 x ne = number of ensemble members] met / forcing / driver data index for each ensemble member
+par = sample.int(np,ne,replace=TRUE)  # [1 x ne] parameter indices for each ensemble member
+Na <- matrix(NA,ne,3) # [ne x 3 = (Cleaf, Csoil, Cstem)]
+vsem_state_indices <- 2:4 # indices of Cv, Cs, Cr values in VSEM outputs
 for(i in 1:ne){
-  Na[i,] = VSEM(as.numeric(Theta[par[i],]),PAR = PAR[met[i],])[nt,2:4]
+  # Run VSEM with paramter indices / met data
+  # get Cleaf/Csoil/Cstem values at final timestep (after 25 years)
+  # store in Na
+  Na[i,] = VSEM(as.numeric(Theta[par[i],]),PAR = PAR[met[i],])[nt,vsem_state_indices] 
 }
 Na.orig = Na
 Nmu = NmuK = NfK = Nf = Na*NA
@@ -96,7 +105,7 @@ hist(Na[,3],main="Cstem")
 ## hard coded 
 Q = diag(c(0.1,0.1,0.1)) ## process error
 R = diag(c(.25,10,1))      ## observation error
-THETA <- as.matrix(Theta[par,]) ## ensemble parameters
+THETA <- as.matrix(Theta[par,]) ## initial ensemble parameters [J, P]
 mu0 <- c(1,1)            ## mean leaf & stem biomass after disturbance
 V0  <- diag(c(0.15,0.25))^2## var in post disturbance leaf and stem biomass
 alloc.soil = 0.25        ## fraction of removed C that goes in the soil
@@ -118,15 +127,15 @@ refpar = as.numeric(Theta[par[true],]) ## grab the "true" parameters
 refpar[9:11] = Na[true,]               ## set initial biomass pools
 for(t in 1:NT){
   tsel <- (t-1)*365 + 1:365            ## select 1 yr of met  
-  ref.mu = VSEM(refpar,PAR[met[true],tsel])[365,2:4]    ## forward simulation
+  ref.mu = VSEM(refpar,PAR[met[true],tsel])[365,vsem_state_indices]    ## forward simulation
   ref.f  = mvtnorm::rmvnorm(1,ref.mu,Q)## process error
   if(D.true[t]){
     ref.f = disturbance(ref.f)
   }
   ref.f = tobit(ref.f)
   refpar[9:11] = ref.f                 ## update IC for next iteration
-  Ntrue[t,] = ref.f
-  No[t,] = tobit(mvtnorm::rmvnorm(1,ref.f,R)) ## observation error
+  Ntrue[t,] = ref.f ## store true observation
+  No[t,] = tobit(mvtnorm::rmvnorm(1,ref.f,R)) ## store observation with error
 }
 par(mfrow=c(3,1))
 plot(No[,1])
@@ -134,7 +143,8 @@ plot(No[,2])
 plot(No[,3])
 ```
 
-```{r,echo=FALSE,results='hide',message=FALSE}
+```{r echo=FALSE, message=FALSE, results='hide'}
+
 AnalysisSSSDMP <- "  ## SingleSite SingleDisturbance MultiPool
 model{
   ## prior
@@ -153,47 +163,47 @@ for(t in 1:NT){
   tsel <- (t-1)*365 + 1:365               ## Select days from driver files
   
   ## update IC
-  THETA[,9:11]  <- Na    ## Multinomial
-  THETAK[,9:11] <- NaK  ## EnKF w/ disturbance
+  THETA[,9:11]  <- Na    ## Multinomial [ne x 3 = num state variables]
+  THETAK[,9:11] <- NaK  ## EnKF w/ disturbance [ne x 3 = num state variables]
   
   ## Forecast 
   for(i in 1:ne){
     fx       = VSEM(THETA[i,], PAR = PAR[met[i],tsel]) ## deterministic simulation
-    Nmu[i,]  =  fx[365,2:4]                         ## state variables at time of assim
+    Nmu[i,]  =  fx[365,vsem_state_indices]                         ## state variables at time of assim
     fxK      = VSEM(THETAK[i,],PAR = PAR[met[i],tsel]) ## deterministic simulation
-    NmuK[i,] = fxK[365,2:4] ## deterministic simulation
+    NmuK[i,] = fxK[365,vsem_state_indices] ## deterministic simulation
     epsilon  = mvtnorm::rmvnorm(1,rep(0,3),Q)                   ## process error  ** shared between versions **
     Nf[i,]   = Nmu[i,]  + epsilon
     NfK[i,]  = NmuK[i,] + epsilon
   }
   
   ## Disturbance
-  d.prior <- rbinom(ne,1,p.dist)             ## prior on disturbance status
+  d.prior <- rbinom(ne,1,p.dist)             ## (1 x ne) prior on disturbance status, 0=no disturbance, 1=disturbance
   sel <- !as.logical(d.prior)                ## select undisturbed ensemble members
   if(sum(!sel)>2){
-    sel.dist = which(!sel)
-    for(j in sel.dist){                      ## run disturbance model
+    sel.dist = which(!sel) # find indices of disturbed ensemble members
+    for(j in sel.dist){                      ## run disturbance model, update disturbed ensemble states
       Nf[j,]  = disturbance(Nf[j,])
       NfK[j,] = disturbance(NfK[j,])
     }
     mufD  = colMeans(Nf[!sel,])
-    pfD = solve(diag(c(0.15,0.5,0.25)^2)) #try(solve(var(Nf[!sel,])))
+    pfD = solve(diag(c(0.15,0.5,0.25)^2)) #try(solve(var(Nf[!sel,]))) # invert this diagonal matrix
   } 
-  if(sum(!sel) <= 2 || class(pfD) == "try-error") {   ## backup values if the ensemble stats fail
-      mufD = c(mu0[1], mean(Nf[,2]),  mu0[2])            
-      pfD  = solve(diag(c(0.15,0.5,0.25)^2))
-  }
+  # if(sum(!sel) <= 2 || class(pfD) == "try-error") {   ## backup values if the ensemble stats fail
+      # mufD = c(mu0[1], mean(Nf[,2]),  mu0[2])            
+      # pfD  = solve(diag(c(0.15,0.5,0.25)^2))
+  # }
   Nf <- tobit(Nf)
   
   ## EnKF forecast stats
   NfK <- tobit(NfK)
   mufK = colMeans(NfK)
   PfK  = var(NfK)
-  pfK  = solve(PfK)             ## Not disturbed forecast precision
+  pfK  = solve(PfK)             ## Not disturbed forecast precision (inverse of covariance PfK)
   Forecast.KD[[t]] <- list(d.prior=d.prior,Nf=NfK,muf=mufK,pf=pfK)
 
   ## priors
-  priors <- list(p    = mean(d.prior),         ## disturbance rate
+  priors <- list(p    = mean(d.prior),         ## disturbance rate (approximation of p.dist)
                  mufN = colMeans(Nf[sel,]),    ## Not disturbed forecast means
                  mufD = mufD,   ## Disturbed forecast means
                  pfN  = solve(var(Nf[sel,])),  ## Not disturbed forecast precision
@@ -219,11 +229,11 @@ for(t in 1:NT){
           mu.f = rbind(priors$mufN,priors$mufD),
           Pf   = abind::abind(solve(priors$pfN),
                  solve(priors$pfD),
-                 along=3),
+                 along=3),  # covariance matrices for undisturbed / disturbed ensemble states
           Xa = dat[,nsel],
           ca = dat[,"D"])
-  Ca <- Na[,1] ## updated class assignments
-  Na <- tobit(Na[,-1])
+  Ca <- Na[,1] ## updated class assignments (get prepended from call to multi.ens.adj)
+  Na <- tobit(Na[,-1]) ## remove class assignments
 #  sel.ic <- sample.int(nrow(dat), ne, replace=TRUE)
 #  Na <- dat[sel.ic,nsel]
   Analysis[[t]] <- list(MCMC=dat,
@@ -237,7 +247,7 @@ for(t in 1:NT){
   muaK <- mufK + K%*%(No[t,] - mufK) 
   PaK <- (I-K %*% H)%*%PfK    
   paK = solve(PaK)
-  NaK <- PEcAn.assim.sequential::adj.ens(Pf = PfK,X = NfK,mu.f = mufK,mu.a = muaK,Pa = PaK) %>% as.matrix()
+  NaK <- PEcAnAssimSequential::adj.ens(Pf = PfK,X = NfK,mu.f = mufK,mu.a = muaK,Pa = PaK) %>% as.matrix()
   Analysis.KD[[t]] <- list(mua=muaK,pa=paK,Pa=PaK,Na=NaK)
   
 }
@@ -326,7 +336,7 @@ for(t in 1:NT){
   
   ## draw new IC
   #  Na <- mvtnorm::rmvnorm(ne,mua,Pa)
-  Na <- PEcAn.assim.sequential::adj.ens(
+  Na <- PEcAnAssimSequential::adj.ens(
     Pf = Pf,X = Nf,mu.f = muf,mu.a = mua,Pa = Pa)
   
   ## save Analysis posterior
