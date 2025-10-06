@@ -3,12 +3,12 @@
 ##' @author Michael Dietze \email{dietze@@bu.edu}
 ##' 
 ##' 
-##' @param Xf Dataframe or matrix of forecast state variables for different ensembles.
-##' @param cf vector assigning forecast disturbance class to each ensemble member
-##' @param mu.f A vector with forecast mean estimates of state variables.
-##' @param Pf  A cov matrix of forecast state variables.  
-##' @param Xa A matrix of posterior samples of state variables.
-##' @param ca A vector of posterior samples of disturbance class
+##' @param Xf Dataframe or matrix of forecast state variables for different ensembles. [ne x 3]
+##' @param cf vector assigning forecast disturbance class to each ensemble member [ne x 1]
+##' @param mu.f A vector with forecast mean estimates of state variables. [nc (num disturbance types) x ns (num state variables)]
+##' @param Pf  A cov matrix of forecast state variables.  [nc (num disturbance types) x ns (num state variables) x ns]
+##' @param Xa A matrix of posterior samples of state variables. [ns (num samples) x 3]
+##' @param ca A vector of posterior samples of disturbance class [ne (num samples) x 1]
 ##' 
 ##' @return Returns a matrix of adjusted analysis mean estimates of state variables and class assignments
 ##' @export
@@ -59,7 +59,7 @@ multi.ens.adj<-function(Xf, cf, mu.f, Pf, Xa, ca){
   
   ## reassign classes
   ff = table(cf)/length(cf) ## class frequency in the forecast
-  uc = sort(unique(cf))
+  uc = sort(unique(cf)) # unique class values sorted
   fa = table_by(ca,uc)/length(ca) ## class frequency in the posterior
   df = pmax(fa-ff,0) ## difference in frequency
   df = df/sum(df)    ## posterior reassignment frequency
@@ -67,12 +67,12 @@ multi.ens.adj<-function(Xf, cf, mu.f, Pf, Xa, ca){
   for(i in seq_along(uc)){
     if(fa[i] < ff[i]){ ## if a class decreases in frequency in the analysis
       sel.c = which(cf == uc[i])
-      cA[sel.c] = sample(uc,length(sel.c),prob=df,replace = TRUE)
+      cA[sel.c] = sample(uc,length(sel.c),prob=df,replace = TRUE) # sample new classes according to reassignment frequencies
     }
   }
   cases = table(cf,cA) ## summary of reassignments
   
-  Z <- Xf*0
+  Z <- Xf*0 # [ne x 3]
   
   for(k in seq_along(uc)){   ## loop over disturbance classes
     sel.c = which(cf == uc[k])
@@ -84,9 +84,7 @@ multi.ens.adj<-function(Xf, cf, mu.f, Pf, Xa, ca){
     
     ## normalize
     for(i in sel.c){
-      
       Z[i,] <- 1/sqrt(L_f) * t(V_f)%*%(Xf[i,]-mu.f[k,])
-      
     }
     Z[is.na(Z)]<-0
     Z[is.infinite(Z)] <- 0
@@ -99,7 +97,10 @@ multi.ens.adj<-function(Xf, cf, mu.f, Pf, Xa, ca){
   }
   
   ### ANALYSIS
-  X_a <- Xf*0
+  # rescale the ensemble members from Z-space (zero mean, identity cov)
+  #.  into posterior space (posterior mean, posterior sample covariance)
+  #   and do this on a disturbance class-by-class basis
+  X_a <- Xf*0 # [ne x 3] (the datapoints in posterior space)
   for(k in seq_along(uc)){
     sel.c = which(cA == uc[k])
     if(length(sel.c) == 0) next

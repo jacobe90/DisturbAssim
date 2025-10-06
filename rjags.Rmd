@@ -1,0 +1,36 @@
+---
+title: "rjags"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(BayesianTools)
+library(magrittr)
+set.seed(42)
+```
+
+
+```{r}
+AnalysisSSSDMP <- "  ## SingleSite SingleDisturbance MultiPool
+model{
+  ## prior
+  muN ~ dmnorm(mufN,pfN)                ## forecast prior on Not disturbed
+  muD ~ dmnorm(mufD,pfD)                ## forecast prior on Disturbed
+  D ~ dbern(p)                          ## disturbance probability
+  ## Analysis 
+  n <- D*muD + (1-D)*muN                ## select between disturbed and undisturbed
+  Y ~ dmnorm(n,R)                       ## Observation error
+}"
+```
+
+
+```{r}
+update = c(list(Y=No[t,],R=solve(R)),priors)
+mod <- rjags::jags.model(file=textConnection(AnalysisSSSDMP),
+                           data=update,
+                           n.adapt=1000,n.chains=3)
+jdat <- rjags::coda.samples(mod,variable.names=c("n","D","muN","muD"),n.iter=10000)
+```
+
+
