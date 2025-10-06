@@ -1,3 +1,6 @@
+# experiment data
+*.RData
+
 # History files
 .Rhistory
 .Rapp.history

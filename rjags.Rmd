@@ -12,25 +12,90 @@ set.seed(42)
 
 
 ```{r}
-AnalysisSSSDMP <- "  ## SingleSite SingleDisturbance MultiPool
+CoinFlipJAGS <- "
 model{
   ## prior
-  muN ~ dmnorm(mufN,pfN)                ## forecast prior on Not disturbed
-  muD ~ dmnorm(mufD,pfD)                ## forecast prior on Disturbed
-  D ~ dbern(p)                          ## disturbance probability
-  ## Analysis 
-  n <- D*muD + (1-D)*muN                ## select between disturbed and undisturbed
-  Y ~ dmnorm(n,R)                       ## Observation error
+  p ~ dbeta(6.86, 3.47)
+  
+  # Likelihood: each Y[i] ~ Bernoulli(p)
+  for (i in 1:N) {
+    Y[i] ~ dbern(p)
+  }
 }"
 ```
 
 
 ```{r}
-update = c(list(Y=No[t,],R=solve(R)),priors)
-mod <- rjags::jags.model(file=textConnection(AnalysisSSSDMP),
+ptrue <- 0.77
+N <- 1000
+samples <- rbinom(N, 1, ptrue)
+
+priors <- list(mup = 0.5, #rowMeans(d.prior),         ## disturbance rate
+               sigmap = 0.25    ## forecast means
+  )
+
+update = c(list(Y=samples, N=N),priors)
+mod <- rjags::jags.model(file=textConnection(CoinFlipJAGS),
                            data=update,
-                           n.adapt=1000,n.chains=3)
-jdat <- rjags::coda.samples(mod,variable.names=c("n","D","muN","muD"),n.iter=10000)
+                           n.adapt=1000,n.chains=10)
+jdat <- rjags::coda.samples(mod,variable.names=c("p"),n.iter=10000)
+posteriorsamples <- as.matrix(jdat)
+posteriormean <- colMeans(posteriorsamples)
+print("posterior means:")
+print(colMeans(posteriorsamples))
+print("posterior standard deviations:")
+print(apply(posteriorsamples, 2, sd))
+```
+
+
+```{r}
+
+hist(posteriorsamples, breaks = 30, 
+     main = "Posterior distribution of parameter p",
+     xlab = "p", col = "skyblue", border = "white",
+     xlim = c(0, 1))
+
+# Add vertical line at 0.77
+abline(v = 0.77, col = "red", lwd = 2, lty = 2)
+
+```
+```{r}
+runWithNAdaptation <- function(nAdapt) {
+  ptrue <- 0.77
+  N <- 1000
+  samples <- rbinom(N, 1, ptrue)
+  
+  priors <- list(
+    mup = 0.5,
+    sigmap = 1/(0.25^2)  # precision = 1 / variance
+  )
+  
+  update <- c(list(Y = samples, N = N), priors)
+  
+  mod <- rjags::jags.model(
+    file = textConnection(CoinFlipJAGS),
+    data = update,
+    n.adapt = nAdapt,
+    n.chains = 10
+  )
+  
+  jdat <- rjags::coda.samples(mod, variable.names = "p", n.iter = 10000)
+  posteriorsamples <- as.matrix(jdat)
+  colMeans(posteriorsamples)
+}
+
+# Run for nAdapt values from 0 to 10000 in increments of 1000
+nAdaptValues <- seq(0, 20000, by = 1000)
+posteriorMeans <- sapply(nAdaptValues, runWithNAdaptation)
+
+# Plot
+plot(nAdaptValues, posteriorMeans,
+     type = "b", pch = 16, col = "blue",
+     xlab = "n.adapt", ylab = "Posterior mean of p",
+     main = "Effect of n.adapt on posterior mean")
+abline(h = 0.77, col = "red", lty = 2)  # true p
+
+
 ```
 
 
