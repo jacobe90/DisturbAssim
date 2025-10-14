@@ -8,7 +8,7 @@
 ##' @param mu.f A vector with forecast mean estimates of state variables. [nc (num disturbance types) x ns (num state variables)]
 ##' @param Pf  A cov matrix of forecast state variables.  [nc (num disturbance types) x ns (num state variables) x ns]
 ##' @param Xa A matrix of posterior samples of state variables. [ns (num samples) x 3]
-##' @param ca A vector of posterior samples of disturbance class [ne (num samples) x 1]
+##' @param ca A vector of posterior samples of disturbance class [ns (num samples) x 1]
 ##' 
 ##' @return Returns a matrix of adjusted analysis mean estimates of state variables and class assignments
 ##' @export

@@ -1,14 +1,16 @@
 ---
-title: "Single Site, Single Disturbance, MultiPool"
-author: "Mike Dietze"
-date: "10/19/2020"
+title: "Analytical_SingleSite_SingleDisturb_MultiPool"
 output: html_document
+author: Jacob Epstein
+date: "10/13/2025"
 ---
+
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 library(BayesianTools)
 library(magrittr)
+library(mvtnorm)
 set.seed(42)
 ```
 
@@ -19,7 +21,7 @@ set.seed(42)
 ## helper functions
 
 ```{r}
-source("multi.ens.adj.R")
+source("multi.analytical.ens.adj.R")
 
 ## set values of state less than zero to be 0 
 tobit <- function(x){
@@ -113,7 +115,7 @@ hist(Ensemble_initial[,3],main="Cstem")
 Q = diag(c(0.1,0.1,0.1)) ## process error
 R = diag(c(.25,10,1))      ## observation error
 THETA <- as.matrix(Theta_reference[par,]) ## initial ensemble parameters [J, P]
-p.dist = 0.15
+p.dist = 0.05
 
 ## storage
 Analysis <- Forecast <- list()
@@ -214,39 +216,67 @@ for(t in 1:NYears){
   )
   Forecast[[t]] <- c(list(d.prior=d.prior,Nf=Forecast_means),priors)
   
+  
   ## Analysis
-  update = c(list(Y=Observed_states[t,],R=solve(R)),priors)
-  mod <- rjags::jags.model(file=textConnection(AnalysisSSSDMP),
-                           data=update,
-                           n.adapt=2000,n.chains=3)
-  jdat <- rjags::coda.samples(mod,variable.names=c("n","D","muN","muD"),n.iter=10000) 
   
-  ## update parameters & save Analysis posterior
-  dat = as.matrix(jdat)
-  nsel <- grep(pattern="^n",x=colnames(dat))
+  ## Compute parameters of posterior (a mixture of gaussians)
   
-  if (t == 9) {
-     jdat10 <- jdat 
-  }
+  mufN = Forecast[[t]]$mufN
+  PfN = var(Forecast_means[sel,])
+  PfD = diag(c(0.15,0.5,0.25)^2)
   
-  ## draw new IC
-  Ensemble_initial <- multi.ens.adj(
+  # Compute component covariances
+  post_PfN = solve(Forecast[[t]]$pfN + solve(R))
+  post_PfD = solve(Forecast[[t]]$pfD + solve(R))
+  
+  # Compute component means
+  post_mufN = post_PfN%*%(solve(R)%*%Observed_states[t,] + Forecast[[t]]$pfN%*%mufN)
+  post_mufD = post_PfD%*%(solve(R)%*%Observed_states[t,] + Forecast[[t]]$pfD%*%mufD)
+  
+  # Compute component weights
+  print("forecasted and observed mean")
+  print("no disturbance")
+  print(mufN)
+  print("disturbance")
+  print(mufD)
+  print("observed:")
+  print(Observed_states[t,])
+  print("posterior means")
+  print("no disturbance")
+  print(post_mufN)
+  print("disturbance")
+  print(post_mufD)
+  w_N = (1 - p.dist) * dmvnorm(Observed_states[t,], mean=mufN, sigma=PfN + R)
+  w_D = p.dist * dmvnorm(Observed_states[t,], mean=mufD, sigma=PfD + R)
+  total <- w_N + w_D
+  print("w_N and w_D:")
+  print(w_N)
+  print(w_D)
+  w_N = w_N / total
+  w_D = w_D / total
+  print("normalized w_N and w_D:")
+  print(w_N)
+  print(w_D)
+  weights = c(w_N, w_D)
+  
+  ## Ensemble adjustment
+  Ensemble_initial <- multi.analytical.ens.adj(
           Xf   = Forecast_means,
           cf   = d.prior,
           mu.f = rbind(priors$mufN,priors$mufD),
           Pf   = abind::abind(solve(priors$pfN),
                  solve(priors$pfD),
                  along=3),  # covariance matrices for undisturbed / disturbed ensemble states
-          Xa = dat[,nsel],
-          ca = dat[,"D"])
+          Pp.mu.a = cbind(post_mufN, post_mufD),
+          Pp.Pa = abind::abind(post_PfN, post_PfD, along=3),
+          Pp.w = weights)
   Ca <- Ensemble_initial[,1] ## updated class assignments (get prepended from call to multi.ens.adj)
   Ensemble_initial <- tobit(Ensemble_initial[,-1]) ## remove class assignments
-#  sel.ic <- sample.int(nrow(dat), ne, replace=TRUE)
-#  Na <- dat[sel.ic,nsel]
-  Analysis[[t]] <- list(MCMC=dat,
-                        Na = Ensemble_initial,
-                        Ca = Ca)
-
+  Analysis[[t]] <- list(Na = Ensemble_initial,
+                        Ca = Ca,
+                        mu.a = cbind(post_mufN, post_mufD),
+                        Pa = abind::abind(post_PfN, post_PfD, along=3),
+                        w = weights)
   
   ## EnKF Analysis
   I = H <- diag(rep(1,3))
@@ -261,9 +291,6 @@ for(t in 1:NYears){
 
 ```
 
-```{r}
-save(Forecast,Analysis,Observed_states,True_states,R,file="exp3.RData")
-```
 
 ### time series
 
@@ -271,50 +298,52 @@ save(Forecast,Analysis,Observed_states,True_states,R,file="exp3.RData")
 pool.names=c("Cleaf","Csoil","Cstem")
 for(i in 1:3){
   
-  CI.Na = sapply(X = Analysis,function(y){
-    x = y$MCMC
-    sel.n = which(colnames(x) == paste0("n[",i,"]"))
-    quantile(x[,sel.n],c(0.025,0.5,0.975))
-  })
-  #CI.Na = sapply(X = Analysis,function(x){
-  #  apply(x,2,quantile,c(0.025,0.975))
-  #})
-  print(CI.Na[1,])
+  CI.Na = mapply(function(y, t){
+    n_samples <- 1000
+    components <- sample(1:2, size = n_samples, replace = TRUE, prob = y$w) #sample component indices
+    x <- matrix(NA, nrow = n_samples, ncol = 3)
+    n_N <- sum(components == 1) # number of not disturbed samples
+    n_D <- sum(components == 2) # number of disturbed samples
+    # print(rmvnorm(n = n_N, mean = as.numeric(post_mufN_t), sigma = as.matrix(post_PfN_t)))
+    if(n_N > 0) {
+      # print(y$mu.a)
+      # print(y$Pa[,,1])
+      x[components == 1, ] <- rmvnorm(n = n_N, mean = y$mu.a[,1], sigma = y$Pa[,,1])
+    }
+    if (n_D > 0) {
+      x[components == 2, ] <- rmvnorm(n = n_D, mean = y$mu.a[,2], sigma = y$Pa[,,2])
+    }
+    
+    # plot samples
+    if (y$w[2] > 0.1) {
+      print(t)
+      print(y$w[2])
+      plot(x[,1], x[,2], 
+       xlab = "X", ylab = "Y", 
+       main = paste("Samples from Posterior Mixture, year = ", t), 
+       pch = 19, col = rgb(0,0,1,0.5))
+    }
+    quantile(x[,i],c(0.025,0.5,0.975))
+  }, Analysis, seq_along(Analysis))
+  
+  print(CI.Na)
+  
   plot(Observed_states[,i],
        #ylim = range(rbind(CIN,data$Y)),xlim=xlim,type='n',
        ylab=pool.names[i],xlab="time")
   
+  # multinomial_analysis_means = sapply(X = Analysis, function(y) {
+  #   x = y$
+  #   z = y$
+  #   colMeans(x)
+  # })
+  # 
+  # plot(multinomial_analysis_means[i,])
+  # 
   ecoforecastR::ciEnvelope(1:ncol(CI.Na),CI.Na[1,],CI.Na[3,],col=ecoforecastR::col.alpha('#b2df8a',0.7))
   lines(CI.Na[2,],col="#b2df8a",lwd=2)
-  # lines(True_states[,i],lty=2,lwd=2)
+  lines(True_states[,i],lty=2,lwd=2)
 }
-```
-
-
-```{r}
-#par(mfrow=c(1,2))
-
-# print(jdat10)
-# jdat10["n[1]"] <- as.numeric(as.character(jdat10["n[1]"]))
-# jdat10["n[3]"] <- as.numeric(as.character(jdat10["n[3]"]))
-# print(summary(jdat10[,"n[1]"]))
-# # print(summary(jdat10[,"n[3]"]))
-# print(as.matrix(jdat10[,'n[1]']))
-plot(as.matrix(jdat10[,'n[1]']), as.matrix(jdat10[,'n[3]']),
-     pch = 16,               # filled circles
-     col = "blue",           # color
-     xlab = "n[1]",
-     ylab = "n[3]",
-     main = "Scatter plot of n[1] vs n[3]")
-
-hist(as.matrix(jdat10[,"D"]), breaks = seq(-0.5, 1.5, by=1),
-     main = "Histogram of Data",
-     xlab = "Value",
-     col = "skyblue",
-     border = "white")
-
-print(summary(as.matrix(jdat10[,"D"])))
-
 ```
 
 ### Ensemble adj at time of disturbance
@@ -334,10 +363,10 @@ points(Observed_states[10,1],Observed_states[10,3],cex=3,col=ecoforecastR::col.a
 sel.a=sample.int(n_ensemble_members,10)
 arrows(Forecast[[10]]$Nf[sel.a,1],Forecast[[10]]$Nf[sel.a,3],
        Analysis[[10]]$Na[sel.a,1],Analysis[[10]]$Na[sel.a,3],length = 0.1,lwd = 0.5)   
-# legend("topleft",
-#        legend=c("Forecast","Analysis","Data"),
-#        pch=c(1,3,18),col=c(1,2,"purple"),
-#        cex = 1.5)
+legend("topleft",
+       legend=c("Forecast","Analysis","Data"),
+       pch=c(1,3,18),col=c(1,2,"purple"),
+       cex = 1.5)
 
 ```
 ## EnKF, no disturbance

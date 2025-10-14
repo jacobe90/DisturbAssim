@@ -3,12 +3,6 @@ title: "analytical_posterior"
 output: html_document
 ---
 
----
-title: "Single Site, Single Disturbance, MultiPool"
-author: "Mike Dietze"
-date: "10/19/2020"
-output: html_document
----
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
