@@ -37,8 +37,10 @@ priors <- list(mup = 0.5, #rowMeans(d.prior),         ## disturbance rate
 update = c(list(Y=samples, N=N),priors)
 mod <- rjags::jags.model(file=textConnection(CoinFlipJAGS),
                            data=update,
+                            inits = list(p=0.77),
                            n.adapt=1000,n.chains=10)
 jdat <- rjags::coda.samples(mod,variable.names=c("p"),n.iter=10000)
+print(jdat)
 posteriorsamples <- as.matrix(jdat)
 posteriormean <- colMeans(posteriorsamples)
 print("posterior means:")

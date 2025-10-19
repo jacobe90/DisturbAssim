@@ -41,14 +41,15 @@ disturbance.p <- function(x,                         ## x = Bleaf, Bsoil, Bstem
 }
 
 disturbance2 <- function(x,type){ ## x = Bleaf, Bsoil, Bstem
-  old.biomass <- x[c(1,3)]
-  new.biomass <- tobit(mvtnorm::rmvnorm(1,mu0[,type]*old.biomass,V0[,,type])) ## draw disturbed leaf and stem
+  old.biomass <- x[c(1,3)]  # select leaf/stem biomass
+  Mu0 <- mu0[,type] * old.biomass                         ## mean for disturbed biomass (proportional to old biomass)
+  new.biomass <- tobit(mvtnorm::rmvnorm(1,Mu0,V0[,,type])) ## draw disturbed leaf and stem from distribution for type
   check.max <- which(new.biomass > old.biomass)
-  if(length(check.max)>0) new.biomass[check.max] = old.biomass[check.max]
+  if(length(check.max)>0) new.biomass[check.max] = old.biomass[check.max]   # constrain new.biomass[i] <= old.biomass[i]
   residual = sum(old.biomass-new.biomass)
   x[c(1,3)] <- new.biomass
-  x[2] <- x[2] + residual*alloc.soil
-  removal <- residual*(1-alloc.soil)
+  x[2] <- x[2] + residual*alloc.soil  # add some of the biomass lost back to the soil
+  removal <- residual*(1-alloc.soil)  # not used?
   return(x)
 }
 

@@ -37,14 +37,15 @@ for(i in 1:nd){
 ## Parameters
 refPars <- VSEMgetDefaults()
 refPars$lower[9:11] = 1
-pft1 <- refPars$best; pft1[7] = pft1[7]*10
+pft1 <- refPars$best; pft1[7] = pft1[7]*10 # 1 (num parameters) x 11 list (increased stem residence time for tree-like PFT)
 refPars$upper[7] =  refPars$upper[7]*10
-np = 50
-sigmaP = diag((refPars$upper - refPars$lower)/10)^2 ## assume range is +/- 5 SD
-epsilon <- mvtnorm::rmvnorm(np,rep(0,nrow(sigmaP)),sigmaP)
+np = 50 # number of parameter samples
+sigmaP = diag((refPars$upper - refPars$lower)/10)^2 # 11 (num params) x 11 (num params) matrix ## assume range is +/- 5 SD
+epsilon <- mvtnorm::rmvnorm(np,rep(0,nrow(sigmaP)),sigmaP) # 50 (num param samples) x 11 (num params) matrix of noise values (in the rows)
+
 Theta <- list()
-Theta[[1]] <- as.data.frame(t(pft1         + t(epsilon))) ## PFT 1
-Theta[[2]] <- as.data.frame(t(refPars$best + t(epsilon))) ## PFT 2
+Theta[[1]] <- as.data.frame(t(pft1         + t(epsilon))) ## PFT 1 (add 50 diff noise values to pft1 starting value)
+Theta[[2]] <- as.data.frame(t(refPars$best + t(epsilon))) ## PFT 2 (add 50 diff noise values to refPars$best starting value)
 colnames(Theta[[1]]) <- rownames(refPars)
 colnames(Theta[[2]]) <- rownames(refPars)
 par(mfrow=c(3,4))
@@ -56,14 +57,14 @@ for(i in 1:11){
   hist(Theta[[1]][,i],main=colnames(Theta[[1]])[i],probability = TRUE)
   lines(density(Theta[[2]][,i]))
 }
-pft.f = pft.a = rep(1,ne)
+pft.f = pft.a = rep(1,ne)  # 1 x ne array
 
 ## initial conditions
-met = sample.int(nd,ne,replace=TRUE)
-par = sample.int(np,ne,replace=TRUE)
-Na <- matrix(NA,ne,3)
+met = sample.int(nd,ne,replace=TRUE) # 1 x ne (num ensemble members) - driver indices for ensemble members
+par = sample.int(np,ne,replace=TRUE) # 1 x ne (num ensemble members) - parameter indices for ensemble members
+Na <- matrix(NA,ne,3) # ne x 3 (num state variables), ensemble state data
 for(i in 1:ne){
-  Na[i,] = VSEM(as.numeric(Theta[[1]][par[i],]),PAR = PAR[met[i],])[nt,2:4]
+  Na[i,] = VSEM(as.numeric(Theta[[1]][par[i],]),PAR = PAR[met[i],])[nt,2:4] # 25-year burn in, use first PFT, get state data at final timestep
 }
 Na.orig = Na
 par(mfrow=c(1,3))
@@ -79,10 +80,10 @@ hist(Na[,3],main="Cstem")
 ## hard coded 
 Q = diag(c(0.1,0.1,0.1)) ## process error
 R = diag(c(.25,10,.5))      ## observation error
-THETA1 <- as.matrix(Theta[[1]][par,]) ## ensemble parameters
-THETA2 <- as.matrix(Theta[[1]][par,]) 
-THETA  <- THETA1
-THETA[pft.f == 2,] <- THETA2[pft.f==2,]
+THETA1 <- as.matrix(Theta[[1]][par,]) ## ensemble parameters (for first pft)
+THETA2 <- as.matrix(Theta[[2]][par,]) ## ensemble parameters (for second pft), (BUG?) should be Theta[[2]][par,]
+THETA  <- THETA1    # ensemble paramters
+THETA[pft.f == 2,] <- THETA2[pft.f==2,] # set ensemble parameters belonging to PFT 2 to corresponding values
 
 ## disturbance
        ## mean leaf & stem biomass after disturbance as % of original
@@ -101,8 +102,8 @@ Analysis <- Forecast <- list()
 Nmu = Nf = Na*NA
 
 ## pseudodata
-No = matrix(NA,NT,3)                   ## storage for observed state
-Ntrue = matrix(NA,NT,3)                ## storage for latent "true" state
+No = matrix(NA,NT,3)                   ## [NT = num years x 3 = num state variables] storage for observed state
+Ntrue = matrix(NA,NT,3)                ## [NT = num years x 3 = num state variables] storage for latent "true" state
 true = 42                              ## reference ensemble member
 D.true = rep(0,NT)                     ## true disturbance timeseries
 D.true[10] = 1                         ## prescribe a disturbance
@@ -145,9 +146,9 @@ model{
   Y ~ dmnorm(X,R)                       ## Observation error
 }"
 
-Na <- Na.orig
-muf <- matrix(NA,3,3)
-pf  <- array(0,c(3,3,3)) ## 3rd variable is class
+Na <- Na.orig     ##  [ne x 3 (num state variables)]
+muf <- matrix(NA,3,3) ## forecast means
+pf  <- array(0,c(3,3,3)) ## forecast precisions, 3rd variable is class
 for(t in 1:NT){
   
   tsel <- (t-1)*365 + 1:365               ## Select days from driver files
@@ -155,27 +156,27 @@ for(t in 1:NT){
   ## update IC & PFT
   pft.f = pft.a
   THETA  <- THETA1
-  THETA[pft.f == 2,] <- THETA2[pft.f==2,]
-  THETA[,9:11]  <- Na    ## Multinomial
+  THETA[pft.f == 2,] <- THETA2[pft.f==2,]   ## set params according to forecast pft
+  THETA[,9:11]  <- Na    ## State variables from analysis
 
   ## Forecast 
   for(i in 1:ne){
     fx       = VSEM(THETA[i,], PAR = PAR[met[i],tsel]) ## deterministic simulation
     Nmu[i,]  =  fx[365,2:4]                         ## state variables at time of assim
-    Nf[i,]   =  mvtnorm::rmvnorm(1,Nmu[i,],Q)
+    Nf[i,]   =  mvtnorm::rmvnorm(1,Nmu[i,],Q)       ## add process error
   }
   
   ## Disturbance
   d.prior <- rmultinom(ne,1,p.dist)             ## prior on disturbance status
-  d.class <- apply(d.prior,2,which.max)
+  d.class <- apply(d.prior,2,which.max)         ## array of disturbance classes
   for(d in 2:3){  ## loop over disturbance classes
     sel.dist <- which(d.class == d)              ## select disturbed ensemble members
     if(length(sel.dist)>3){
       for(j in sel.dist){                      ## run disturbance model
         Nf[j,]  = disturbance2(Nf[j,],type = d-1)
       }
-      muf[,d]  = colMeans(Nf[sel.dist,])
-      pf[,,d] =  try(solve(var(Nf[sel.dist,])))
+      muf[,d]  = colMeans(Nf[sel.dist,])        ## compute mean of disturbed ensemble members for class
+      pf[,,d] =  try(solve(var(Nf[sel.dist,]))) ## compute precision
     } 
     if(sum(sel.dist) <= 3 || class(pf) == "try-error") {   ## backup values if the ensemble stats fail
       muf[,d] = colMeans(Nf[d.class==1,])*c(mu0[1,d-1],1,mu0[2,d-1])
@@ -186,9 +187,9 @@ for(t in 1:NT){
     }
   }
   ## set undisturbed
-  sel.dist = which(d.class == 1)
-  muf[,1] = colMeans(Nf[sel.dist,])
-  pf[,,1] = solve(var(Nf[sel.dist,]))
+  sel.undist = which(d.class == 1)
+  muf[,1] = colMeans(Nf[sel.undist,])
+  pf[,,1] = solve(var(Nf[sel.undist,]))
   Nf <- tobit(Nf)
 
   ## priors
@@ -199,8 +200,8 @@ for(t in 1:NT){
   Forecast[[t]] <- c(list(d.prior=d.prior,Nf=Nf,pft=pft.f),priors)
   
   ## initial conditions: disturbance likelihood
-  Lp = NA
-  for(i in 1:3){ Lp[i] = mvtnorm::dmvnorm(No[t,],muf[,i],pf[,,i])}
+  Lp = NA   ## likelihoods of observation wrt each disturbance class mean / covariance
+  for(i in 1:3){ Lp[i] = mvtnorm::dmvnorm(No[t,],muf[,i],pf[,,i])}  #(BUG?) calling this with the precision matrix?
   rho.IC = rep(0,3); rho.IC[which.max(Lp)] = 1; rho.IC[1] = NA
   
   ## Analysis
@@ -209,8 +210,8 @@ for(t in 1:NT){
                            data=update,
                            inits = list(rho=rho.IC),
                            n.adapt=1000,n.chains=3)
-  jdat <- rjags::coda.samples(mod,variable.names="X",n.iter=2000) ## burn-in 
-  jdat <- rjags::coda.samples(mod,variable.names=c("X","rho","x"),n.iter=10000) 
+  jdat <- rjags::coda.samples(mod,variable.names=c("X"),n.iter=2000) ## burn-in
+  jdat <- rjags::coda.samples(mod,variable.names=c("X","rho","x"),n.iter=10000)
   
   ## update parameters & save Analysis posterior
   dat = as.matrix(jdat)
@@ -274,11 +275,12 @@ for(i in 1:3){
   #CI.Na = sapply(X = Analysis,function(x){
   #  apply(x,2,quantile,c(0.025,0.975))
   #})
-  
+  # plot(No[,i],ylab=pool.names[i],xlab="time")
+  # abline(v = 10, col = "red", lty = 2, lwd = 2)
   plot(No[,i],
-       #ylim = range(rbind(CIN,data$Y)),xlim=xlim,type='n',
-       ylab=pool.names[i],xlab="time")
-  ecoforecastR::ciEnvelope(1:ncol(CI.Na),CI.Na[1,],CI.Na[3,],col=ecoforecastR::col.alpha('#b2df8a',0.7))
+        #ylim = range(rbind(CIN,data$Y)),xlim=xlim,type='n',
+        ylab=pool.names[i],xlab="time")
+   ecoforecastR::ciEnvelope(1:ncol(CI.Na),CI.Na[1,],CI.Na[3,],col=ecoforecastR::col.alpha('#b2df8a',0.7))
   lines(CI.Na[2,],col="#b2df8a",lwd=2)
   lines(Ntrue[,i],lty=2,lwd=2)
 }
