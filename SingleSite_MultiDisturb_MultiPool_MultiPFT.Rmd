@@ -193,7 +193,7 @@ for(t in 1:NT){
   Nf <- tobit(Nf)
 
   ## priors
-  priors <- list(p   = rowMeans(d.prior),         ## disturbance rate
+  priors <- list(p   = rowMeans(d.prior),         ## disturbance rates
                  muf = muf,    ## forecast means
                  pf  = pf      ## forecast precision
   )
@@ -201,7 +201,7 @@ for(t in 1:NT){
   
   ## initial conditions: disturbance likelihood
   Lp = NA   ## likelihoods of observation wrt each disturbance class mean / covariance
-  for(i in 1:3){ Lp[i] = mvtnorm::dmvnorm(No[t,],muf[,i],pf[,,i])}  #(BUG?) calling this with the precision matrix?
+  for(i in 1:3){ Lp[i] = mvtnorm::dmvnorm(No[t,],muf[,i],solve(pf[,,i]))}
   rho.IC = rep(0,3); rho.IC[which.max(Lp)] = 1; rho.IC[1] = NA
   
   ## Analysis

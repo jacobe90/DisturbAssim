@@ -13,7 +13,7 @@
 ##' @return Returns a matrix of adjusted analysis mean estimates of state variables and class assignments
 ##' @export
 
-multi.ens.adj<-function(Xf, cf, mu.f, Pf, Xa, ca){
+multi.ens.adj<-function(Xf, cf, mu.f, Pf, Xa, ca, uc=NULL){
   
   if(FALSE){  ## set params
     ## single
@@ -58,8 +58,10 @@ multi.ens.adj<-function(Xf, cf, mu.f, Pf, Xa, ca){
   }
   
   ## reassign classes
-  ff = table(cf)/length(cf) ## class frequency in the forecast
-  uc = sort(unique(cf)) # unique class values sorted
+  if (is.null(uc)) {
+    uc = sort(unique(cf)) # unique class values sorted
+  }
+  ff = table_by(cf, uc)/length(cf) ## class frequency in the forecast
   fa = table_by(ca,uc)/length(ca) ## class frequency in the posterior
   df = pmax(fa-ff,0) ## difference in frequency
   df = df/sum(df)    ## posterior reassignment frequency

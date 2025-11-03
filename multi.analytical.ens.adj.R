@@ -5,28 +5,31 @@
 ##' 
 ##' @param Xf Dataframe or matrix of forecast state variables for different ensembles. [ne x 3]
 ##' @param cf vector assigning forecast disturbance class to each ensemble member [ne x 1]
-##' @param mu.f A vector with forecast mean estimates of state variables. [nc (num disturbance types) x nS (num state variables)]
+##' @param mu.f A vector with forecast mean estimates of state variables. [nc (num disturbance classes) x nS (num state variables)]
 ##' @param Pf  A vector of cov matrices of forecast state variables.  [nc (num disturbance classes) x nS x nS]
 ##' @param Pp.mu.a Posterior predictive forecast means of state variables. [nc x nS]
 ##' @param Pp.Pa Posterior predictive covariance matrices of state variables. [nc x nS x nS]
 ##' @param Pp.w Posterior frequencies of each class, or posterior component weights [nc x 1]
+##' @param uc (optional) A vector with integer entries corresponding to each disturbance class [1 x nc] 
 ##' 
 ##' @return Returns a matrix of adjusted analysis mean estimates of state variables and class assignments
 ##' @export
 
-multi.analytical.ens.adj <- function(Xf, cf, mu.f, Pf, Pp.mu.a, Pp.Pa, Pp.w){
+multi.analytical.ens.adj <- function(Xf, cf, mu.f, Pf, Pp.mu.a, Pp.Pa, Pp.w, uc=NULL){
   
   ## reassign classes
-  ff = table(cf)/length(cf) ## class frequency in the forecast
-  uc = sort(unique(cf)) # unique class values sorted
+  if (is.null(uc)) {
+    uc = sort(unique(cf)) # unique class values sorted
+  }
+  ff = table_by(cf, uc)/length(cf) ## class frequency in the forecast
   df = pmax(Pp.w-ff,0) ## difference in frequency
   df = df/sum(df)    ## posterior reassignment frequency
   cA = cf            ## class assigned in the Analysis
   for(i in seq_along(uc)){
-    # print("ff:")
-    # print(ff)
-    # print("weights:")
-    # print(Pp.w)
+    print("ff:")
+    print(ff)
+    print("weights:")
+    print(Pp.w)
     if(Pp.w[i] < ff[i]){   ## if a class decreases in frequency in the analysis
       sel.c = which(cf == uc[i])
       cA[sel.c] = sample(uc,length(sel.c),prob=df,replace = TRUE) # sample new classes according to reassignment frequencies

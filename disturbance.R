@@ -32,10 +32,10 @@ disturbance.p <- function(x,                         ## x = Bleaf, Bsoil, Bstem
   old.biomass <- x[c(1,3)]
   new.biomass <- tobit(mvtnorm::rmvnorm(1,mu0*old.biomass,tcrossprod(old.biomass,old.biomass)*V0)) ## draw disturbed leaf and stem
   check.max <- which(new.biomass > old.biomass)
-  if(length(check.max)>0) new.biomass[check.max] = old.biomass[check.max]
+  if(length(check.max)>0) new.biomass[check.max] = old.biomass[check.max] # constrain new.biomass[i] <= old.biomass[i]
   residual = sum(old.biomass-new.biomass)
-  x[c(1,3)] <- new.biomass
-  x[2] <- x[2] + residual*alloc.soil
+  x[c(1,3)] <- new.biomass # update state with disturbed biomass
+  x[2] <- x[2] + residual*alloc.soil # some of the biomass gets transported to the soil
   removal <- residual*(1-alloc.soil)
   return(x)
 }
@@ -53,18 +53,18 @@ disturbance2 <- function(x,type){ ## x = Bleaf, Bsoil, Bstem
   return(x)
 }
 
-# random correlated bernouli
+# random correlated bernoulli
 rcbern <- function(p,rho,mu){
   
   ## calculate cov
   D = as.matrix(dist(seq_along(mu),diag = TRUE,upper = TRUE))
-  SIGMA <- 1/(1-rho^2)*rho^D
+  SIGMA <- 1/(1-rho^2)*rho^D # TODO: why this covariance matrix?
   
   ## draw rMVN
   x = mvtnorm::rmvnorm(1,rep(0,length(p)),SIGMA)
   
   ## inverse distribution transform
-  y = pnorm(x)
-  qbinom(y,1,p)
+  y = pnorm(x) # normal distribution function
+  qbinom(y,1,p) # map into binomial quantiles
   
 }

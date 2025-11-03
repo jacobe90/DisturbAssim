@@ -269,7 +269,8 @@ for(t in 1:NYears){
                  along=3),  # covariance matrices for undisturbed / disturbed ensemble states
           Pp.mu.a = cbind(post_mufN, post_mufD),
           Pp.Pa = abind::abind(post_PfN, post_PfD, along=3),
-          Pp.w = weights)
+          Pp.w = weights,
+          )
   Ca <- Ensemble_initial[,1] ## updated class assignments (get prepended from call to multi.ens.adj)
   Ensemble_initial <- tobit(Ensemble_initial[,-1]) ## remove class assignments
   Analysis[[t]] <- list(Na = Ensemble_initial,
