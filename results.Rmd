@@ -229,22 +229,36 @@ m = matrix(1:6,nrow=3,byrow = TRUE)
 layout(m)
 
 ### Row 1: Example time-series ###
-site = 188
-exp.name = c("P1Q1R1","P1Q1R4")
+site = 185 # 188
+exp.name = c("P1Q1R1","P1Q1R0.001")
 exp.pretty.name = c("(a) Example site, Original","(c) Example site, Low Obs Error")
 pool.names=c("Leaf","Soil","AGB")
 i = 3 ## Stem
 time = 1985:2017
 for(ex in seq_along(exp.name)){
-  load(paste0("OR_TS_",site,"_",exp.name[ex],".RData"))
-  plot(time,Yi[,i],
-       ylim = range(rbind(CI.Na,Yi[,i],CI.D),na.rm=TRUE),
+  load(paste0("OR_SD_",site,"_",exp.name[ex],".RData"))
+  print(paste0("OR_SD_",site,"_",exp.name[ex],".RData"))
+  print("first ensemble member")
+  print(CI.Na[1,])
+  CI.Na = sapply(X = test$Analysis,function(x){
+        y = x$CI
+        sel.n = which(colnames(y) == paste0("n[",i,"]"))
+        y[,sel.n]
+      })
+      
+  CI.D = sapply(X = test$Analysis,function(x){
+      y = x$CI
+      sel.n = which(colnames(y) == paste0("D"))
+      y[,sel.n]
+    })
+  plot(time,test$Y[,i],
+       ylim = range(rbind(CI.Na,test$Y[,i],CI.D),na.rm=TRUE),
        type='n',
        ylab=bquote(.(pool.names[i]) ~ (kgC/m^2)),xlab="time",
        main=exp.pretty.name[ex])
   ecoforecastR::ciEnvelope(time,CI.Na[1,],CI.Na[5,],col=ecoforecastR::col.alpha('blue',0.5))
   lines(time,CI.Na[3,],col="blue",lwd=2)
-  points(time,Yi[,i],col="red",cex=1.5)
+  points(time,test$Y[,i],col="red",cex=1.5)
   if(ex == 1) {
     legend("bottomleft",legend=c("Assimilation","Data"),
        lwd=5,col=c("blue","red"),cex=0.7)
@@ -261,7 +275,7 @@ div.pretty.name = c("(b) Divergence, Original","(e) Divergence, Low Obs Error")
 div.reg <- list()
 div.class <- list()
 obs.class.re = obs.class; obs.class.re[obs.class.re ==4] = 3; obs.class.re[obs.class.re ==5] = 4; obs.class.re = obs.class.re + 1
-for(i in 1:2){
+for(i in c(8,5)){
   ## divergence
   div = (elist[[i]]$divergence[,1] - obs.tlo)/
     (apply(elist[[i]]$divergence[,c(2,6)],1,diff)*0.5)
@@ -288,7 +302,7 @@ distabs = obs.pre-obs.dist
 pred.seq$distabs = seq(min(distabs),max(distabs),length=500)
 detect.pretty.name = c("(c) Probability of detection, Original","(f) Probability of Detection, Low Obs Error")
 dist.qb.abs <- list()
-for(i in 1:2){
+for(i in c(8,5)){
   distrate = distrate = elist[[i]]$distrate
   dist.qb.abs[[i]] = glm(distrate ~ distabs,
                     na.action=na.omit,

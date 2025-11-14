@@ -107,15 +107,9 @@ SSSD.model <- function(Y,R,Q,PAR,Xic,THETA,dist){
     
     ## Disturbance
     d.forecast <- rep(0,ne)
-    # d.forecast[1:ceiling(ne*0.1)] <- 1 #rbinom(ne,1,dist$p.dist)
-    # if (dist$p.dist == 0) {
-    #   p.dist = dist$p.dist - 0.05
-    # }
-    # if (dist$p.dist == 1) {
-    #   dist$p.dist = dist$p.dist - 0.05
-    # }
-    d.forecast <- rbinom(ne, 1, dist$p.dist)
-    ## prior on disturbance status (set ~10% of ensemble members to be disturbed) Question: Why not use dist$p.dist? Why not disturb random ensemble members
+    d.forecast[1:ceiling(ne*0.1)] <- 1 #rbinom(ne,1,dist$p.dist)
+    # d.forecast <- rbinom(ne, 1, dist$p.dist) ## prior on disturbance status (set ~10% of ensemble members to be disturbed) Question: Why not use dist$p.dist? Why not disturb random ensemble members
+    
     sel <- !as.logical(d.forecast)                ## select undisturbed ensemble members
     if(sum(!sel)>2){ # if there are more than 2 disturbed ensemble members
       sel.dist = which(!sel)
@@ -222,6 +216,8 @@ SSSD.model <- function(Y,R,Q,PAR,Xic,THETA,dist){
                           CI = apply(dat,2,quantile,c(0.025,0.25,0.5,0.75,0.975)),
                           mu = apply(dat,2,mean,na.rm=TRUE)
     )
+    #print("first ensemble member:")
+    #print(Na[1,])
   }
   return(list(Forecast=Forecast,Analysis=Analysis,Y=Y))
 }
@@ -273,6 +269,39 @@ colnames(ICprior) <- c("Cv","Cs","CR")
 pairs(ICprior)
   
 ```
+```{r}
+# function to run data assimilation given R / Q / P multipliers
+# Rmult -- multiplier for observation error, R
+# Qmult -- multiplier for process error, Q
+# Pmult -- multiplier for disturbance probability
+runDA <- function(Rmult, Qmult, Pmult, siteIndices) {
+  for(i in siteIndices){
+    ofile = paste0("OR_SD_",
+                   formatC(i, width = 3, format = "d", flag = "0"),
+                   "_P",Pmult,"Q",Qmult,"R",Rmult,".RData")
+    print(ofile)
+    NT = floor(ncol(rad)/365)
+    Yi = matrix(NA,NT,3)  ## observed data
+    Yi[1:ncol(Yw),3] = Yw[i,]  ## only Cw observed (Question: where do Yi observations come from?)
+    R = diag(rep(Rw,3))*Rmult[Ri]    ## observation error
+    Q = diag(c(Ql,Qsoil,Qw)^2)*Qmult[Qi]  ## process error
+    dtype = which(names(d.prior) == dextract[i,"t2004"])
+    if(length(dtype)==0) break
+    dist <- list(              ## disturbance parameters
+      p.dist = d.prior[dtype]*Pmult[Pi],     ## disturbance probability (Question: where do disturbance probabilities come from?)
+      mu0 = c(0.2,PBBAR[4,dtype]),   ## % retention [leaf,agb], first parameter made up, should include soil
+      V0 =  diag(c(0.15,PBVAR[4,dtype])^2), #variance in retention Question(where do the woody biomass mean / variance parameters come from?)
+      alloc.soil = 0.05        ## made up  
+    )
+    print("disturbance probability:")
+    print(dist$p.dist)
+    test = SSSD.model(Y = Yi,R=R,Q=Q,
+                    PAR=rad[i,],Xic=ICprior,THETA=theta[1:11],
+                    dist = dist)
+    save(test,file=ofile)
+  }
+}
+```
 
 
 ## analyze sites - just one disturbance
@@ -280,37 +309,22 @@ pairs(ICprior)
 Rmult = c(1,0.1,0.01,0.001)
 Qmult = c(1,10)
 Pmult = c(1)
-Ri = 4 #4
-Qi = 2 #2
+Ri = 1 #4
+Qi = 1 #2
 Pi = 1
 #i = 181  # 177:263 = #fire
+
+# site indices
 od = c(83:176,264:356)
-# full run: 83:356
-for(i in 83:356){
-  ofile = paste0("OR_SD_",
-                 formatC(i, width = 3, format = "d", flag = "0"),
-                 "_P",Pi,"Q",Qi,"R",Ri,".RData")
-  print(ofile)
-  NT = floor(ncol(rad)/365)
-  Yi = matrix(NA,NT,3)  ## observed data
-  Yi[1:ncol(Yw),3] = Yw[i,]  ## only Cw observed (Question: where do Yi observations come from?)
-  R = diag(rep(Rw,3))*Rmult[Ri]    ## observation error
-  Q = diag(c(Ql,Qsoil,Qw)^2)*Qmult[Qi]  ## process error
-  dtype = which(names(d.prior) == dextract[i,"t2004"])
-  if(length(dtype)==0) break
-  dist <- list(              ## disturbance parameters
-    p.dist = d.prior[dtype]*Pmult[Pi],     ## disturbance probability (Question: where do disturbance probabilities come from?)
-    mu0 = c(0.2,PBBAR[4,dtype]),   ## % retention [leaf,agb], first parameter made up, should include soil
-    V0 =  diag(c(0.15,PBVAR[4,dtype])^2), #variance in retention Question(where do the woody biomass mean / variance parameters come from?)
-    alloc.soil = 0.05        ## made up  
-  )
-  print("disturbance probability:")
-  print(dist$p.dist)
-  test = SSSD.model(Y = Yi,R=R,Q=Q,
-                  PAR=rad[i,],Xic=ICprior,THETA=theta[1:11],
-                  dist = dist)
-  save(test,file=ofile)
+fullRun = c(83:356)
+testRun = fullRun[seq(1, length(fullRun), by = 6)]
+expGrid <- expand.grid(Rmult=Rmult, Qmult=Qmult, Pmult=Pmult)
+for (i in seq_len(nrow(expGrid))) {
+  row <- expGrid[i, ]  # extract a combo of R / Q / P
+  runDA(row$Rmult, row$Qmult, row$Pmult, testRun) # run data assimilation experiment
 }
+
+
 ```
 
 
@@ -325,7 +339,7 @@ runs <- runs[grepl("^OR",runs)]
 # runs <- runs[grepl("84",runs)]
 for (runfile in runs) {
   load(runfile)
-  for(i in 1:3){
+  for(i in 3){
       CI.Na = sapply(X = test$Analysis,function(x){
         y = x$CI
         sel.n = which(colnames(y) == paste0("n[",i,"]"))
@@ -391,7 +405,7 @@ exp = sapply(strsplit(runs,"_",fixed=TRUE),function(x){
 exps <- unique(exp)
 print(exps) # the combos of P / Q / R multipliers experimented with
 ## load experiments that haven't yet been summarized
-# elist <- list()   ## run once
+elist <- list()   ## run once
 t04 = 15            ## time of disturbance assessement (2004)
 tlo = 28            ## time of last observation
 for(i in seq_along(exps)){
@@ -500,7 +514,7 @@ for(i in seq_along(exps)){
   dist.beta.abs = betareg::betareg(distrate2 ~ distabs | distabs,
                                    na.action=na.omit,
                                    link="logit",
-                                   link.phi = "identity",
+                                   link.phi = "log",
                                    start=c(0,5,0.5,0),
                                    type="BR")
   dist.qb.abs = glm(distrate ~ distabs,
@@ -512,6 +526,7 @@ for(i in seq_along(exps)){
                     family=binomial("logit")
   )
   plot(distabs,distrate,col=obs.class,main=exps[i])
+  print(summary(dist.beta.abs))
   lines(pred.seq$distabs,predict(dist.beta.abs,newdata=pred.seq,type="quantile"),col="green")
   lines(pred.seq$distabs,predict(dist.beta.abs,newdata=pred.seq,type="quantile",at=0.75),col="green",lty=2)
   lines(pred.seq$distabs,predict(dist.beta.abs,newdata=pred.seq,type="quantile",at=0.25),col="green",lty=2)
@@ -566,9 +581,7 @@ save(stats,file="stats.RData")
 
 factors affecting detection of disturbance
 ```{r}
-Ps = as.numeric(substr(names(elist),2,2))
-Qs = as.numeric(substr(names(elist),4,4))
-Rs = as.numeric(substr(names(elist),6,6))
+# Rs = as.numeric(substr(names(elist),6,6))
 
 ## P
 
@@ -578,15 +591,18 @@ Rs = as.numeric(substr(names(elist),6,6))
 
 ## Divergence
 div.cov = sapply(stats,"[[","div.cov")
-plot(Rmult[Rs],div.cov,col=Qs,log="x",xlab="Variance Multiplier",ylab="Filter Coverage")
-legend("topright",legend=paste0(Qmult[1:2],"x"))
+print(div.cov)
+print(Rs)
+print(Qs)
+plot(rev(expGrid$Rmult),div.cov,col=rev(expGrid$Qmult),log="x",xlab="Variance Multiplier",ylab="Filter Coverage")
+#legend("topright",legend=paste0(Qmult[1:2],"x"))
 
 div.median = sapply(stats,"[[","div.median")
-plot(Rmult[Rs],div.median,col=Qs,log="x",xlab="Variance Multiplier",ylab="Median Divergance")
+plot(rev(expGrid$Rmult),div.median,col=rev(expGrid$Qmult),log="x",xlab="Variance Multiplier",ylab="Median Divergance")
 legend("topleft",legend=paste0(Qmult[1:2],"x"))
 
 div.slope = sapply(stats,function(x){coef(x$div.reg)[2]})
-plot(Rmult[Rs],div.slope,col=Qs,log="x",xlab="Variance Multiplier",ylab="Divergance Slope")
+plot(rev(expGrid$Rmult),div.slope,col=rev(expGrid$Qmult),log="x",xlab="Variance Multiplier",ylab="Divergance Slope")
 ## Disturbance @ default
 summary(stats[[4]]$dist.combo)
 ## nothing matters
@@ -633,8 +649,8 @@ plotly::plot_ly(data.frame(obs.pre=obs.pre,obs.post=obs.dist),x=~obs.pre,y=~obs.
 which.min((obs.pre-13.3)^2+(obs.dist-5.1)^2) ## select a point
 
 ## settings
-site = 188
-exp.name = "P1Q1R4" #"P1Q1R1"  ## manually run for each experiment **
+site = 197 # 188
+exp.name = "P1Q1R1" #"P1Q1R4"  ## manually run for each experiment **
 
 ## data
 NT = 33
@@ -642,9 +658,9 @@ Yi = matrix(NA,NT,3)  ## observed data
 Yi[1:ncol(Yw),3] = Yw[site,]  ## only Cw observed
   
 ## model
-load(paste0("OR_SD_",site,"_",exp.name,".RData"),envir = viz)
+load(paste0("OR_SD_",site,"_",exp.name,".RData"))
 pool.names=c("Cleaf","Csoil","Cstem")
-test = viz$test
+# test = viz$test
 
 for(i in 1:3){
   

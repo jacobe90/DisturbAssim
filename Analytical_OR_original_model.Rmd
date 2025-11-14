@@ -72,8 +72,9 @@ plot(metTime,rad[1,],type='l')
 ##' @param Q process error
 ##' @param Xic state initial condition matrix
 ##' @param THETA parameter matrix
-##' @param dist  disturbance list: p.dist, mu0[3], V0[3,3], alloc soil 
-SSSD.model <- function(Y,R,Q,PAR,Xic,THETA,dist){
+##' @param dist  disturbance list: p.dist, mu0[3], V0[3,3], alloc soil
+##' @param updateQ if true, conditionally update the process error Q based on observations 
+SSSD.model <- function(Y,R,Q,PAR,Xic,THETA,dist,updateQ=TRUE){
   
   ## init
   NT = length(PAR)/365
@@ -96,6 +97,7 @@ SSSD.model <- function(Y,R,Q,PAR,Xic,THETA,dist){
   
   a_t = Q[3, 3] # place a prior on process precision: (1/Q) ~ Gamma(a_0, b_0).
   b_t = Q[3, 3]
+  
   for(t in 1:NT){
     
     ## update IC
@@ -109,12 +111,9 @@ SSSD.model <- function(Y,R,Q,PAR,Xic,THETA,dist){
     
     ## update process error (if we have observed data)
     ## assume Y ~ N(mu, Q). We will pick Q using the posterior: Q = 1/(E[p((1/Q) | y)]) = 1/E[Gamma(a_t, b_t)] = b_t / a_t
-    if (!is.na(Y[t,3])) {
+    if (!is.na(Y[t,3]) && updateQ) {
       a_t <- a_t + 0.5
       b_t <- b_t + 0.5 * (Y[t,3] - colMeans(Nmu)[3])^2
-      print("a_t, b_t:")
-      print(a_t)
-      print(b_t)
       Q[3, 3] = b_t / a_t 
     }
     
@@ -125,15 +124,8 @@ SSSD.model <- function(Y,R,Q,PAR,Xic,THETA,dist){
     
     ## Disturbance
     d.forecast <- rep(0,ne)
-    # d.forecast[1:ceiling(ne*0.1)] <- 1 #rbinom(ne,1,dist$p.dist)
-    # if (dist$p.dist == 0) {
-    #   p.dist = dist$p.dist - 0.05
-    # }
-    # if (dist$p.dist == 1) {
-    #   dist$p.dist = dist$p.dist - 0.05
-    # }
-    d.forecast <- rbinom(ne, 1, dist$p.dist)
-    ## prior on disturbance status (set ~10% of ensemble members to be disturbed) Question: Why not use dist$p.dist? Why not disturb random ensemble members
+    d.forecast[1:ceiling(ne*0.1)] <- 1 ## prior on disturbance status (set ~10% of ensemble members to be disturbed) Question: Why not use dist$p.dist? Why not disturb random ensemble members
+    # d.forecast <- rbinom(ne, 1, dist$p.dist)
     sel <- !as.logical(d.forecast)                ## select undisturbed ensemble members
     if(sum(!sel)>2){ # if there are more than 2 disturbed ensemble members
       sel.dist = which(!sel)
@@ -141,20 +133,24 @@ SSSD.model <- function(Y,R,Q,PAR,Xic,THETA,dist){
         Nf[j,]  = disturbance.p(Nf[j,],mu0=dist$mu0,V0 = dist$V0,alloc.soil = dist$alloc.soil) # disturb states of the selected ensemble members
       }
       mufD  = colMeans(Nf[!sel,]) # compute sample mean of disturbed ensemble members
-      pfD = try(solve(var(Nf[!sel,]))) # compute sample covariance of disturbed ensemble members
+      CfD = var(Nf[!sel,])
+      pfD = try(solve(CfD)) # compute sample covariance of disturbed ensemble members
     } 
     if(sum(!sel) <= 2 || "try-error" %in% class(pfD)) {   ## backup values if the ensemble stats fail
       mufD = c(dist$mu0[1], mean(Nf[,2]),  dist$mu0[2]) # use default disturbance mean            
-      pfD  = solve(diag(c(0.15,0.5,0.25)^2)) # use hard-coded precision (Question: where does this come from?)
+      CfD = diag(c(0.15,0.5,0.25)^2)
+      pfD  = solve(CfD) # use hard-coded precision
     }
     Nf <- tobit(Nf)
     
+    ## estimate forecast parameters
+    pD = 0.1 # pD = as.numeric(dist$p.dist) ## disturbance rate
+    mufN = colMeans(Nf[sel,])    ## Not disturbed forecast means
+    CfN = var(Nf[sel,])
+    pfN = solve(CfN)  ## Not disturbed forecast precision
+    
     ## estimate prior parameters
     pD    = as.numeric(dist$p.dist)         ## disturbance rate
-    mufN = colMeans(Nf[sel,])    ## Not disturbed forecast means
-    mufD = mufD   ## Disturbed forecast means
-    pfN  = solve(var(Nf[sel,]))  ## Not disturbed forecast precision
-    pfD  = pfD  ## Disturbed forecast precision
     
     ## Analysis
     H = which(!is.na(Y[t,]))
@@ -165,27 +161,13 @@ SSSD.model <- function(Y,R,Q,PAR,Xic,THETA,dist){
       mat_H[H] <- 1
       R_H = R[H, H]
       C_starD = solve(pfD + t(mat_H) %*% ((1/R_H) * mat_H))
-      print("C_starD:")
-      print(C_starD)
       m_starD = C_starD %*% (pfD %*% mufD + (t(mat_H) * (1/R_H) * Y[t,H]))
-      print("m_starD:")
-      print(m_starD)
       C_starN = solve(pfN + t(mat_H) %*% ((1/R_H) * mat_H))
-      print("C_starN:")
-      print(C_starN)
       m_starN = C_starN %*% (pfN %*% mufN + (t(mat_H) * (1/R_H) * Y[t,H]))
-      print("m_starN:")
-      print(m_starN)
-      pD_star = pD * dnorm(Y[t,H], mat_H %*% mufD, mat_H %*% solve(pfD) %*% t(mat_H) + R_H)
-      print("pD likelihood:")
-      print(dnorm(Y[t,H], mat_H %*% mufD, mat_H %*% solve(pfD) %*% t(mat_H) + R_H))
-      pN_star = (1-pD) * dnorm(Y[t,H], mat_H %*% mufN, mat_H %*% solve(pfN) %*% t(mat_H) + R_H)
-      print("pN likelihood")
-      print(dnorm(Y[t,H], mat_H %*% mufN, mat_H %*% solve(pfN) %*% t(mat_H) + R_H))
-      print("p.dist")
-      print(dist$p.dist)
-      print("observation")
-      print(Y[t, H])
+      
+      # posterior mixture weights
+      pD_star = pD * dnorm(Y[t,H], mat_H %*% mufD, mat_H %*% solve(pfD) %*% t(mat_H) + R_H) # posterior probability of disturbance
+      pN_star = (1-pD) * dnorm(Y[t,H], mat_H %*% mufN, mat_H %*% solve(pfN) %*% t(mat_H) + R_H) # posterior probability of not being disturbed
       total = pD_star + pN_star
       if (total > 0) {
         pD_star = pD_star / total
@@ -229,8 +211,8 @@ SSSD.model <- function(Y,R,Q,PAR,Xic,THETA,dist){
             Xf   = Nf,
             cf   = d.forecast,
             mu.f = rbind(mufN,mufD),
-            Pf   = abind::abind(solve(pfN),
-                   solve(pfD),
+            Pf   = abind::abind(CfN,
+                   CfD,
                    along=3),  # covariance matrices for undisturbed / disturbed ensemble states
             Pp.mu.a = cbind(m_starN, m_starD),
             Pp.Pa = abind::abind(C_starN, C_starD, along=3),
@@ -239,10 +221,8 @@ SSSD.model <- function(Y,R,Q,PAR,Xic,THETA,dist){
     } else {
       Na = cbind(rep(0,nrow(Nf)),Nf) # put dummy data for Ca
     }
-    Ca <- Na[,1] ## updated classf assignments
+    Ca <- Na[,1] ## updated class assignments
     Na <- tobit(Na[,-1])
-    #  sel.ic <- sample.int(nrow(dat), ne, replace=TRUE)
-    #  Na <- dat[sel.ic,nsel]
     Analysis[[t]] <- list(Na = Na,
                           Ca = Ca,
                           CI = apply(Na,2,quantile,c(0.025,0.25,0.5,0.75,0.975)),
@@ -306,8 +286,8 @@ pairs(ICprior)
 Rmult = c(1,0.1,0.01,0.001)
 Qmult = c(1,10)
 Pmult = c(1)
-Ri = 4 #4
-Qi = 2 #2
+Ri = 1 #4
+Qi = 1 #2
 Pi = 1
 #i = 181  # 177:263 = #fire
 od = c(83:176,264:356)
@@ -330,8 +310,6 @@ for(i in 83:356){
     V0 =  diag(c(0.15,PBVAR[4,dtype])^2), #variance in retention Question(where do the woody biomass mean / variance parameters come from?)
     alloc.soil = 0.05        ## made up  
   )
-  print("disturbance probability:")
-  print(dist$p.dist)
   test = SSSD.model(Y = Yi,R=R,Q=Q,
                   PAR=rad[i,],Xic=ICprior,THETA=theta[1:11],
                   dist = dist)
@@ -411,18 +389,17 @@ tlo = 28            ## time of last observation
 for(i in seq_along(exps)){
   if(is.null(elist[[exps[i]]])){
     esel <- which(exp==exps[i])
-    distrate = rep(NA,nrow(dextract))
-    divergence = predist = distsize = matrix(NA,nrow(dextract),6) ## pre and post disturbance biomass pools (w/uncertainty)
+    distrate = rep(NA,nrow(dextract)) # 1 x (number of sites)
+    divergence = predist = distsize = matrix(NA,nrow(dextract),6) ## pre and post disturbance biomass pools (w/uncertainty) nsite x 6
     for(j in seq_along(esel)){
       ## load file
       load(runs[esel[j]])
       k = as.numeric(unlist(strsplit(runs[esel[j]],"_",fixed=TRUE))[3])
-
+      
       ## extract detection rate
-      distrate[k]=test$Analysis[[t04]]$mu["D"]
+      distrate[k]=test$Analysis[[t04]]$mu["D"] # posterior probability of disturbance
 
       ## capture of disturbance change
-      print(test$Analysis[[t04-1]])
       predist[k,1]    = test$Analysis[[t04-1]]$mu["n[3]"]
       predist[k,2:6]  = test$Analysis[[t04-1]]$CI[,"n[3]"]
       distsize[k,1]   = test$Analysis[[t04]]$mu["n[3]"]
@@ -441,11 +418,10 @@ for(i in seq_along(exps)){
 } ## end loop over experiments
 
 ## grab matching data
-obs.pre  = Yw[,t04-1]
-obs.dist = Yw[,t04]
-obs.tlo  = Yw[,tlo]
-obs.class= dextract[,"t2004"]/10
-
+obs.pre  = Yw[,t04-1] # 1 x nsite (observation before disturbance)
+obs.dist = Yw[,t04] # observation during disturbance
+obs.tlo  = Yw[,tlo] # observation during last timestep
+obs.class= dextract[,"t2004"]/10 # 1 x nsite
 save(elist,obs.pre,obs.dist,obs.tlo,obs.class,file="elist.RData")
 ```
 
@@ -454,7 +430,7 @@ save(elist,obs.pre,obs.dist,obs.tlo,obs.class,file="elist.RData")
 
 ```{r}
 pdf("OR_exps_diagnostics.pdf")
-trim <- function(x,lo=0.0001,hi=0.9999){
+trim <- function(x,lo=0.0001,hi=0.9999) {
   x[x<lo] <- lo
   x[x>hi] <- hi
   return(x)
@@ -465,13 +441,12 @@ betatrim <- function(y){
 }
 stats <- list()
 for(i in seq_along(exps)){
-  
   ## divergence
   div = (elist[[i]]$divergence[,1] - obs.tlo)/
-    (apply(elist[[i]]$divergence[,c(2,6)],1,diff)*0.5)
-  div.reg    = lm(div~obs.tlo)
-  div.median = median(div,na.rm = TRUE)
-  div.cov    = sum(div < 1 & div > -1,na.rm=TRUE)/sum(!is.na(div))
+    (apply(elist[[i]]$divergence[,c(2,6)],1,diff)*0.5) # 1 x nsite (compute filter divergence)
+  div.reg    = lm(div~obs.tlo) # linear model for div in terms of obs.tlo
+  div.median = median(div,na.rm = TRUE) # compute median divergence
+  div.cov    = sum(div < 1 & div > -1,na.rm=TRUE)/sum(!is.na(div)) # % of sites with filter divergence outside of (-1, 1)
 
   
   hist(div,main=exps[i])
@@ -510,28 +485,28 @@ for(i in seq_along(exps)){
   lines(pred.seq$distprop,predict(dist.beta.prop,newdata=pred.seq),col="green")
   
   ## vs ABSOLUTE disturbance size
-  distabs = obs.pre-obs.dist
-  pred.seq$distabs = seq(min(distabs),max(distabs),length=500)
-  dist.beta.abs = betareg::betareg(distrate2 ~ distabs | distabs,
-                                   na.action=na.omit,
-                                   link="logit",
-                                   link.phi = "identity",
-                                   start=c(0,5,0.5,0),
-                                   type="BR")
-  dist.qb.abs = glm(distrate ~ distabs,
-                    na.action=na.omit,
-                    family=quasibinomial("logit")
-  )
-  dist.bin.abs = glm(round(distrate) ~ distabs,
-                    na.action=na.omit,
-                    family=binomial("logit")
-  )
-  plot(distabs,distrate,col=obs.class,main=exps[i])
-  lines(pred.seq$distabs,predict(dist.beta.abs,newdata=pred.seq,type="quantile"),col="green")
-  lines(pred.seq$distabs,predict(dist.beta.abs,newdata=pred.seq,type="quantile",at=0.75),col="green",lty=2)
-  lines(pred.seq$distabs,predict(dist.beta.abs,newdata=pred.seq,type="quantile",at=0.25),col="green",lty=2)
-  lines(pred.seq$distabs,predict(dist.qb.abs,newdata=pred.seq,type="response"),col="purple")
-  lines(pred.seq$distabs,predict(dist.bin.abs,newdata=pred.seq,type="response"),col="blue")
+  # distabs = obs.pre-obs.dist
+  # pred.seq$distabs = seq(min(distabs, na.rm = TRUE),max(distabs, na.rm = TRUE),length=500)
+  # dist.beta.abs = betareg::betareg(distrate2 ~ distabs | distabs,
+  #                                  na.action=na.omit,
+  #                                  link="logit",
+  #                                  link.phi = "identity",
+  #                                  start=c(0,5,0.5,0),
+  #                                  type="BR")
+  # dist.qb.abs = glm(distrate ~ distabs,
+  #                   na.action=na.omit,
+  #                   family=quasibinomial("logit")
+  # )
+  # dist.bin.abs = glm(round(distrate) ~ distabs,
+  #                   na.action=na.omit,
+  #                   family=binomial("logit")
+  # )
+  # plot(distabs,distrate,col=obs.class,main=exps[i])
+  # lines(pred.seq$distabs,predict(dist.beta.abs,newdata=pred.seq,type="quantile"),col="green")
+  # lines(pred.seq$distabs,predict(dist.beta.abs,newdata=pred.seq,type="quantile",at=0.75),col="green",lty=2)
+  # lines(pred.seq$distabs,predict(dist.beta.abs,newdata=pred.seq,type="quantile",at=0.25),col="green",lty=2)
+  # lines(pred.seq$distabs,predict(dist.qb.abs,newdata=pred.seq,type="response"),col="purple")
+  # lines(pred.seq$distabs,predict(dist.bin.abs,newdata=pred.seq,type="response"),col="blue")
 
   ## vs divergence
   absdiv = abs(div)
@@ -547,10 +522,10 @@ for(i in seq_along(exps)){
   lines(pred.seq$absdiv,predict(dist.beta.absdiv,newdata=pred.seq),col="green")
   lines(pred.seq$absdiv,predict(dist.bin.absdiv,newdata=pred.seq,type="response"),col="blue")
 
- dist.qb.combo = glm(distrate2 ~ obs.pre + distprop +
-                        distabs + absdiv + obs.class,
-                      na.action=na.omit,
-                      family=quasibinomial("logit"))
+ # dist.qb.combo = glm(distrate2 ~ obs.pre + distprop +
+ #                        distabs + absdiv + obs.class,
+ #                      na.action=na.omit,
+ #                      family=quasibinomial("logit"))
   dist.bin.combo = glm(round(distrate) ~ obs.pre + distprop +
                         distabs + absdiv + as.factor(obs.class),
                       na.action=na.omit,
@@ -559,23 +534,23 @@ for(i in seq_along(exps)){
 # dist.beta.combo = betareg::betareg(distrate2 ~ obs.pre + obs.class + distabs + absdiv,
 #                                   na.action=na.omit,link="logit")
   
-  stats[[i]] <- list(
-    div.reg = div.reg,
-    div.median = div.median,
-    div.cov = div.cov,
-    dist.bar = dist.bar,
-    dist.class = dist.class,
-    dist.pre =  dist.beta.pre,
-    dist.prop = dist.beta.prop,
-    dist.beta.abs =  dist.beta.abs,
-    dist.bin.abs  = dist.bin.abs,
-    dist.absdiv   = dist.beta.absdiv,
-    dist.combo = dist.bin.combo
-  )
+  # stats[[i]] <- list(
+  #   div.reg = div.reg,
+  #   div.median = div.median,
+  #   div.cov = div.cov,
+  #   dist.bar = dist.bar,
+  #   dist.class = dist.class,
+  #   dist.pre =  dist.beta.pre,
+  #   dist.prop = dist.beta.prop,
+  #   dist.beta.abs =  dist.beta.abs,
+  #   dist.bin.abs  = dist.bin.abs,
+  #   dist.absdiv   = dist.beta.absdiv,
+  #   dist.combo = dist.bin.combo
+  # )
 
 }
 dev.off()
-save(stats,file="stats.RData")
+#save(stats,file="stats.RData")
 ```
 
 

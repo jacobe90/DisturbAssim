@@ -26,10 +26,6 @@ multi.analytical.ens.adj <- function(Xf, cf, mu.f, Pf, Pp.mu.a, Pp.Pa, Pp.w, uc=
   df = df/sum(df)    ## posterior reassignment frequency
   cA = cf            ## class assigned in the Analysis
   for(i in seq_along(uc)){
-    print("ff:")
-    print(ff)
-    print("weights:")
-    print(Pp.w)
     if(Pp.w[i] < ff[i]){   ## if a class decreases in frequency in the analysis
       sel.c = which(cf == uc[i])
       cA[sel.c] = sample(uc,length(sel.c),prob=df,replace = TRUE) # sample new classes according to reassignment frequencies
@@ -57,9 +53,6 @@ multi.analytical.ens.adj <- function(Xf, cf, mu.f, Pf, Pp.mu.a, Pp.Pa, Pp.w, uc=
     Z[is.infinite(Z)] <- 0
   }
   
-  print("test printout:")
-  print(mu.f[k,])
-  
   ### ANALYSIS
   # rescale the ensemble members from Z-space (zero mean, identity cov)
   #.  into posterior space (posterior mean, posterior sample covariance)
@@ -73,23 +66,12 @@ multi.analytical.ens.adj <- function(Xf, cf, mu.f, Pf, Pp.mu.a, Pp.Pa, Pp.w, uc=
     L_a  <- S_a$d
     V_a  <- S_a$v
     
-    # print(Pp.Pa[k])
-    # print(V_a)
-    # print(diag(sqrt(L_a)))
-    
     ## analysis ensemble 
     for(i in sel.c){
       # we decomposed Pa - then it's putting it back together but with a different Z which comes from the likelihood of that ens    
       X_a[i,] <- V_a %*%diag(sqrt(L_a))%*%Z[i,] + Pp.mu.a[,k]
     }
   }
-  
-  print("test printout 2:")
-  print(Pp.mu.a[,k])
-  print(Pp.Pa[,,k])
-  
-  print("mean of posterior ensemble:")
-  print(colMeans(X_a))
   
   return(cbind(cA,X_a))
   
