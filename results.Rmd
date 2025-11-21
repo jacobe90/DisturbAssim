@@ -230,7 +230,7 @@ layout(m)
 
 ### Row 1: Example time-series ###
 site = 185 # 188
-exp.name = c("P1Q1R1","P1Q1R0.001")
+exp.name = c("P1Q1R0.01","P1Q1R0.001")
 exp.pretty.name = c("(a) Example site, Original","(c) Example site, Low Obs Error")
 pool.names=c("Leaf","Soil","AGB")
 i = 3 ## Stem
@@ -275,7 +275,7 @@ div.pretty.name = c("(b) Divergence, Original","(e) Divergence, Low Obs Error")
 div.reg <- list()
 div.class <- list()
 obs.class.re = obs.class; obs.class.re[obs.class.re ==4] = 3; obs.class.re[obs.class.re ==5] = 4; obs.class.re = obs.class.re + 1
-for(i in c(8,5)){
+for(i in c(6,5)){
   ## divergence
   div = (elist[[i]]$divergence[,1] - obs.tlo)/
     (apply(elist[[i]]$divergence[,c(2,6)],1,diff)*0.5)
@@ -302,7 +302,7 @@ distabs = obs.pre-obs.dist
 pred.seq$distabs = seq(min(distabs),max(distabs),length=500)
 detect.pretty.name = c("(c) Probability of detection, Original","(f) Probability of Detection, Low Obs Error")
 dist.qb.abs <- list()
-for(i in c(8,5)){
+for(i in c(6,5)){
   distrate = distrate = elist[[i]]$distrate
   dist.qb.abs[[i]] = glm(distrate ~ distabs,
                     na.action=na.omit,
@@ -329,23 +329,35 @@ m = matrix(1:2,nrow=2,byrow = TRUE)
 layout(m)
 ## Divergence
 div.cov = sapply(stats,"[[","div.cov")
-plot(Rmult[Rs],div.cov,col=Qs,pch=Qs,log="x",xlab="Variance Multiplier",ylab="Filter Coverage",main="(a) Filter Coverage")
+plot(rev(expGrid$Rmult),div.cov,col=rev(expGrid$Qmult),pch=rev(expGrid$Qmult),log="x",xlab="Variance Multiplier",ylab="Filter Coverage",main="(a) Filter Coverage")
 legend("topright",legend=paste0(Qmult[1:2],"x"),col=1:2,pch=1:2,title="Q")
 
-#div.median = sapply(stats,"[[","div.median")
-#plot(Rmult[Rs],div.median,col=Qs,pch=Qs,log="x",xlab="Variance Multiplier",ylab="Median Divergance",main="(b) Filter Divergence")
-#legend("topleft",legend=paste0(Qmult[1:2],"x"),col=1:2,pch=1:2)
+div.median = sapply(stats,"[[","div.median")
+plot(rev(expGrid$Rmult),div.median,col=rev(expGrid$Qmult),pch=rev(expGrid$Qmult),log="x",xlab="Variance Multiplier",ylab="Median Divergance",main="(b) Filter Divergence")
+legend("topleft",legend=paste0(Qmult[1:2],"x"),col=1:2,pch=1:2)
 
 ## Detection probability
-for(i in 3:6){
+for(i in 1:8){
   distrate = distrate = elist[[i]]$distrate
   dist.qb.abs[[i]] = glm(distrate ~ distabs,
                     na.action=na.omit,
                     family=quasibinomial("logit")
   )
 }
-thresh = sapply(dist.qb.abs,function(x){bm=coef(x); -bm[1]/bm[2]})
-plot(Rmult[Rs],thresh,col=Qs,pch=Qs,log="x",xlab="Variance Multiplier",ylab=expression("Detection Threshold" ~ (kgC/m^2)),main="(b) Disturbance Detection Threshold")
+# # print(dist.qb.abs)
+coef(dist.qb.abs[[8]])
+thresh = sapply(dist.qb.abs,function(x){
+  bm=coef(x);
+  print(bm);
+  if(!is.null(bm)) {
+    -bm[1]/bm[2]
+  }
+  else {
+    NULL
+  }
+});
+thresh = unlist(lapply(thresh, function(v) if (is.null(v)) NA else v));
+plot(rev(expGrid$Rmult),thresh,col=rev(expGrid$Qmult),pch=rev(expGrid$Qmult),log="x",xlab="Variance Multiplier",ylab=expression("Detection Threshold" ~ (kgC/m^2)),main="(b) Disturbance Detection Threshold")
 legend("topleft",legend=paste0(Qmult[1:2],"x"),col=1:2,pch=1:2)
 ```
 

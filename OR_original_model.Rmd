@@ -283,12 +283,12 @@ runDA <- function(Rmult, Qmult, Pmult, siteIndices) {
     NT = floor(ncol(rad)/365)
     Yi = matrix(NA,NT,3)  ## observed data
     Yi[1:ncol(Yw),3] = Yw[i,]  ## only Cw observed (Question: where do Yi observations come from?)
-    R = diag(rep(Rw,3))*Rmult[Ri]    ## observation error
-    Q = diag(c(Ql,Qsoil,Qw)^2)*Qmult[Qi]  ## process error
+    R = diag(rep(Rw,3))*Rmult=    ## observation error
+    Q = diag(c(Ql,Qsoil,Qw)^2)*Qmult  ## process error
     dtype = which(names(d.prior) == dextract[i,"t2004"])
     if(length(dtype)==0) break
     dist <- list(              ## disturbance parameters
-      p.dist = d.prior[dtype]*Pmult[Pi],     ## disturbance probability (Question: where do disturbance probabilities come from?)
+      p.dist = d.prior[dtype]*Pmult,     ## disturbance probability (Question: where do disturbance probabilities come from?)
       mu0 = c(0.2,PBBAR[4,dtype]),   ## % retention [leaf,agb], first parameter made up, should include soil
       V0 =  diag(c(0.15,PBVAR[4,dtype])^2), #variance in retention Question(where do the woody biomass mean / variance parameters come from?)
       alloc.soil = 0.05        ## made up  
@@ -469,6 +469,8 @@ for(i in seq_along(exps)){
   div = (elist[[i]]$divergence[,1] - obs.tlo)/
     (apply(elist[[i]]$divergence[,c(2,6)],1,diff)*0.5)
   div.reg    = lm(div~obs.tlo)
+  print("div.reg")
+  print(div.reg)
   div.median = median(div,na.rm = TRUE)
   div.cov    = sum(div < 1 & div > -1,na.rm=TRUE)/sum(!is.na(div))
 

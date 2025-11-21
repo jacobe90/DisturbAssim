@@ -148,6 +148,7 @@ plot(Observed_states[,3])
 ```
 
 ```{r echo=FALSE, message=FALSE, results='hide'}
+ensemble_adjustment <- FALSE # run ensemble adjustment (or sample directly from posterior)
 
 AnalysisSSSDMP <- "  ## SingleSite SingleDisturbance MultiPool
 model{
@@ -160,7 +161,7 @@ model{
   Y ~ dmnorm(n,R)                       ## Observation error
 }"
 
-Ensemble_initial <- Ensemble_initial_kalman <- Ensemble_initial.orig
+Ensemble_initial <- Ensemble_stochastic <- Ensemble_initial_kalman <- Ensemble_initial.orig
 THETA_Kalman <- THETA # stored states for experiment without pure ensemble Kalman Filter
 for(t in 1:NYears){
   
@@ -234,50 +235,52 @@ for(t in 1:NYears){
   post_mufD = post_PfD%*%(solve(R)%*%Observed_states[t,] + Forecast[[t]]$pfD%*%mufD)
   
   # Compute component weights
-  print("forecasted and observed mean")
-  print("no disturbance")
-  print(mufN)
-  print("disturbance")
-  print(mufD)
-  print("observed:")
-  print(Observed_states[t,])
-  print("posterior means")
-  print("no disturbance")
-  print(post_mufN)
-  print("disturbance")
-  print(post_mufD)
   w_N = (1 - p.dist) * dmvnorm(Observed_states[t,], mean=mufN, sigma=PfN + R)
   w_D = p.dist * dmvnorm(Observed_states[t,], mean=mufD, sigma=PfD + R)
   total <- w_N + w_D
-  print("w_N and w_D:")
-  print(w_N)
-  print(w_D)
   w_N = w_N / total
   w_D = w_D / total
-  print("normalized w_N and w_D:")
-  print(w_N)
-  print(w_D)
   weights = c(w_N, w_D)
   
-  ## Ensemble adjustment
-  Ensemble_initial <- multi.analytical.ens.adj(
-          Xf   = Forecast_means,
-          cf   = d.prior,
-          mu.f = rbind(priors$mufN,priors$mufD),
-          Pf   = abind::abind(solve(priors$pfN),
-                 solve(priors$pfD),
-                 along=3),  # covariance matrices for undisturbed / disturbed ensemble states
-          Pp.mu.a = cbind(post_mufN, post_mufD),
-          Pp.Pa = abind::abind(post_PfN, post_PfD, along=3),
-          Pp.w = weights,
-          )
-  Ca <- Ensemble_initial[,1] ## updated class assignments (get prepended from call to multi.ens.adj)
-  Ensemble_initial <- tobit(Ensemble_initial[,-1]) ## remove class assignments
-  Analysis[[t]] <- list(Na = Ensemble_initial,
-                        Ca = Ca,
-                        mu.a = cbind(post_mufN, post_mufD),
-                        Pa = abind::abind(post_PfN, post_PfD, along=3),
-                        w = weights)
+  if (ensemble_adjustment) {
+    ## Ensemble adjustment
+    Ensemble_initial <- multi.analytical.ens.adj(
+            Xf   = Forecast_means,
+            cf   = d.prior,
+            mu.f = rbind(priors$mufN,priors$mufD),
+            Pf   = abind::abind(solve(priors$pfN),
+                   solve(priors$pfD),
+                   along=3),  # covariance matrices for undisturbed / disturbed ensemble states
+            Pp.mu.a = cbind(post_mufN, post_mufD),
+            Pp.Pa = abind::abind(post_PfN, post_PfD, along=3),
+            Pp.w = weights,
+            )
+    Ca <- Ensemble_initial[,1] ## updated class assignments (get prepended from call to multi.ens.adj)
+    Ensemble_initial <- tobit(Ensemble_initial[,-1]) ## remove class assignments
+    Analysis[[t]] <- list(Na = Ensemble_initial,
+                          Ca = Ca,
+                          mu.a = cbind(post_mufN, post_mufD),
+                          Pa = abind::abind(post_PfN, post_PfD, along=3),
+                          w = weights)
+  } else {
+    ## Multinomial sampling directly from the posterior
+    Ca <- rbinom(n_ensemble_members, size=1, prob=weights[2])
+    Pp.mu.a <- t(cbind(post_mufN, post_mufD))
+    Pp.Pa <- abind::abind(post_PfN, post_PfD, along=3)
+    for (i in 1:n_ensemble_members) {
+      distclass <- Ca[i] + 1
+      Ensemble_initial[i,] <- mvtnorm::rmvnorm(1, mean=Pp.mu.a[distclass,], sigma=Pp.Pa[,,distclass])
+      Ensemble_initial[i,] <- tobit(Ensemble_initial[i,])
+    }
+    Analysis[[t]] <- list(Na = Ensemble_stochastic,
+                                     Ca = Ca,
+                                     mu.a = cbind(post_mufN, post_mufD),
+                                     Pa = abind::abind(post_PfN, post_PfD, along=3),
+                                     w = weights)
+  }
+  
+  
+  
   
   ## EnKF Analysis
   I = H <- diag(rep(1,3))
@@ -293,6 +296,11 @@ for(t in 1:NYears){
 ```
 
 
+```{r}
+for (i in 1:length(Analysis)) {
+  print(Analysis[[i]]$w)
+}
+```
 ### time series
 
 ```{r}
