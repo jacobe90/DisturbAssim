@@ -1,3 +1,5 @@
+# mac stuff
+*.DS_Store
 # experiment data
 *.RData
 

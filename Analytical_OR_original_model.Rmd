@@ -69,7 +69,7 @@ plot(metTime,rad[1,],type='l')
 ```{r,echo=FALSE,results='hide',message=FALS}
 ##' Single Site, Single Disturbance
 ##' @param Y observed data
-##' @param R observation error
+##' @param Rparams 2 element list [slope, intercept] mapping data value to observation error (R) value
 ##' @param Q process error
 ##' @param Xic state initial condition matrix
 ##' @param THETA parameter matrix
@@ -77,7 +77,7 @@ plot(metTime,rad[1,],type='l')
 ##' @param updateQ if true, conditionally update the process error Q based on observations
 ##' @param useAdjustment if true, use ensemble adjustment. If false, just sample from the posterior.
 ##' @param use_analytical_posterior if true use analytical posterior, if false use MCMC to sample from the posterior
-SSSD.model <- function(Y,R,Q,PAR,Xic,THETA,dist,updateQ=TRUE, useAdjustment=TRUE, use_analytical_posterior=TRUE){
+SSSD.model <- function(Y,Rparams,Q,PAR,Xic,THETA,dist,updateQ=TRUE, useAdjustment=TRUE, use_analytical_posterior=TRUE){
   
   ## init
   NT = length(PAR)/365
@@ -160,7 +160,7 @@ SSSD.model <- function(Y,R,Q,PAR,Xic,THETA,dist,updateQ=TRUE, useAdjustment=TRUE
         H = as.numeric(H[1])
         mat_H = matrix(0, 1, 3)
         mat_H[H] <- 1
-        R_H = R[H, H]
+        R_H <- Y[t,H] * Rparams[1] + Rparams[2] # compute heteroskedastic observation error
         C_starD = solve(pfD + t(mat_H) %*% ((1/R_H) * mat_H))
         m_starD = C_starD %*% (pfD %*% mufD + (t(mat_H) * (1/R_H) * Y[t,H]))
         C_starN = solve(pfN + t(mat_H) %*% ((1/R_H) * mat_H))
@@ -236,7 +236,8 @@ SSSD.model <- function(Y,R,Q,PAR,Xic,THETA,dist,updateQ=TRUE, useAdjustment=TRUE
                      pfN  = pfN,  ## Not disturbed forecast precision
                      pfD  = pfD  ## Disturbed forecast precision
         )
-        update = c(list(Y=Y[t,],R=solve(R)),priors,H = which(!is.na(Y[t,])))
+        Rprec <- 1/(Y[t,] * Rparams[1] + Rparams[2]) # R precision value
+        update = c(list(Y=Y[t,],R=diag(c(Rprec, Rprec, Rprec))),priors,H = which(!is.na(Y[t,])))
         mod <- rjags::jags.model(file=textConnection(AnalysisSSSDMP),
                                  data=update,
                                  n.adapt=1000,n.chains=3,quiet=TRUE)
@@ -434,7 +435,8 @@ pairs(ICprior)
 ### wrapper function to run data assimilation
 ```{r}
 ##' @description runDA: function to run data assimilation given R / Q / P multipliers
-##' @param Rmult -- multiplier for observation error, R
+##' @param Rparams[2] -- A list of the form [m, b] containing the slope / intercept of observation error line. 
+##'                      R = m * [measured wood carbon (kg / m^2)] + b
 ##' @param Qmult -- multiplier for process error, Q
 ##' @param Pmult -- multiplier for disturbance probability
 ##' @param updateQ if true, conditionally update the process error Q based on observations
@@ -442,17 +444,20 @@ pairs(ICprior)
 ##' @param use_analytical_posterior
 ##' @param siteIndices indices of Oregon sites to run with
 ##' @param expName name of experiment to use in output file names
-runDA <- function(Rmult, Qmult, Pmult, updateQ, useAdjustment, use_analytical_posterior, siteIndices, expName) {
+runDA <- function(Rparams, updateQ, useAdjustment, use_analytical_posterior, siteIndices, expName) {
   for(i in siteIndices){
-    ofile = paste0(expName,"_OR_SD_",
-                   formatC(i, width = 3, format = "d", flag = "0"),
-                   "_P",Pmult,"Q",Qmult,"R",Rmult,".RData")
+    ofile = paste0(
+        "experiments/final/",
+        expName, "_OR_SD_",
+        formatC(i, width = 3, format = "d", flag = "0"),
+        ".RData"
+    )
+    
     print(ofile)
     NT = floor(ncol(rad)/365)
     Yi = matrix(NA,NT,3)  ## observed data
     Yi[1:ncol(Yw),3] = Yw[i,]  ## only Cw observed (Question: where do Yi observations come from?)
-    R = diag(rep(Rw,3))*Rmult    ## observation error
-    Q = diag(c(Ql,Qsoil,Qw)^2)*Qmult  ## process error
+    Q = diag(c(Ql,Qsoil,Qw)^2)  ## process error
     dtype = which(names(d.prior) == dextract[i,"t2004"])
     if(length(dtype)==0) break
     dist <- list(              ## disturbance parameters
@@ -461,7 +466,7 @@ runDA <- function(Rmult, Qmult, Pmult, updateQ, useAdjustment, use_analytical_po
       V0 =  diag(c(0.15,PBVAR[4,dtype])^2), #variance in retention Question(where do the woody biomass mean / variance parameters come from?)
       alloc.soil = 0.05        ## made up  
     )
-    test = SSSD.model(Y = Yi,R=R,Q=Q,
+    test = SSSD.model(Y = Yi,Rparams=Rparams,Q=Q,
                     PAR=rad[i,],Xic=ICprior,THETA=theta[1:11],
                     dist = dist, useAdjustment=useAdjustment, updateQ=updateQ, 
                     use_analytical_posterior = use_analytical_posterior)
@@ -470,6 +475,37 @@ runDA <- function(Rmult, Qmult, Pmult, updateQ, useAdjustment, use_analytical_po
 }
 ```
 
+
+## Compare results with GEDI Mean / Landtrendr mean, with and without observation error heteroskedasticity
+```{r}
+od = c(83:176,264:356)
+fullRun = c(83:356)
+
+RGEDImean <- 0.8848249 # kg / m^2
+RLandTrendrmean <- 3.79986 # kg / m^2
+RparamsGEDIfixed <- c(RGEDImean, 1)
+RparamsLandTrendrfixed <- c(RLandTrendrmean, 1)
+RparamsGEDIheteroskedastic <- c(0.01331, 0.09761) # from 0.5 quantile regression line: c(0.01159707, 0.04660497)
+
+# compute intercept for Landtrendr heteroskedastic params
+Cwmean <- (RGEDImean - RparamsGEDIheteroskedastic[2]) / RparamsGEDIheteroskedastic[1]
+Landtrendrslope <- RparamsGEDIheteroskedastic[1]
+Landtrendrintercept <- RLandTrendrmean - Landtrendrslope * Cwmean
+RparamsLandtrendrheteroskedastic <- c(Landtrendrslope, Landtrendrintercept)
+
+# experiment Rgedi_Hfalse_Dfalse
+# runDA(Rparams=RparamsGEDIfixed, updateQ=TRUE, useAdjustment=TRUE, use_analytical_posterior=TRUE, siteIndices=fullRun, expName="Rgedi_Hfalse_Dfalse") # R = (gedi, landtrendr), H = heteroskedastic = (true, false), D = disturbance product = (true, false)
+
+# experiment Rlandtrendr_Hfalse_Dfalse
+# runDA(Rparams=RparamsLandTrendrfixed, updateQ=TRUE, useAdjustment=TRUE, use_analytical_posterior=TRUE, siteIndices=fullRun, expName="Rlandtrendr_Hfalse_Dfalse") # R = (gedi, landtrendr), H = heteroskedastic = (true, false), D = disturbance product = (true, false)
+
+# experiment Rgedi_Htrue_Dfalse
+# runDA(Rparams=RparamsGEDIheteroskedastic, updateQ=TRUE, useAdjustment=TRUE, use_analytical_posterior=TRUE, siteIndices=fullRun, expName="Rgedi_Htrue_Dfalse") # R = (gedi, landtrendr), H = heteroskedastic = (true, false), D = disturbance product = (true, false)
+
+# experiment Rlandtrendr_Htrue_Dfalse
+runDA(Rparams=RparamsLandtrendrheteroskedastic, updateQ=TRUE, useAdjustment=TRUE, use_analytical_posterior=TRUE, siteIndices=fullRun, expName="Rlandtrendr_Htrue_Dfalse") # R = (gedi, landtrendr), H = heteroskedastic = (true, false), D = disturbance product = (true, false)
+
+```
 
 ## experiment: use_analytical_posterior=FALSE / updateQ=FALSE
 ```{r}
@@ -849,9 +885,9 @@ for (runfile in runs) {
 }
 ```
 
-## analyze sites - just one disturbance
+## Run ATrueQFalse for full test run
 ```{r}
-Rmult = c(1,0.1,0.01,0.001)
+Rmult = c(1,0.001)
 Qmult = c(1)
 Pmult = c(1)
 #i = 181  # 177:263 = #fire
@@ -864,146 +900,25 @@ testHighAbsDist = c(107, 125, 137, 149, 161) # sites with large disturbances
 expGrid <- expand.grid(Rmult=Rmult, Qmult=Qmult, Pmult=Pmult)
 for (i in seq_len(nrow(expGrid))) {
   row <- expGrid[i, ]  # extract a combo of R / Q / P
-  runDA(Rmult=row$Rmult, Qmult=row$Qmult, Pmult=row$Pmult, updateQ=TRUE, useAdjustment=FALSE, siteIndices=testHighAbsDist) # run data assimilation experiment
+  runDA(Rmult=row$Rmult, Qmult=row$Qmult, Pmult=row$Pmult, updateQ=FALSE, useAdjustment=TRUE, use_analytical_posterior=TRUE, siteIndices=testRun, expName="ATrueQFalse") # run data assimilation experiment
 }
 ```
-
-```{r}
-
-
-# runDA(Rmult=0.001, Qmult=1, Pmult=1, updateQ=TRUE, siteIndices=263)
-
-load("Analytical_OR_SD_107_P1Q1R0.001.RData")
-print("Site 107 R0.001")
-print(test$Analysis[[15]]$muD)
-for (i in 1:28) {
-  print(test$Analysis[[i]]$muD)
-}
-
-print("Site 107 R1")
-load("Analytical_OR_SD_107_P1Q1R1.RData")
-print(test$Analysis[[15]]$muD)
-for (i in 1:28) {
-  print(test$Analysis[[i]]$muD)
-}
-
-print("Site 125 R0.001")
-load("Analytical_OR_SD_125_P1Q1R0.001.RData")
-print(test$Analysis[[15]]$muD)
-for (i in 1:28) {
-  print(test$Analysis[[i]]$muD)
-}
-
-print("Site 125 R1")
-load("Analytical_OR_SD_125_P1Q1R1.RData")
-print(test$Analysis[[15]]$muD)
-for (i in 1:28) {
-  print(test$Analysis[[i]]$muD)
-}
-# for (i in 1:28) {
-#   print(test$Analysis[[i]]$muD)
-# }
-
-
-
-```
-
-
-## visualization
-```{r}
-library(stringr)
-
-i = 181
-pool.names=c("Cleaf","Csoil","Cstem")
-runs <- dir(pattern="*.RData")
-runs <- runs[grepl("^Analytical_OR",runs)]
-print(runs)
-
-#load("Analytical_OR_SD_263_P1Q1R0.001.RData")
-# runs <- runs[grepl("84",runs)]
-for (runfile in runs) {
-  load(runfile)
-  for(i in 3){
-      CI.Na = sapply(X = test$Analysis,function(x){
-        y = x$CI
-        y[,i]
-      })
-      run.muN = sapply(X = test$Analysis, function(x) {
-        x$m_starN[i]
-      })
-      run.muD = sapply(X = test$Analysis, function(x) {
-        x$m_starD[i]
-      })
-      run.probD = sapply(X = test$Analysis, function(x) {
-        x$muD
-      }) 
-  
-      
-      # CI.Na.2 = sapply(X = test$Analysis, function(x) {
-      #   y = x$mcmc
-      #   sel.n = which(colnames(y) == paste0("n[",i,"]"))
-      #   quantile(y[,sel.n],c(0.025,0.5,0.975))
-      # })
-    plot(test$Y[,i],
-     ylim = range(rbind(CI.Na,test$Y[,i]),na.rm=TRUE),
-     type='n',
-     ylab=pool.names[i],xlab="time", main=runfile)
-
-    ecoforecastR::ciEnvelope(1:ncol(CI.Na),
-                             CI.Na[1,], CI.Na[5,],
-                             col=ecoforecastR::col.alpha('#b2df8a',0.7))
-    
-    # Median CI.Na line
-    lines(CI.Na[3,], col="#b2df8a", lwd=2)
-    
-    # μN line
-    lines(run.muN, col="#40826D", lwd=2)
-    
-    # μD line
-    lines(run.muD, col="#9D2933", lwd=2)
-    
-    # Observations
-    points(test$Y[,i], pch = 1)
-    
-    # === ADD LEGEND HERE ===
-    legend("topright",
-           legend = c("CI.mean", "muN", "muD", "observed"),
-           col    = c("#b2df8a", "#40826D", "#9D2933", "black"),
-           lwd    = c(2, 2, 2, NA),
-           pch    = c(NA, NA, NA, 1),
-           bty    = "n")
-    # ========================
-    plot(run.probD, main=paste0(runfile, " disturbance probs"))
-    lines(run.probD, col="#9D2933", lwd=2)
-  }
-  
-}
-
-```
-
- TODO:
- * why is Analysis not contracting around the data?
-    * reducing obs error by /10 didn't solve
- * why are the disturbance forecast pools crazy?
- * assess disturbance posterior
-
-## Computer experiments
-* Run under defaults
-* Run under a grid of inc process error and decrease obs error and increase disturbance probability
 
 ## postprocessing
 
 ```{r}
-## Detect set of experiments that have been run
-runs <- dir(pattern="*.RData")
-runs <- runs[grepl("^Analytical_OR",runs)]
-print(runs)
+## Detect set of experiments that have been run / sites that have been experimented with
+runs <- dir(path="./experiments/final", pattern="OR_SD")
+sites <- sapply(strsplit(runs, "_", fixed=TRUE), function(x) {
+  site <- x[6]
+  site <- as.numeric(sub(".RData", "", site))
+})
 exp = sapply(strsplit(runs,"_",fixed=TRUE),function(x){
-  sub(".RData","",x[5],fixed = TRUE)
+  x <- paste0(x[1:3], collapse="_")
 })
 exps <- unique(exp)
 print(exps) # the combos of P / Q / R multipliers experimented with
-## load experiments that haven't yet been summarized
+# load experiments that haven't yet been summarized
 elist <- list()   ## run once
 t04 = 15            ## time of disturbance assessement (2004)
 tlo = 28            ## time of last observation
@@ -1014,8 +929,9 @@ for(i in seq_along(exps)){
     divergence = predist = distsize = matrix(NA,nrow(dextract),6) ## pre and post disturbance biomass pools (w/uncertainty) nsite x 6
     for(j in seq_along(esel)){
       ## load file
-      load(runs[esel[j]])
-      k = as.numeric(unlist(strsplit(runs[esel[j]],"_",fixed=TRUE))[4])
+      load(paste0("./experiments/final/", runs[esel[j]]))
+      k = sites[esel[j]]
+      #print(k)
       ## extract detection rate
       distrate[k]=test$Analysis[[t04]]$muD # posterior probability of disturbance
 
@@ -1024,17 +940,17 @@ for(i in seq_along(exps)){
       predist[k,2:6]  = test$Analysis[[t04-1]]$CI[,3]
       distsize[k,1]   = test$Analysis[[t04]]$mu[3]
       distsize[k,2:6] = test$Analysis[[t04]]$CI[,3]
-      
+
       ## Filter divergence
       divergence[k,1]   = test$Analysis[[tlo]]$mu[3]
       divergence[k,2:6] = test$Analysis[[tlo]]$CI[,3]
     } ## end loop over individual runs
-    
+
     elist[[exps[i]]] = list(distrate=distrate,predist=predist,
                             distsize=distsize,divergence=divergence)
-    
+
   } ## end if not processed
-  
+
 } ## end loop over experiments
 
 ## grab matching data
@@ -1042,14 +958,14 @@ obs.pre  = Yw[,t04-1] # 1 x nsite (observation before disturbance)
 obs.dist = Yw[,t04] # observation during disturbance
 obs.tlo  = Yw[,tlo] # observation during last timestep
 obs.class= dextract[,"t2004"]/10 # 1 x nsite
-save(elist,obs.pre,obs.dist,obs.tlo,obs.class,file="AnalyticalElist.RData")
+save(elist,obs.pre,obs.dist,obs.tlo,obs.class,file="./experiments/final/elist.RData")
 ```
 
 
 ## analyses
 
 ```{r}
-pdf("Analytical_OR_exps_diagnostics.pdf")
+pdf("./experiments/final/exps_diagnostics.pdf")
 trim <- function(x,lo=0.0001,hi=0.9999) {
   x[x<lo] <- lo
   x[x>hi] <- hi
@@ -1067,24 +983,24 @@ for(i in seq_along(exps)){
   div.reg    = lm(div~obs.tlo) # linear model for div in terms of obs.tlo
   div.median = median(div,na.rm = TRUE) # compute median divergence
   div.cov    = sum(div < 1 & div > -1,na.rm=TRUE)/sum(!is.na(div)) # % of sites with filter divergence outside of (-1, 1)
-  
-  
+
+
   hist(div,main=exps[i])
   abline(v=c(-1,1),lty=2)
   plot(obs.tlo,div,col=obs.class,main=exps[i])
   abline(h=c(-1,1),lty=2)
   abline(div.reg,col=2)
-  
+
   ## Disturbance detection
   distrate = elist[[i]]$distrate
   hist(distrate,main=exps[i])
-  
+
   ## Disturbance skill
   ord <- order(distrate)
   plot(distrate[ord],col=obs.class[ord],main=exps[i])
   dist.bar   = mean(distrate,na.rm = TRUE)
   dist.class = tapply(distrate,obs.class,mean,na.rm=TRUE)
-  
+
   ## vs predisturbance biomass
   distrate2 = betatrim(distrate)
   pred.seq = data.frame(obs.pre=seq(0,max(obs.pre,na.rm = TRUE),length=500),
@@ -1095,7 +1011,7 @@ for(i in seq_along(exps)){
   plot(obs.pre,distrate,col=obs.class,main=exps[i])
   abline(dist.reg.pre,col=2)
   lines(pred.seq$obs.pre,predict(dist.beta.pre,newdata=pred.seq),col="green")
-  
+
   ## vs proportional disturbance size
   distprop = 1 - elist[[i]]$distsize[,1]/elist[[i]]$predist[,1] ## predicted
   distprop = 1 - obs.dist/obs.pre ## observed
@@ -1103,7 +1019,7 @@ for(i in seq_along(exps)){
                                    na.action=na.omit,link="logit")
   plot(distprop,distrate,col=obs.class,main=exps[i])
   lines(pred.seq$distprop,predict(dist.beta.prop,newdata=pred.seq),col="green")
-  
+
   ## vs ABSOLUTE disturbance size
   distabs = obs.pre-obs.dist
   pred.seq$distabs = seq(min(distabs, na.rm = TRUE),max(distabs, na.rm = TRUE),length=500)
@@ -1150,10 +1066,10 @@ for(i in seq_along(exps)){
                         distabs + absdiv + as.factor(obs.class),
                       na.action=na.omit,
                       family=binomial("logit"))
-  
+
 # dist.beta.combo = betareg::betareg(distrate2 ~ obs.pre + obs.class + distabs + absdiv,
 #                                   na.action=na.omit,link="logit")
-  
+
   stats[[i]] <- list(
     div.reg = div.reg,
     div.median = div.median,
@@ -1170,8 +1086,291 @@ for(i in seq_along(exps)){
 
 }
 dev.off()
-save(stats,file="AnalyticalStats.RData")
+save(stats,file="./experiments/final/stats.RData")
 ```
+
+## Compare Analytical (UpdateQ = False) / MCMC Results
+```{r}
+## summary figure showing didn't work great at default error rate
+m = matrix(1:6,nrow=3,byrow = TRUE)
+layout(m)
+options(repr.plot.width = 14, repr.plot.height = 14)
+
+### Row 1: Example time-series ###
+site = 185 # 188
+exp.name = "P1Q1R0.001"
+analytical_elist_idx = 1 # indices of these experiments in elist
+mcmc_elist_idx = 5
+exp.pretty.name = c("(a) Example site, ATrueQFalse, R=0.001","(c) Example site, MCMC (R = 0.001)")
+pool.names=c("Leaf","Soil","AGB")
+i = 3 ## Stem
+time = 1985:2017
+
+load(paste0("ATrueQFalse_OR_SD_",site,"_",exp.name,".RData"))
+CI.Na = sapply(X = test$Analysis,function(x){
+      y = x$CI
+      y[,i]
+    })
+plot(time,test$Y[,i],
+     ylim = range(rbind(CI.Na,test$Y[,i]),na.rm=TRUE),
+     type='n',
+     ylab=bquote(.(pool.names[i]) ~ (kgC/m^2)),xlab="time",
+     main=exp.pretty.name[1])
+ecoforecastR::ciEnvelope(time,CI.Na[1,],CI.Na[5,],col=ecoforecastR::col.alpha('blue',0.5))
+lines(time,CI.Na[3,],col="blue",lwd=2)
+points(time,test$Y[,i],col="red",cex=1.5)
+legend("bottomleft",legend=c("Assimilation","Data"),
+     lwd=5,col=c("blue","red"),cex=0.7)
+
+
+load(paste0("OR_SD_",site,"_",exp.name,".RData"))
+print(paste0("OR_SD_",site,"_",exp.name,".RData"))
+CI.Na = sapply(X = test$Analysis,function(x){
+        y = x$CI
+        sel.n = which(colnames(y) == paste0("n[",i,"]"))
+        y[,sel.n]
+      })
+plot(time,test$Y[,i],
+     ylim = range(rbind(CI.Na,test$Y[,i]),na.rm=TRUE),
+     type='n',
+     ylab=bquote(.(pool.names[i]) ~ (kgC/m^2)),xlab="time",
+     main=exp.pretty.name[2])
+ecoforecastR::ciEnvelope(time,CI.Na[1,],CI.Na[5,],col=ecoforecastR::col.alpha('blue',0.5))
+lines(time,CI.Na[3,],col="blue",lwd=2)
+points(time,test$Y[,i],col="red",cex=1.5)
+
+### Row 2: Divergence ###
+load("ATrueQFalseStats.RData")
+load("ATrueQFalseElist.RData")
+disturb.names = c("Intact","Other","Cut","Fire","Pest")
+disturb.col = c("#ebebeb",'#b04c00','#1f78b4','#faabaa','#b2df8a')
+disturb.col.al <- tapply(disturb.col,1:5,FUN=ecoforecastR::col.alpha,0.7); disturb.col.al[1] = disturb.col[1]
+div.pretty.name = c("(b) Divergence, Analytical","(e) Divergence, MCMC")
+div.reg <- list()
+div.class <- list()
+obs.class.re = obs.class; obs.class.re[obs.class.re ==4] = 3; obs.class.re[obs.class.re ==5] = 4; obs.class.re = obs.class.re + 1
+
+i <- analytical_elist_idx
+div = (elist[[i]]$divergence[,1] - obs.tlo)/
+  (apply(elist[[i]]$divergence[,c(2,6)],1,diff)*0.5)
+div.reg[[i]]    = lm(div~obs.tlo)
+div.class[[i]]    = lm(div~obs.tlo + as.factor(obs.class))
+
+dh = density(na.omit(div))
+#  abline(v=c(-1,1),lty=2)
+plot(obs.tlo,div,col=disturb.col.al[obs.class.re],
+     xlab="final AGB",ylab="Divergence",
+     pch=16, main=div.pretty.name[1])
+abline(h=c(-1,1),lty=2)
+abline(div.reg[[i]],col="purple",lwd=3)
+abline(v=0,lty=2)
+lines(dh$y*10,dh$x,lwd=3)
+legend("topright",legend=disturb.names,
+                col=disturb.col,pch=16,cex=0.7,
+                text.col=c(1,disturb.col[2:5]))
+
+load("stats.RData")
+load("elist.RData")
+
+i <- mcmc_elist_idx
+div = (elist[[i]]$divergence[,1] - obs.tlo)/
+  (apply(elist[[i]]$divergence[,c(2,6)],1,diff)*0.5)
+div.reg[[i]]    = lm(div~obs.tlo)
+div.class[[i]]    = lm(div~obs.tlo + as.factor(obs.class))
+
+dh = density(na.omit(div))
+#  abline(v=c(-1,1),lty=2)
+plot(obs.tlo,div,col=disturb.col.al[obs.class.re],
+     xlab="final AGB",ylab="Divergence",
+     pch=16, main=div.pretty.name[2])
+abline(h=c(-1,1),lty=2)
+abline(div.reg[[i]],col="purple",lwd=3)
+abline(v=0,lty=2)
+lines(dh$y*10,dh$x,lwd=3)
+
+
+### Row 3: Disturbance magnitude vs P(detection) ###
+load("ATrueQFalseStats.RData")
+load("ATrueQFalseElist.RData")
+pred.seq=list()
+distabs = obs.pre-obs.dist
+pred.seq$distabs = seq(min(distabs),max(distabs),length=500)
+dist.qb.abs <- list()
+i <- analytical_elist_idx
+distrate = distrate = elist[[i]]$distrate
+dist.qb.abs[[i]] = glm(distrate ~ distabs,
+                  na.action=na.omit,
+                  family=quasibinomial("logit")
+)
+plot(distabs,distrate,col=disturb.col.al[obs.class.re],
+     xlab="AGB disturbance magnitude",ylab="P(detect)",
+     pch=16, main="(c) Probability of detection, Analytical",xlim=c(0,17), ylim=c(0, 1))
+lines(pred.seq$distabs,predict(dist.qb.abs[[i]],newdata=pred.seq,type="response"),col="purple")
+
+load("stats.RData")
+load("elist.RData")
+pred.seq=list()
+distabs = obs.pre-obs.dist
+pred.seq$distabs = seq(min(distabs),max(distabs),length=500)
+dist.qb.abs <- list()
+i <- mcmc_elist_idx
+distrate = distrate = elist[[i]]$distrate
+dist.qb.abs[[i]] = glm(distrate ~ distabs,
+                  na.action=na.omit,
+                  family=quasibinomial("logit")
+)
+plot(distabs,distrate,col=disturb.col.al[obs.class.re],
+     xlab="AGB disturbance magnitude",ylab="P(detect)",
+     pch=16, main="(f) Probability of Detection, MCMC",xlim=c(0,17), ylim=c(0, 1))
+lines(pred.seq$distabs,predict(dist.qb.abs[[i]],newdata=pred.seq,type="response"),col="purple")
+if(i == 1) legend("topleft",legend=disturb.names,
+                col=disturb.col,pch=16,cex=0.7,
+                text.col=c(1,disturb.col[2:5]))
+```
+
+
+## Compare Analytical (UpdateQ = True) / MCMC Results
+```{r}
+## summary figure showing didn't work great at default error rate
+m = matrix(1:6,nrow=3,byrow = TRUE)
+layout(m)
+options(repr.plot.width = 14, repr.plot.height = 14)
+
+### Row 1: Example time-series ###
+site = 185 # 188
+exp.name = "P1Q1R0.001"
+analytical_elist_idx = 1 # indices of these experiments in elist
+mcmc_elist_idx = 5
+exp.pretty.name = c("(a) Example site, Analytical / Updating Q, R=0.001","(c) Example site, MCMC (R = 0.001)")
+pool.names=c("Leaf","Soil","AGB")
+i = 3 ## Stem
+time = 1985:2017
+
+load(paste0("ATrueQTrue_OR_SD_",site,"_",exp.name,".RData"))
+print(paste0("ATrueQTrue_OR_SD_",site,"_",exp.name,".RData"))
+CI.Na = sapply(X = test$Analysis,function(x){
+      y = x$CI
+      y[,i]
+    })
+plot(time,test$Y[,i],
+     ylim = range(rbind(CI.Na,test$Y[,i]),na.rm=TRUE),
+     type='n',
+     ylab=bquote(.(pool.names[i]) ~ (kgC/m^2)),xlab="time",
+     main=exp.pretty.name[1])
+ecoforecastR::ciEnvelope(time,CI.Na[1,],CI.Na[5,],col=ecoforecastR::col.alpha('blue',0.5))
+lines(time,CI.Na[3,],col="blue",lwd=2)
+points(time,test$Y[,i],col="red",cex=1.5)
+legend("bottomleft",legend=c("Assimilation","Data"),
+     lwd=5,col=c("blue","red"),cex=0.7)
+
+
+load(paste0("OR_SD_",site,"_",exp.name,".RData"))
+print(paste0("OR_SD_",site,"_",exp.name,".RData"))
+CI.Na = sapply(X = test$Analysis,function(x){
+        y = x$CI
+        sel.n = which(colnames(y) == paste0("n[",i,"]"))
+        y[,sel.n]
+      })
+plot(time,test$Y[,i],
+     ylim = range(rbind(CI.Na,test$Y[,i]),na.rm=TRUE),
+     type='n',
+     ylab=bquote(.(pool.names[i]) ~ (kgC/m^2)),xlab="time",
+     main=exp.pretty.name[2])
+ecoforecastR::ciEnvelope(time,CI.Na[1,],CI.Na[5,],col=ecoforecastR::col.alpha('blue',0.5))
+lines(time,CI.Na[3,],col="blue",lwd=2)
+points(time,test$Y[,i],col="red",cex=1.5)
+
+### Row 2: Divergence ###
+load("AnalyticalStats.RData")
+load("AnalyticalElist.RData")
+disturb.names = c("Intact","Other","Cut","Fire","Pest")
+disturb.col = c("#ebebeb",'#b04c00','#1f78b4','#faabaa','#b2df8a')
+disturb.col.al <- tapply(disturb.col,1:5,FUN=ecoforecastR::col.alpha,0.7); disturb.col.al[1] = disturb.col[1]
+div.pretty.name = c("(b) Divergence, Analytical","(e) Divergence, MCMC")
+div.reg <- list()
+div.class <- list()
+obs.class.re = obs.class; obs.class.re[obs.class.re ==4] = 3; obs.class.re[obs.class.re ==5] = 4; obs.class.re = obs.class.re + 1
+
+i <- analytical_elist_idx
+div = (elist[[i]]$divergence[,1] - obs.tlo)/
+  (apply(elist[[i]]$divergence[,c(2,6)],1,diff)*0.5)
+div.reg[[i]]    = lm(div~obs.tlo)
+div.class[[i]]    = lm(div~obs.tlo + as.factor(obs.class))
+
+dh = density(na.omit(div))
+#  abline(v=c(-1,1),lty=2)
+plot(obs.tlo,div,col=disturb.col.al[obs.class.re],
+     xlab="final AGB",ylab="Divergence",
+     pch=16, main=div.pretty.name[1], ylim=c(-1.1, 1.1))
+abline(h=c(-1,1),lty=2)
+abline(div.reg[[i]],col="purple",lwd=3)
+abline(v=0,lty=2)
+# lines(dh$y*10,dh$x,lwd=3)
+legend("topright",legend=disturb.names,
+                col=disturb.col,pch=16,cex=0.7,
+                text.col=c(1,disturb.col[2:5]))
+
+load("stats.RData")
+load("elist.RData")
+
+i <- mcmc_elist_idx
+div = (elist[[i]]$divergence[,1] - obs.tlo)/
+  (apply(elist[[i]]$divergence[,c(2,6)],1,diff)*0.5)
+div.reg[[i]]    = lm(div~obs.tlo)
+div.class[[i]]    = lm(div~obs.tlo + as.factor(obs.class))
+
+dh = density(na.omit(div))
+#  abline(v=c(-1,1),lty=2)
+plot(obs.tlo,div,col=disturb.col.al[obs.class.re],
+     xlab="final AGB",ylab="Divergence",
+     pch=16, main=div.pretty.name[2])
+abline(h=c(-1,1),lty=2)
+abline(div.reg[[i]],col="purple",lwd=3)
+abline(v=0,lty=2)
+lines(dh$y*10,dh$x,lwd=3)
+
+
+### Row 3: Disturbance magnitude vs P(detection) ###
+load("AnalyticalStats.RData")
+load("AnalyticalElist.RData")
+pred.seq=list()
+distabs = obs.pre-obs.dist
+pred.seq$distabs = seq(min(distabs),max(distabs),length=500)
+dist.qb.abs <- list()
+i <- analytical_elist_idx
+distrate = distrate = elist[[i]]$distrate
+dist.qb.abs[[i]] = glm(distrate ~ distabs,
+                  na.action=na.omit,
+                  family=quasibinomial("logit")
+)
+plot(distabs,distrate,col=disturb.col.al[obs.class.re],
+     xlab="AGB disturbance magnitude",ylab="P(detect)",
+     pch=16, main="(c) Probability of detection, Analytical",xlim=c(0,17), ylim=c(0, 1))
+lines(pred.seq$distabs,predict(dist.qb.abs[[i]],newdata=pred.seq,type="response"),col="purple")
+
+load("stats.RData")
+load("elist.RData")
+pred.seq=list()
+distabs = obs.pre-obs.dist
+pred.seq$distabs = seq(min(distabs),max(distabs),length=500)
+dist.qb.abs <- list()
+i <- mcmc_elist_idx
+distrate = distrate = elist[[i]]$distrate
+dist.qb.abs[[i]] = glm(distrate ~ distabs,
+                  na.action=na.omit,
+                  family=quasibinomial("logit")
+)
+plot(distabs,distrate,col=disturb.col.al[obs.class.re],
+     xlab="AGB disturbance magnitude",ylab="P(detect)",
+     pch=16, main="(f) Probability of Detection, MCMC",xlim=c(0,17), ylim=c(0, 1))
+lines(pred.seq$distabs,predict(dist.qb.abs[[i]],newdata=pred.seq,type="response"),col="purple")
+if(i == 1) legend("topleft",legend=disturb.names,
+                col=disturb.col,pch=16,cex=0.7,
+                text.col=c(1,disturb.col[2:5]))
+```
+
+
+
 
 ## quick check: find and plot sites with high distabs, but distrate = 0
 ```{r}
