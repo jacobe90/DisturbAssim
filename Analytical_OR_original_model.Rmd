@@ -19,19 +19,13 @@ library(magrittr)
 ```{r}
 ## Load disturbance rate, state&transition, disturbed biomass stats
 load("STprior.RData")
-load("fit.RData")
 load("extract.h03v04.RData")
-# print(dtime)
-# print(paste0("t", dtime))
-# print(colnames(dextract))
 dtime <- 1985:2012
 colnames(dextract) <- paste0("t",dtime)
 dextract[is.na(dextract)] <- 0
-d.prior["UN"] = d.prior["UN"] + d.prior[6]                         ## change at runtime (removes <NA>)
+d.prior["0"] = d.prior["0"] + d.prior[6]                         ## change at runtime (removes <NA>)
 d.prior = d.prior[-6]
-# Question: what are the classes of disturbance in d.prior? 
-print(dim(dextract))
-print(colnames(dextract))
+
 ## Load Calibration
 load("fit.RData")
 Qsoil = Qs
@@ -148,7 +142,7 @@ SSSD.model <- function(Y,Rparams,Q,PAR,Xic,THETA,dist,updateQ=TRUE, useAdjustmen
     Nf <- tobit(Nf)
     
     ## estimate forecast parameters
-    pD = 0.1 # pD = as.numeric(dist$p.dist) ## disturbance rate
+    pD = as.numeric(dist$p.dist[t]) ## disturbance rate
     mufN = colMeans(Nf[sel,])    ## Not disturbed forecast means
     CfN = var(Nf[sel,])
     pfN = solve(CfN)  ## Not disturbed forecast precision
@@ -178,12 +172,12 @@ SSSD.model <- function(Y,Rparams,Q,PAR,Xic,THETA,dist,updateQ=TRUE, useAdjustmen
           pN_star = 0.5 ## set them to be equal
         }
         # test: compute MCMC posterior approximation
-        priors <- list(p    = pD,         ## disturbance rate
-                     mufN = mufN,    ## Not disturbed forecast means
-                     mufD = mufD,   ## Disturbed forecast means
-                     pfN  = pfN,  ## Not disturbed forecast precision
-                     pfD  = pfD  ## Disturbed forecast precision
-        )
+        # priors <- list(p    = pD,         ## disturbance rate
+        #              mufN = mufN,    ## Not disturbed forecast means
+        #              mufD = mufD,   ## Disturbed forecast means
+        #              pfN  = pfN,  ## Not disturbed forecast precision
+        #              pfD  = pfD  ## Disturbed forecast precision
+        # )
         # update = c(list(Y=Y[t,],R=solve(R)),priors,H = which(!is.na(Y[t,])))
         # mod <- rjags::jags.model(file=textConnection(AnalysisSSSDMP),
         #                          data=update,
@@ -437,6 +431,7 @@ pairs(ICprior)
 ##' @description runDA: function to run data assimilation given R / Q / P multipliers
 ##' @param Rparams[2] -- A list of the form [m, b] containing the slope / intercept of observation error line. 
 ##'                      R = m * [measured wood carbon (kg / m^2)] + b
+##' @param useDistProduct -- if TRUE, use incorporate disturbance product predictions into priors. If FALSE, use a                                uniform prior across all years
 ##' @param Qmult -- multiplier for process error, Q
 ##' @param Pmult -- multiplier for disturbance probability
 ##' @param updateQ if true, conditionally update the process error Q based on observations
@@ -444,7 +439,7 @@ pairs(ICprior)
 ##' @param use_analytical_posterior
 ##' @param siteIndices indices of Oregon sites to run with
 ##' @param expName name of experiment to use in output file names
-runDA <- function(Rparams, updateQ, useAdjustment, use_analytical_posterior, siteIndices, expName) {
+runDA <- function(Rparams, useDistProduct, updateQ, useAdjustment, use_analytical_posterior, siteIndices, expName) {
   for(i in siteIndices){
     ofile = paste0(
         "experiments/final/",
@@ -460,8 +455,14 @@ runDA <- function(Rparams, updateQ, useAdjustment, use_analytical_posterior, sit
     Q = diag(c(Ql,Qsoil,Qw)^2)  ## process error
     dtype = which(names(d.prior) == dextract[i,"t2004"])
     if(length(dtype)==0) break
+    p.dist = rep(d.prior[dtype],NT) ## set background rate
+    if (useDistProduct) {
+      users_accuracy = c(1-d.prior[1],.77,.92,.77,.78,.78) #Kennedy et al 2015 table 6
+      has.dist = which(dextract[i,] > 0)
+      p.dist[has.dist] = users_accuracy[dextract[i,has.dist]/10 + 1]
+    }
     dist <- list(              ## disturbance parameters
-      p.dist = d.prior[dtype]*Pmult,     ## disturbance probability (Question: where do disturbance probabilities come from?)
+      p.dist = p.dist,     ## disturbance probability
       mu0 = c(0.2,PBBAR[4,dtype]),   ## % retention [leaf,agb], first parameter made up, should include soil
       V0 =  diag(c(0.15,PBVAR[4,dtype])^2), #variance in retention Question(where do the woody biomass mean / variance parameters come from?)
       alloc.soil = 0.05        ## made up  
@@ -483,27 +484,41 @@ fullRun = c(83:356)
 
 RGEDImean <- 0.8848249 # kg / m^2
 RLandTrendrmean <- 3.79986 # kg / m^2
-RparamsGEDIfixed <- c(RGEDImean, 1)
-RparamsLandTrendrfixed <- c(RLandTrendrmean, 1)
-RparamsGEDIheteroskedastic <- c(0.01331, 0.09761) # from 0.5 quantile regression line: c(0.01159707, 0.04660497)
+RparamsGEDIfixed <- c(0, RGEDImean)
+RparamsLandTrendrfixed <- c(0, RLandTrendrmean)
+RparamsGEDIheteroskedastic <- c(0.01331, 0.09761) # from regular regression (m_G, b_G)
+
+# 0.5 quantile regression line: c(0.01159707, 0.04660497)
 
 # compute intercept for Landtrendr heteroskedastic params
-Cwmean <- (RGEDImean - RparamsGEDIheteroskedastic[2]) / RparamsGEDIheteroskedastic[1]
-Landtrendrslope <- RparamsGEDIheteroskedastic[1]
-Landtrendrintercept <- RLandTrendrmean - Landtrendrslope * Cwmean
-RparamsLandtrendrheteroskedastic <- c(Landtrendrslope, Landtrendrintercept)
+Cwmean <- (RGEDImean - RparamsGEDIheteroskedastic[2]) / RparamsGEDIheteroskedastic[1] # m_G * Cwmean + b_G = RGEDImean
+Landtrendrslope <- RparamsGEDIheteroskedastic[1] # set m_L = m_G
+Landtrendrintercept <- RLandTrendrmean - Landtrendrslope * Cwmean # m_L * Cwmean + b_L = RLandTrendrmean
+RparamsLandtrendrheteroskedastic <- c(Landtrendrslope, Landtrendrintercept) # (m_L, b_G)
 
-# experiment Rgedi_Hfalse_Dfalse
-# runDA(Rparams=RparamsGEDIfixed, updateQ=TRUE, useAdjustment=TRUE, use_analytical_posterior=TRUE, siteIndices=fullRun, expName="Rgedi_Hfalse_Dfalse") # R = (gedi, landtrendr), H = heteroskedastic = (true, false), D = disturbance product = (true, false)
-
-# experiment Rlandtrendr_Hfalse_Dfalse
-# runDA(Rparams=RparamsLandTrendrfixed, updateQ=TRUE, useAdjustment=TRUE, use_analytical_posterior=TRUE, siteIndices=fullRun, expName="Rlandtrendr_Hfalse_Dfalse") # R = (gedi, landtrendr), H = heteroskedastic = (true, false), D = disturbance product = (true, false)
-
-# experiment Rgedi_Htrue_Dfalse
-# runDA(Rparams=RparamsGEDIheteroskedastic, updateQ=TRUE, useAdjustment=TRUE, use_analytical_posterior=TRUE, siteIndices=fullRun, expName="Rgedi_Htrue_Dfalse") # R = (gedi, landtrendr), H = heteroskedastic = (true, false), D = disturbance product = (true, false)
+# # experiment Rgedi_Hfalse_Dfalse
+# runDA(Rparams=RparamsGEDIfixed, useDistProduct = FALSE, updateQ=TRUE, useAdjustment=TRUE, use_analytical_posterior=TRUE, siteIndices=fullRun, expName="Rgedi_Hfalse_Dfalse") # R = (gedi, landtrendr), H = heteroskedastic = (true, false), D = disturbance product = (true, false)
+# 
+# # experiment Rlandtrendr_Hfalse_Dfalse
+# runDA(Rparams=RparamsLandTrendrfixed, useDistProduct = FALSE, updateQ=TRUE, useAdjustment=TRUE, use_analytical_posterior=TRUE, siteIndices=fullRun, expName="Rlandtrendr_Hfalse_Dfalse") # R = (gedi, landtrendr), H = heteroskedastic = (true, false), D = disturbance product = (true, false)
+# 
+# # experiment Rgedi_Htrue_Dfalse
+# runDA(Rparams=RparamsGEDIheteroskedastic, useDistProduct = FALSE, updateQ=TRUE, useAdjustment=TRUE, use_analytical_posterior=TRUE, siteIndices=fullRun, expName="Rgedi_Htrue_Dfalse") # R = (gedi, landtrendr), H = heteroskedastic = (true, false), D = disturbance product = (true, false)
 
 # experiment Rlandtrendr_Htrue_Dfalse
-runDA(Rparams=RparamsLandtrendrheteroskedastic, updateQ=TRUE, useAdjustment=TRUE, use_analytical_posterior=TRUE, siteIndices=fullRun, expName="Rlandtrendr_Htrue_Dfalse") # R = (gedi, landtrendr), H = heteroskedastic = (true, false), D = disturbance product = (true, false)
+runDA(Rparams=RparamsLandtrendrheteroskedastic, useDistProduct = FALSE, updateQ=TRUE, useAdjustment=TRUE, use_analytical_posterior=TRUE, siteIndices=fullRun, expName="Rlandtrendr_Htrue_Dfalse") # R = (gedi, landtrendr), H = heteroskedastic = (true, false), D = disturbance product = (true, false)
+
+# experiment Rgedi_Hfalse_Dtrue
+runDA(Rparams=RparamsGEDIfixed, updateQ=TRUE, useDistProduct = TRUE, useAdjustment=TRUE, use_analytical_posterior=TRUE, siteIndices=fullRun, expName="Rgedi_Hfalse_Dtrue") # R = (gedi, landtrendr), H = heteroskedastic = (true, false), D = disturbance product = (true, false)
+
+# experiment Rlandtrendr_Hfalse_Dtrue
+runDA(Rparams=RparamsLandTrendrfixed, updateQ=TRUE, useDistProduct = TRUE, useAdjustment=TRUE, use_analytical_posterior=TRUE, siteIndices=fullRun, expName="Rlandtrendr_Hfalse_Dtrue") # R = (gedi, landtrendr), H = heteroskedastic = (true, false), D = disturbance product = (true, false)
+
+# experiment Rgedi_Htrue_Dtrue
+runDA(Rparams=RparamsGEDIheteroskedastic, updateQ=TRUE, useDistProduct = TRUE, useAdjustment=TRUE, use_analytical_posterior=TRUE, siteIndices=fullRun, expName="Rgedi_Htrue_Dtrue") # R = (gedi, landtrendr), H = heteroskedastic = (true, false), D = disturbance product = (true, false)
+
+# experiment Rlandtrendr_Htrue_Dtrue
+runDA(Rparams=RparamsLandtrendrheteroskedastic, useDistProduct = TRUE, updateQ=TRUE, useAdjustment=TRUE, use_analytical_posterior=TRUE, siteIndices=fullRun, expName="Rlandtrendr_Htrue_Dtrue") # R = (gedi, landtrendr), H = heteroskedastic = (true, false), D = disturbance product = (true, false)
 
 ```
 
@@ -976,6 +991,13 @@ betatrim <- function(y){
     (y * (n.obs - 1) + 0.5) / n.obs
 }
 stats <- list()
+
+classnames <- c("other", "cut", "road" ,"fire", "biotic") # disturbance types
+class_vals <- sort(unique(obs.class))
+class_vals <- class_vals[class_vals != 0] # drop 0 (corresponds to no disturbance)
+classes_in_data <- classnames[class_vals]
+
+
 for(i in seq_along(exps)){
   ## divergence
   div = (elist[[i]]$divergence[,1] - obs.tlo)/
@@ -984,20 +1006,26 @@ for(i in seq_along(exps)){
   div.median = median(div,na.rm = TRUE) # compute median divergence
   div.cov    = sum(div < 1 & div > -1,na.rm=TRUE)/sum(!is.na(div)) # % of sites with filter divergence outside of (-1, 1)
 
-
-  hist(div,main=exps[i])
-  abline(v=c(-1,1),lty=2)
+  
+  # hist(div,main=exps[i])
+  # abline(v=c(-1,1),lty=2)
   plot(obs.tlo,div,col=obs.class,main=exps[i])
+  legend("topright",
+       legend = classes_in_data,
+       col = class_vals,
+       pch = 21,
+       bty = "n",
+       title = "disturbance type")
   abline(h=c(-1,1),lty=2)
   abline(div.reg,col=2)
 
   ## Disturbance detection
   distrate = elist[[i]]$distrate
-  hist(distrate,main=exps[i])
+  # hist(distrate,main=exps[i])
 
   ## Disturbance skill
   ord <- order(distrate)
-  plot(distrate[ord],col=obs.class[ord],main=exps[i])
+  # plot(distrate[ord],col=obs.class[ord],main=exps[i])
   dist.bar   = mean(distrate,na.rm = TRUE)
   dist.class = tapply(distrate,obs.class,mean,na.rm=TRUE)
 
@@ -1008,17 +1036,17 @@ for(i in seq_along(exps)){
   dist.reg.pre  = lm(distrate ~ obs.pre)
   dist.beta.pre = betareg::betareg(distrate2 ~ obs.pre,
                                    na.action=na.omit,link="logit")
-  plot(obs.pre,distrate,col=obs.class,main=exps[i])
-  abline(dist.reg.pre,col=2)
-  lines(pred.seq$obs.pre,predict(dist.beta.pre,newdata=pred.seq),col="green")
+  # plot(obs.pre,distrate,col=obs.class,main=exps[i])
+  # abline(dist.reg.pre,col=2)
+  # lines(pred.seq$obs.pre,predict(dist.beta.pre,newdata=pred.seq),col="green")
 
   ## vs proportional disturbance size
   distprop = 1 - elist[[i]]$distsize[,1]/elist[[i]]$predist[,1] ## predicted
   distprop = 1 - obs.dist/obs.pre ## observed
   dist.beta.prop = betareg::betareg(distrate2 ~ distprop,
                                    na.action=na.omit,link="logit")
-  plot(distprop,distrate,col=obs.class,main=exps[i])
-  lines(pred.seq$distprop,predict(dist.beta.prop,newdata=pred.seq),col="green")
+  # plot(distprop,distrate,col=obs.class,main=exps[i])
+  # lines(pred.seq$distprop,predict(dist.beta.prop,newdata=pred.seq),col="green")
 
   ## vs ABSOLUTE disturbance size
   distabs = obs.pre-obs.dist
@@ -1038,6 +1066,12 @@ for(i in seq_along(exps)){
                     family=binomial("logit")
   )
   plot(distabs,distrate,col=obs.class,main=exps[i])
+  legend("topright",
+       legend = classes_in_data,
+       col = class_vals,
+       pch = 21,
+       bty = "n",
+       title = "disturbance type")
   lines(pred.seq$distabs,predict(dist.beta.abs,newdata=pred.seq,type="quantile"),col="green")
   lines(pred.seq$distabs,predict(dist.beta.abs,newdata=pred.seq,type="quantile",at=0.75),col="green",lty=2)
   lines(pred.seq$distabs,predict(dist.beta.abs,newdata=pred.seq,type="quantile",at=0.25),col="green",lty=2)
@@ -1052,12 +1086,12 @@ for(i in seq_along(exps)){
                                    na.action=na.omit,
                         family = binomial("logit"))
   pred.seq$absdiv = seq(0,max(absdiv,na.rm=TRUE),length=500)
-  plot(absdiv,distrate,col=obs.class,main=exps[i])
-  abline(v=c(-1,1),lty=2,col=3)
-  abline(lm(distrate ~ absdiv),col=2)
-  lines(pred.seq$absdiv,predict(dist.beta.absdiv,newdata=pred.seq),col="green")
-  lines(pred.seq$absdiv,predict(dist.bin.absdiv,newdata=pred.seq,type="response"),col="blue")
-
+  # plot(absdiv,distrate,col=obs.class,main=exps[i])
+  # abline(v=c(-1,1),lty=2,col=3)
+  # abline(lm(distrate ~ absdiv),col=2)
+  # lines(pred.seq$absdiv,predict(dist.beta.absdiv,newdata=pred.seq),col="green")
+  # lines(pred.seq$absdiv,predict(dist.bin.absdiv,newdata=pred.seq,type="response"),col="blue")
+  # 
   dist.qb.combo = glm(distrate2 ~ obs.pre + distprop +
                         distabs + absdiv + obs.class,
                       na.action=na.omit,

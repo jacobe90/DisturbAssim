@@ -24,7 +24,7 @@ colnames(dextract) <- paste0("t",dtime)
 dextract[is.na(dextract)] <- 0
 d.prior["0"] = d.prior["0"] + d.prior[6]  ## change at runtime (removes <NA>)
 d.prior = d.prior[-6]
-
+print(d.prior)
 
 ## Load Calibration
 load("fit.RData")
@@ -250,7 +250,7 @@ for(i in 1:356){
   if(length(dtype)==0) break
   p.dist = rep(d.prior[dtype]*Pmult[Pi],NT) ## set background rate
   has.dist = which(dextract[i,] > 0)
-  p.dist[has.dist] = users_accuracy[dextract[i,has.dist]/10 + 1] 
+  p.dist[has.dist] = users_accuracy[dextract[i,has.dist]/10 + 1]
   dist <- list(              ## disturbance parameters
     #p.dist = d.prior[dtype]*Pmult[Pi],     ## disturbance probability
     p.dist = p.dist,
