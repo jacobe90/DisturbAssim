@@ -189,10 +189,10 @@ for(t in 1:NT){
                            data=update,
                            inits = list(rho=rho.IC),
                            n.adapt=3000,n.chains=3)
-  jdat <- rjags::coda.samples(mod,variable.names = "rho",n.iter=2000) ## burn-in 
-  plot(jdat)
-  jdat <- rjags::coda.samples(mod,variable.names=c("X","rho","x"),n.iter=10000) 
-  print(jdat[0,])
+  #jdat <- rjags::coda.samples(mod,variable.names = "rho",n.iter=2000) ## burn-in 
+  #plot(jdat)
+  jdat <- rjags::coda.samples(mod,variable.names=c("X","rho","x"),n.iter=20000) 
+  #print(jdat[0,])
   
   ## update parameters & save Analysis posterior
   dat = as.matrix(jdat)
@@ -201,6 +201,7 @@ for(t in 1:NT){
   ## draw new IC
   d.post <- dat[,grep(pattern="rho",x=colnames(dat))]
   d.class.post <- apply(d.post,1,which.max)
+  
   Na <- multi.ens.adj(
           Xf   = Nf,
           cf   = d.class,
@@ -214,6 +215,32 @@ for(t in 1:NT){
           ca = d.class.post)
   Ca <- Na[,1] ## updated class assignments
   Na <- tobit(Na[,-1])
+  
+  # save everything
+  if (t == 15) {
+    Xa <- dat[,Xsel]
+    cw.obs <- No[t, 3]
+    distprobs <- p.dist
+    R_H <- R[3, 3]
+    
+    mu.F <- array(NA, dim = c(3, 3))
+    cov.F <- array(NA, dim = c(3, 3, 3))
+    mu.A <- array(NA, dim = c(3, 3))
+    cov.A <- array(NA, dim = c(3, 3, 3))
+    w.A <- array(NA, dim = c(3))
+    
+    for (d in 1:3) {
+      w.A[d] <- length(which(d.class.post == d)) / length(d.class.post)
+      mu.F[d,] <- muf[,d]
+      cov.F[d,,] <- solve(pf[,,d])
+      Na.d <- Xa[d.class.post == d,]
+      Na.d.mu <- colMeans(Na.d)
+      Na.d.Sig <- cov(Na.d)
+      mu.A[d,] <- Na.d.mu
+      cov.A[d,,] <- Na.d.Sig
+    }
+    save(distprobs, cw.obs, R_H, mu.F, cov.F, mu.A, cov.A, file="multidisturb-ex-values.RData")
+  }
 #  sel.ic <- sample.int(nrow(dat), ne, replace=TRUE)
 #  Na <- dat[sel.ic,nsel]
   Analysis[[t]] <- list(MCMC=dat,

@@ -1,0 +1,308 @@
+---
+title: "RelabelDisturbances"
+output: html_document
+author: "Jacob Epstein"
+date: 1/9/26
+---
+
+## Goal:
+
+## - Find disturbance years as changepoints in biomass timeseries
+## - Generate labels for each year based on disturbance class
+## - Derive disturbance model priors based on the distribution of % biomass 
+##    retained for each kind of disturbance
+ 
+## Disturbance classes: 
+```{r}
+dist_name <- c(
+  "0"  = "none",
+  "10" = "other",
+  "20" = "cut",
+  "30" = "road",
+  "40" = "fire",
+  "50" = "biotic"
+)
+```
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+source("disturbance.R")
+source("multi.ens.adj.R")
+source("multi.analytical.ens.adj.R")
+source("StatsAuxiliary.R")
+library(BayesianTools)
+library(magrittr)
+library(mclust)
+```
+
+```{r}
+## Load disturbance rate, state&transition, disturbed biomass stats
+load("STprior.RData")
+load("extract.h03v04.RData")
+dtime <- 1985:2012
+colnames(dextract) <- paste0("t",dtime)
+dextract[is.na(dextract)] <- 0
+d.prior["0"] = d.prior["0"] + d.prior[6]                         ## change at runtime (removes <NA>)
+d.prior = d.prior[-6]
+
+## Load Calibration
+load("fit.RData")
+Qsoil = Qs
+```
+
+```{r}
+## BIOMASS observations
+B2C = 0.5 ##biomass to carbon ratio
+Yw <- bextract*B2C*1000*1e-4 ## convert Mg/ha (Mg per hectacre)  to  kg C
+```
+
+```{r}
+pdf("./experiments/exploration/disturbance-years-labelled.pdf")
+nsite <- dim(Yw)[1]
+nyear <- dim(dextract)[2]
+disttypes <- seq(0, 50, by=10)
+distlabels <- matrix(data = 0, nrow = nsite, ncol = nyear)
+t04 <- which(dtime == 2004)
+
+for (i in 1:nsite) {
+  ## compute the disturbances in the time series for the site
+  pctchanges <- as.numeric(Yw[i, 2:nyear] / Yw[i, 1:nyear-1])
+  nchange <- length(pctchanges)
+  changediffs <- c()
+  for (t in 1:nchange) {
+    # find average in 3 year window around t
+    tmin <- max(1, t-3)
+    tmax <- min(nchange, t+3)
+    
+    if (t < tmax) {
+      changeavg <- mean(c(pctchanges[tmin:(t-1)], pctchanges[(t+1):tmax])) 
+    } else {
+      changeavg <- mean(pctchanges[tmin:(t-1)])
+    }
+    changediff <- abs(pctchanges[t] / changeavg)
+    changediffs <- c(changediffs, changediff)
+  }
+  disidxs <- which(changediffs < 0.80) # get disturbance idxs
+  disidxs <- Filter(function(idx) {
+    yidx <- Yw[i, idx]
+    dyidx <- Yw[i, idx + 1] - Yw[i, idx]
+    return(dyidx < -0.75 & yidx > 0.75); # filter indices for which the decrease or starting biomass is too small
+  }, disidxs)
+  plot(Yw[i,], ylim=c(0, 20), type="l", main=paste("site", i))
+  abline(v = disidxs, col = "red", lwd = 2, lty = 2)
+  
+  ## label the disturbances
+  for (idx in disidxs) {
+    # default to disturbance product's label if it labelled a disturbance
+    # else search for a label in a 3 year window (6 years total) around the target year
+    # else default to disturbance product label for target year (2004) if it was labelled a disturbance
+    # else, assign to class "other"
+    product.labels <- dextract[i,idx:min(idx+1,nyear)]
+    product.labels.positive <- which(product.labels > 0)
+    product.labels.window <- dextract[i,max(0, idx-3):min(idx+3, nyear)]
+    window.positive <- which(product.labels.window > 0)
+    if (length(product.labels.positive) > 0) {
+      distlabels[i,idx] <- product.labels[product.labels.positive[1]]
+    } else if (length(window.positive) > 0) {
+      distlabels[i,idx] <- product.labels.window[window.positive[1]]
+    } else if (dextract[i, t04] > 0) {
+      distlabels[i,idx] <- dextract[i, t04]
+    } else {
+      distlabels[i, idx] <- 10 # "other"
+    }
+  }
+
+}
+dev.off()
+```
+
+## visualize distributions of percent biomass retained
+```{r}
+pdf("./experiments/exploration/disturbance-size-across-years-from-metric.pdf")
+dist_name <- c(
+  "0"  = "none",
+  "10" = "other",
+  "20" = "cut",
+  "30" = "road",
+  "40" = "fire",
+  "50" = "biotic"
+)
+nyear <- dim(dextract)[2]
+binwidth <- 0.025
+
+## density plot for each disturbance type of percent biomass retained
+for (disttype in seq(0, 50, by=10)) {
+  dist.indices <- which(distlabels == disttype, arr.ind=TRUE)
+  dist.pct.all <- c()
+  nidx <- dim(dist.indices)[1]
+  if (nidx > 0) {
+    for (i in 1:nidx) {
+      idx <- dist.indices[i,]
+      if (idx[2] < nyear) {
+        dist.pct <- as.numeric(Yw[idx[1], idx[2] + 1] / Yw[idx[1], idx[2]])
+        if (!is.na(dist.pct) & 0 < dist.pct & dist.pct < 1.1) {
+          dist.pct.all <- c(dist.pct.all, dist.pct) 
+        }
+      }
+    }
+  }
+  hist(as.numeric(dist.pct.all), prob = TRUE, breaks=seq(0, 1.1, by=0.025), xlim=c(0, 1.1), ylim=c(0, 20), xlab="% Cw retained after decrease", main=paste(
+    dist_name[as.character(disttype)]
+  ))
+}
+dev.off()
+```
+
+## load a larger number of disturbed pixels
+```{r}
+# load("state-transition-saved.RData")
+
+## sample disturbances for target year
+nsamp = 15000
+samp = raster::sampleStratified(d04,size = nsamp,exp=1000) # nsamp per class
+
+## eliminate disturbances that did not apply to forests
+c03 <- covS[[which(ctime==2003)]]
+csamp <- c03[samp[,1]]
+fsamp <- samp[csamp==42,]
+
+## print total number of samples for each class
+for (c in seq_along(dclass)) {
+  nc <- length(which(fsamp[,2] == dclass[c]))
+  print(paste("class", dclass[c], ":", nc, "samples"))  
+}
+
+# extract disturbance / biomass data
+dextract.large = raster::extract(disR,fsamp[,1])
+bextract.large = raster::extract(bioS,fsamp[,1])
+B2C = 0.5
+Yw.large <- bextract.large*B2C*1000*1e-4
+```
+
+## relabel the disturbances
+```{r}
+nsite <- nrow(dextract.large)
+nyear <- ncol(dextract.large)
+disttypes <- seq(0, 50, by=10)
+distlabels.large <- matrix(data = 0, nrow = nsite, ncol = nyear)
+
+for (i in 1:nsite) {
+  ## compute the disturbances in the time series for the site
+  pctchanges <- as.numeric(Yw.large[i, 2:nyear] / Yw.large[i, 1:nyear-1])
+  nchange <- length(pctchanges)
+  changediffs <- c()
+  for (t in 1:nchange) {
+    # find average in 3 year window around t
+    tmin <- max(1, t-3)
+    tmax <- min(nchange, t+3)
+    
+    if (t < tmax) {
+      changeavg <- mean(c(pctchanges[tmin:(t-1)], pctchanges[(t+1):tmax])) 
+    } else {
+      changeavg <- mean(pctchanges[tmin:(t-1)])
+    }
+    changediff <- abs(pctchanges[t] / changeavg)
+    changediffs <- c(changediffs, changediff)
+  }
+  disidxs <- which(changediffs < 0.80) # get disturbance idxs
+  disidxs <- Filter(function(idx) {
+    yidx <- Yw.large[i, idx]
+    dyidx <- Yw.large[i, idx + 1] - Yw.large[i, idx]
+    return(dyidx < -0.75 & yidx > 0.75); # filter indices for which the decrease or starting biomass is too small
+  }, disidxs)
+  
+  ## label the disturbances
+  for (idx in disidxs) {
+    # default to disturbance product's label if it labelled a disturbance
+    # else search for a label in a 3 year window (6 years total) around the target year
+    # else default to disturbance product label for target year (2004) if it was labelled a disturbance
+    # else, assign to class "other"
+    product.labels <- dextract.large[i,idx:min(idx+1,nyear)]
+    product.labels.positive <- which(product.labels > 0)
+    product.labels.window <- dextract.large[i,max(0, idx-3):min(idx+3, nyear)]
+    window.positive <- which(product.labels.window > 0)
+    label04 <- dextract.large[i, t04]
+    # save(val, file="debugging-or.RData")
+    if (length(product.labels.positive) > 0) {
+      distlabels.large[i,idx] <- product.labels[product.labels.positive[1]]
+    } else if (length(window.positive) > 0) {
+      distlabels.large[i,idx] <- product.labels.window[window.positive[1]]
+    } else if (!is.na(label04) & label04 > 0) {
+      distlabels.large[i,idx] <- dextract.large[i, t04]
+    } else {
+      distlabels.large[i, idx] <- 10 # "other"
+    }
+  }
+}
+```
+
+
+## generate disturbance model priors for each disturbance type
+```{r}
+dist.priors <- list()
+
+## fit a mixture of normals to each density plot
+for (disttype in c(10, 20, 40, 50)) {
+  # compute array of percent retained for that disturbance type
+  dist.indices <- which(distlabels.large == disttype, arr.ind=TRUE)
+  nidx <- dim(dist.indices)[1]
+  dist.pct.all <- c()
+  for (i in 1:nidx) {
+    idx <- dist.indices[i,]
+    if (idx[2] < nyear) {
+      dist.pct <- as.numeric(Yw.large[idx[1], idx[2] + 1] / Yw.large[idx[1], idx[2]])
+      if (!is.na(dist.pct) & 0 < dist.pct & dist.pct < 1.1) {
+        dist.pct.all <- c(dist.pct.all, dist.pct) 
+      }
+    }
+  }
+  
+  # fit a mixture of normals to the distribution of percent retained
+  fit <- mclust::Mclust(dist.pct.all)
+  
+  # plot the fitted distribution / density plot of percent retained
+  hist(
+    as.numeric(dist.pct.all),
+    prob = TRUE,
+    breaks = seq(0, 1.1, by = 0.025),
+    xlim = c(0, 1.1),
+    ylim = c(0, 20),
+    xlab = "% Cw retained after decrease",
+    main = paste(dist_name[as.character(disttype)])
+  )
+  
+  xgrid <- seq(0, 1.1, length.out = 500)
+  
+  # Print stats
+  # print(fit$BIC)
+  
+  # Extract parameters
+  weights <- fit$parameters$pro
+  means   <- fit$parameters$mean
+  sds     <- sqrt(fit$parameters$variance$sigmasq)
+  
+  if (length(sds) < length(weights)) {
+    sds <- rep(sds[1], length(weights))
+  }
+  
+  mix_density <- rowSums(
+    sapply(seq_along(weights), function(k) {
+      weights[k] * dnorm(xgrid, means[k], sds[k])
+    })
+  )
+  
+  # store parameters
+  dist.priors[[as.character(disttype)]]$weights <- weights
+  dist.priors[[as.character(disttype)]]$means <- means
+  dist.priors[[as.character(disttype)]]$vars <- sds
+  
+  lines(xgrid, mix_density, col = "red", lwd = 2)
+}
+
+save(distlabels, dist.priors, file="dis.postprocessed.RData")
+```
+
+
+
+
+

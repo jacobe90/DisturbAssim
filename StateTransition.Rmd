@@ -13,17 +13,17 @@ options(scipen=999)
 
 ## Objectives
 
-* Use data on land cover, disturbance, and biomass to calibrate a simple state and transition model to drive disturbance probabilities for real-world examples
-* set up points and time series for assimilation examples
+-   Use data on land cover, disturbance, and biomass to calibrate a simple state and transition model to drive disturbance probabilities for real-world examples
+-   set up points and time series for assimilation examples
 
-Metadata: downloaded tile_h03v04 from http://emapr.ceoas.oregonstate.edu/pages/data/viz/index.html on 11/19/2020
+Metadata: downloaded tile_h03v04 from <http://emapr.ceoas.oregonstate.edu/pages/data/viz/index.html> on 11/19/2020
 
 ## load data
 
 ```{r}
 # cover
-cover = raster("conus_land_cover_ARD_tile_h03v04/conus_land_cover_ARD_tile_h03v04.tif")
-covS  = stack("conus_land_cover_ARD_tile_h03v04/conus_land_cover_ARD_tile_h03v04.tif")
+cover = raster("conus_land_cover_ARD_tile_h03v04.tif")
+covS  = stack("conus_land_cover_ARD_tile_h03v04.tif")
 ctime = 1990:2017
 extent(cover)
 nlayers(cover)
@@ -40,25 +40,31 @@ colnames(nlcd)[2] <- "ID"
 nlcd$ID = as.numeric(nlcd$ID)
 #rat = dplyr::left_join(tibble::tibble(rat),nlcd,by="ID")
 rat = nlcd[as.integer(nlcd$ID) %in% rat$ID,]
+colnames(rat)[2] <- "nlcd_ID"
+rat <- as.data.frame(rat)
 levels(cov04) <- rat 
-cov04 = deratify(cov04,"description")
+cov04 = deratify(cov04,"Description")
 cov04 <- raster::projectRaster(cov04,crs=crs("+proj=longlat +datum=WGS84"))
 raster::writeRaster(cov04,"cov04.tif",format="GTiff",overwrite=TRUE)
 save(rat,file="rat.RData")
 
+
+```
+
+```{r}
 # disturbance
 dis.processed = "dis.h03v04.RData"
 if(file.exists(dis.processed)){
   load(dis.processed)
 } else {
   ## process disturbance data to match cover's extent and resolution
-  #dis = raster("Cmonster_disturbance_class_ARD_tile_h03v04/Cmonster_disturbance_class_ARD_tile_h03v04.tif")
-  #extent(dis)
-  #nlayers(dis)
-  #res(dis)
-  #crs(dis)
+  dis = raster("Cmonster_disturbance_class_ARD_tile_h03v04.tif")
+  extent(dis)
+  nlayers(dis)
+  res(dis)
+  crs(dis)
   
-  disS = stack(x = "Cmonster_disturbance_class_ARD_tile_h03v04/Cmonster_disturbance_class_ARD_tile_h03v04.tif")
+  disS = stack(x = "Cmonster_disturbance_class_ARD_tile_h03v04.tif")
 
   ## match disturbance to cover
   dis <- raster::resample(dis,cover,method="ngb")
@@ -67,14 +73,12 @@ if(file.exists(dis.processed)){
   compareRaster(dis, cover, res = TRUE)
   compareRaster(dis,cover,extent = TRUE)
 }
-
 ```
-
 
 ```{r}
 ### biomass
-biomass = raster("conus_biomass_ARD_tile_h03v04/conus_biomass_ARD_tile_h03v04.tif")
-bioS = stack("conus_biomass_ARD_tile_h03v04/conus_biomass_ARD_tile_h03v04.tif")
+biomass = raster("conus_biomass_ARD_tile_h03v04.tif")
+bioS = stack("conus_biomass_ARD_tile_h03v04.tif")
 #extent(biomass)
 #res(biomass)
 nlayers(bioS)
@@ -89,6 +93,7 @@ raster::plot(bio04,col=c('#ffffff','#edf8fb','#ccece6','#99d8c9','#66c2a4','#2ca
 ```
 
 ## estimate cover frequencies, select those of interest
+
 ```{r}
 f = freq(cover)
 ## most frequent class is 42 = evergreen forest
@@ -102,7 +107,8 @@ cvr = as.matrix(cover[[1]])
 ```
 
 Disturbance class info from Robert Kennedy (email 2020-11-24)
-```
+
+```         
 AGENTS
  = {
     1:   'Undisturbed',
@@ -141,8 +147,8 @@ Classes 200 and 201 are also based on the interpreter rules for patches -- if th
 Classes 100-160 are based on pixel-level labels based on the temporal signature alone.  They are smaller than our minimum mapping unit of 11 pixels. 
 ```
 
-
 ## Estimate disturbance probability for each cover class
+
 ```{r}
 dtime = 1985:2012
 fd = freq(dis)
@@ -270,18 +276,27 @@ dis04 = disR[[which(dtime==2004)]]
 #levels(dis04) <- drat 
 #dis04 = deratify(dis04,"class")
 #dis04 <- raster::projectRaster(dis04,crs=crs("+proj=longlat +datum=WGS84"))
+
+```
+## write raster
+```{r}
+NAvalue(dis04) <- -9999
+dis04[is.na(dis04)] <- -9999
 raster::writeRaster(dis04,"dis04.tif",format="GTiff",overwrite=TRUE)
 
 dname = c("Intact","Other","Cut","Fire","Pest")
 raster::plot(dis04,col=c("#ebebeb",'#b04c00','#1f78b4','#faabaa','#b2df8a'),axis.args=list(at=seq(3,48,length=5),labels=dname,cex.axis=0.4),asp=1,main="Disturbance") #"#a6cee3" '#33a02c'
-  
+
 ```
 
-
 ## Determine transitions (cover / pft)
+
 ## looking at a sample, most disturbances correspond to cover changes THAT YEAR
+
 ## exception is fire, where there seems to be a nontrivial number that are forest that year but nonforest e.g barren the following year
+
 ## do see a good number of cover transitions
+
 ```{r}
 train = list()
 nd = length(dclass)-1
@@ -390,16 +405,24 @@ save(d.prior,TRANS,PBBAR,PBVAR,file="STprior.RData")
 ```
 
 ## select sites of interest, save
+
 ```{r}
+load("state-transition-saved.RData")
+
 ## sample disturbances for target year
-nsamp = 100
-d04 <- disR[[which(dtime==2004)]]
-samp = raster::sampleStratified(d04,size = nsamp,exp=1000)
+nsamp = 150
+samp = raster::sampleStratified(d04,size = nsamp,exp=1000) # sample nsamp per disturbance class
 
 ## eliminate disturbances that did not apply to forests
 c03 <- covS[[which(ctime==2003)]]
 csamp <- c03[samp[,1]]
 fsamp <- samp[csamp==42,]
+
+## print total number of samples for each class
+for (c in seq_along(dclass)) {
+  nc <- length(which(fsamp[,2] == dclass[c]))
+  print(paste("class", dclass[c], ":", nc, "samples"))  
+}
 
 dextract = raster::extract(disR,fsamp[,1])
 
@@ -434,4 +457,3 @@ points = spTransform(SpatialPoints(coord,crs(bioS)),crs("+proj=longlat +datum=WG
 
 save(points,bextract,cextract,dextract,file="extract.h03v04.RData")
 ```
-

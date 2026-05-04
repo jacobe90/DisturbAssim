@@ -337,8 +337,8 @@ pairs(ICprior)
 
 ## analyze sites - just one disturbance
 ```{r}
-Rmult = c(1,0.1,0.01,0.001)
-Qmult = c(1,10)
+Rmult = c(0.01)
+Qmult = c(1)
 Pmult = c(1)
 Ri = 1
 Qi = 1
@@ -346,8 +346,9 @@ Pi = 1
 users_accuracy = c(1-d.prior[1],.77,.92,.77,.78,.78) #Kennedy et al 2015 table 6
 ## 0 = none, 10 = other, 20 = cut, 30 = road, 40 = fire, 50 = biotic
 od = c(83:176,264:356)
-for(i in 181:280){
-  ofile = paste0("OR_NDP_",  ## N = Nimble, DP = Disturbance Prior
+testHighAbsDist = c(107, 125, 137, 149, 161) # sites with large disturbances
+for(i in testHighAbsDist){
+  ofile = paste0("experiments/OR_NDP/OR_NDP_",  ## N = Nimble, DP = Disturbance Prior
                  formatC(i, width = 3, format = "d", flag = "0"),
                  "_P",Pi,"Q",Qi,"R",Ri,".RData")
   print(ofile)

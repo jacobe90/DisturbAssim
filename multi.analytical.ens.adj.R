@@ -41,7 +41,7 @@ multi.analytical.ens.adj <- function(Xf, cf, mu.f, Pf, Pp.mu.a, Pp.Pa, Pp.w, uc=
     sel.c = which(cf == uc[k])
     
     ## SVD of forecast covariances
-    S_f  <- svd(Pf[,,k])
+    S_f  <- svd(Pf[k,,])
     L_f  <- S_f$d
     V_f  <- S_f$v
     
@@ -62,14 +62,14 @@ multi.analytical.ens.adj <- function(Xf, cf, mu.f, Pf, Pp.mu.a, Pp.Pa, Pp.w, uc=
     sel.c = which(cA == uc[k])
     if(length(sel.c) == 0) next
     
-    S_a  <- svd(Pp.Pa[,,k])
+    S_a  <- svd(Pp.Pa[k,,])
     L_a  <- S_a$d
     V_a  <- S_a$v
     
     ## analysis ensemble 
     for(i in sel.c){
       # we decomposed Pa - then it's putting it back together but with a different Z which comes from the likelihood of that ens    
-      X_a[i,] <- V_a %*%diag(sqrt(L_a))%*%Z[i,] + Pp.mu.a[,k]
+      X_a[i,] <- V_a %*%diag(sqrt(L_a))%*%Z[i,] + Pp.mu.a[k,]
     }
   }
   

@@ -1,0 +1,171 @@
+## test -- compute mean of both analytical posterior and directly via MC, compare
+
+```{r}
+analytical_posterior <- function(
+  muf_mat,   # [D x 3]
+  Cf_array,  # [D x 3 x 3]
+  pD,        # length D
+  Yobs,      # scalar
+  H,         # index in {1,2,3}
+  R_H        # scalar
+) {
+  D <- nrow(muf_mat)
+
+  mat_H <- matrix(0, 1, 3)
+  mat_H[H] <- 1
+
+  muA <- matrix(NA, D, 3)
+  CA  <- array(NA, c(D, 3, 3))
+  wA  <- numeric(D)
+
+  for (d in 1:D) {
+    muf <- muf_mat[d, ]
+    Cf  <- Cf_array[d, , ]
+    pf  <- solve(Cf)
+
+    CA[d,,] <- solve(
+      pf + t(mat_H) %*% ((1 / R_H) * mat_H)
+    )
+
+    muA[d,] <- CA[d,,] %*% (
+      pf %*% muf + t(mat_H) * (1 / R_H) * Yobs
+    )
+
+    lik <- dnorm(
+      Yobs,
+      mean = mat_H %*% muf,
+      sd   = sqrt(mat_H %*% Cf %*% t(mat_H) + R_H)
+    )
+
+    wA[d] <- lik * pD[d]
+  }
+
+  wA <- wA / sum(wA)
+
+  list(muA = muA, CA = CA, wA = wA)
+}
+
+mc_mean <- function(
+  muf_mat, Cf_array, pD, Yobs, H, R_H,
+  n_mc = 10e7
+) {
+  D <- nrow(muf_mat)
+
+  d_idx <- sample(1:D, size = n_mc, replace = TRUE, prob = pD)
+
+  X <- matrix(NA, n_mc, 3)
+  
+  mean <- matrix(0, 1, 3)
+  weight.sum <- 0
+  for (i in 1:n_mc) {
+    d <- sample(1:D, size=1, replace=TRUE, prob = pD)
+    X <- MASS::mvrnorm(1, muf_mat[d, ], Cf_array[d,,])
+    ## Likelihood under the true observation model
+    w <- dnorm(
+      Yobs,
+      mean = X[, H],
+      sd   = sqrt(R_H)
+    )
+    weight.sum <- weight.sum + w
+    mean <- mean + w * X
+  }
+  
+  mean <- mean / weight.sum
+  return(list(mu = mean))
+}
+
+
+set.seed(123)
+
+D <- 4
+H <- 3
+Yobs <- 1.7
+R_H <- 0.25
+
+## Random but well-conditioned priors
+muf_mat <- matrix(rnorm(D * 3), D, 3)
+
+Cf_array <- array(NA, c(D, 3, 3))
+for (d in 1:D) {
+  A <- matrix(rnorm(9), 3, 3)
+  Cf_array[d,,] <- crossprod(A) + diag(0.5, 3)
+}
+
+pD <- runif(D)
+pD <- pD / sum(pD)
+
+## Compute posteriors
+ana <- analytical_posterior(
+  muf_mat, Cf_array, pD, Yobs, H, R_H
+)
+
+mc <- mc_posterior(
+  muf_mat, Cf_array, pD, Yobs, H, R_H
+)
+```
+
+## comparison of overall means
+
+```{r}
+mu_mix <- Reduce(`+`, lapply(1:D, function(d)
+  ana$wA[d] * ana$muA[d, ]
+))
+
+print(mu_mix)
+print(mc$mu)
+```
+
+## test with data from SingleSite_MultiDisturb_MultiPool.R
+## compare means / covs of components, and mixture weights
+```{r}
+load("multidisturb-ex-values.RData")
+ana.test <- analytical_posterior(mu.F, cov.F, distprobs, cw.obs, H, R_H)
+print(ana.test$wA)
+print(w.A)
+print(ana.test$muA[1,])
+print(ana.test$CA[1,,])
+print(mu.A[1,])
+print(cov.A[1,,])
+print(ana.test$muA[3,])
+print(ana.test$CA[3,,])
+print(mu.A[3,])
+print(cov.A[3,,])
+
+
+```
+
+
+```{r}
+## Analytical mixture covariance
+mc_posterior_exact <- function(
+  muA, CA, wA, n_mc = 20e6
+) {
+  D <- nrow(muA)
+  d_idx <- sample(1:D, size = n_mc, replace = TRUE, prob = wA)
+
+  X <- matrix(NA, n_mc, 3)
+  for (d in 1:D) {
+    idx <- which(d_idx == d)
+    if (length(idx) > 0) {
+      X[idx, ] <- MASS::mvrnorm(
+        length(idx),
+        muA[d, ],
+        CA[d,,]
+      )
+    }
+  }
+
+  list(
+    mu = colMeans(X),
+    Sigma = cov(X)
+  )
+}
+
+mc2 <- mc_posterior_exact(
+  ana$muA, ana$CA, ana$wA, n_mc = 5e5
+)
+
+print(mc2$mu)
+print(mu_mix)
+```
+
