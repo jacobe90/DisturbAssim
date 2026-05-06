@@ -152,12 +152,22 @@ SSSD.model <- function(Y,Rparams,Q,PAR,Xic,THETA,dist,updateQ=TRUE, useAdjustmen
         muF[d+1,]  = colMeans(Nf[sel.dist,])
         CF[d+1,,] = var(Nf[sel.dist,])
         pF[d+1,,] = try(solve(CF[d+1,,]))
-      }
-      if(sum(!sel.undisturbed) <= 2 || "try-error" %in% class(pF[d+1,,])) {
-        muF[d+1,] = c(dist$vals[[d]]$mean[1], mean(Nf[,2]),  dist$vals[[d]]$mean[2])
-        CF[d+1,,] = diag(c(dist$vals[[d]]$cov[1,1],0.25,dist$vals[[d]]$cov[2,2]))
+        # print(paste("precision, class: ", d, "value: ", pF[d+1,1,1]))
+        # print(class(pF[d+1,1,1]))
+      } 
+      # backup values if the ensemble stats fail
+      
+      if(sum(!sel.undisturbed) <= 2 || "try-error" %in% class(pF[d+1,,]) || grepl("Error", pF[d+1, 1,1])) {
+        muF[d+1,] = c(dist$vals[[d]]$mu0[1], mean(Nf[,2]),  dist$vals[[d]]$mu0[2])   
+        CF[d+1,,] = diag(c(dist$vals[[d]]$V0[1,1],0.25,dist$vals[[d]]$V0[2,2]))
         pF[d+1,,] = solve(CF[d+1,,])
+        print(paste("iteration: ", d, "class: ", class(pF[d+1,1,1]), "value: ", pF[d+1,1,1]))
       }
+      
+      pF <- array(as.numeric(pF), dim = dim(pF), dimnames = dimnames(pF))
+      
+      
+      
     }
     ## Truncate negative pools to zero, then compute undisturbed-class
     ## forecast moments from the unperturbed members.
@@ -434,23 +444,6 @@ hist(age)
 colnames(ICprior) <- c("Cv","Cs","CR") 
 pairs(ICprior)
 
-## disturbance priors
-# default <- list(mu0=c(0.2, 0.25), V0=diag(c(0.15, 0.1)^2))
-# cut.sqrtN <- sqrt(21)
-# cut.removal.var <- 0.01 # convert cut SE 0.0053 to SD, sample size 21 from Berg 2016
-# 
-# # compute severe fire removal mean / variance (from chafe 2025)
-# fire.severe.before.mu <- 192.8  
-# fire.severe.after.mu <- 8.5
-# fire.severe.before.se <- 20.0
-# fire.severe.after.se <- 2.3
-# fire.severe.N <- 327 # Upper bound on sample size
-# fire.severe.removal.mu <- fire.severe.after.mu / fire.severe.before.mu
-# # fire.severe.removal.var <- ((fire.severe.after.mu^2 * fire.severe.before.se^2 / fire.severe.before.mu^4) + (fire.severe.after.se^2 / fire.severe.before.mu^2)) # use delta method
-# fire.severe.removal.var <- 0.01 
-# firepriors <- list(mu0=c(0.2, fire.severe.removal.mu), V0=diag(c(0.2^2, fire.severe.removal.var)))
-# cutpriors <- list(mu0=c(0.2, 0.0298), V0=diag(c(0.2^2, cut.removal.var)))
-# dist.forecastparams <- list("0"=default, "10"=default, "20"=cutpriors, "40"=firepriors, "50"=default)
 ```
 
 ### wrapper function to run data assimilation
@@ -545,7 +538,7 @@ runDA <- function(Rparams, useDistProduct, updateQ, useAdjustment, use_analytica
 
 ```{r}
 od = c(83:176,264:356)
-fullRun = c(83:356)
+fullRun = c(224:356)
 debug = c(90, 91, 94, 104, 106, 125, 152, 153, 165, 175) # high abs dist, low dist prob
 testRun = seq(551, ne, by=10)
 
@@ -591,7 +584,7 @@ runDA(Rparams=RparamsGEDIheteroskedastic, updateQ=TRUE, useDistProduct=TRUE, use
 
 ```{r}
 pool.names = c("Cl, Cs, Cw")
-for (site in c(471)) {
+for (site in 100:356) {
   runfile <- paste0("Rgedi_Htrue_Dtrue_OR_SD_", sprintf("%03d", site), ".RData")
   load(paste0("./experiments/final/", runfile))
   for(i in 3){
