@@ -1,0 +1,421 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{bm}
+\usepackage{mathtools}
+\usepackage{hyperref}
+\usepackage{microtype}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{listings}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  columns=fullflexible,
+  showstringspaces=false,
+  language=R,
+}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\T}{^{\mathsf T}}
+\newcommand{\inv}{^{-1}}
+\DeclareMathOperator{\diag}{diag}
+
+\title{Analytical Sequential State \& Disturbance Assimilation: \\
+       The \texttt{SSSD.model} Function}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\noindent
+This note documents the data-assimilation routine
+\texttt{SSSD.model} in
+\texttt{Analytical\_OR\_original\_model.Rmd}, focusing on the
+configuration \texttt{useAdjustment=TRUE} and
+\texttt{use\_analytical\_posterior=TRUE}.  The filter is a
+mixture-of-Gaussians extension of an Ensemble Adjustment Kalman
+Filter (EAKF) in which each mixture component corresponds to a
+distinct disturbance class.  At every annual timestep $t$ the
+algorithm performs three steps:
+\begin{enumerate}
+\item a deterministic ecosystem \emph{forecast} with the VSEM model
+      followed by stochastic process error and disturbance perturbation,
+\item an \emph{analysis} step in which a closed-form Gaussian posterior
+      is obtained per disturbance class and the class weights are
+      updated by the marginal likelihood, and
+\item an \emph{ensemble adjustment} (\texttt{multi.analytical.ens.adj})
+      that deterministically rescales the forecast ensemble so its
+      empirical moments and class frequencies match the analytical
+      posterior, providing initial conditions for the next year.
+\end{enumerate}
+
+\paragraph{State and notation.}
+Let $\bm x_t \in \R^{3}$ denote the carbon-pool state
+$(C_v, C_s, C_w)$ -- foliage, soil and wood -- for a site at the end of
+year $t$.  An ensemble of $n_e$ members
+$\{\bm x_t^{(i)}\}_{i=1}^{n_e}$ approximates the filtering distribution.
+Each member is also assigned a disturbance class
+$c^{(i)} \in \{0, 1, \dots, n_d\}$, with $0 = $ undisturbed.  We write
+$N = n_d + 1$ for the total number of mixture components and reserve
+indices $d = 1, \dots, N$ for them ($d = 1$ corresponds to the
+undisturbed component).
+
+\bigskip
+
+\section{Forecast: VSEM and the disturbance mixture}
+\label{sec:forecast}
+
+\subsection{The VSEM model}
+
+VSEM (the ``Very Simple Ecosystem Model'' from the \texttt{BayesianTools}
+R package) is a daily-time-step terrestrial carbon model with three
+pools: foliage $C_v$, soil $C_s$ and wood $C_w$.  Given a vector of
+$11$ ecosystem parameters $\bm\theta$ -- light-use efficiency, the
+fraction of GPP allocated to foliage, root and wood, the turnover rates
+of each pool, etc.\ -- and a daily PAR (photosynthetically active
+radiation) driver, VSEM integrates the system
+\[
+  \frac{d}{dt}
+  \begin{pmatrix} C_v \\ C_s \\ C_w \end{pmatrix}
+  =
+  f_{\mathrm{VSEM}}\!\bigl(C_v, C_s, C_w; \bm\theta,
+                            \mathrm{PAR}(t)\bigr)
+\]
+forward by one day at a time.  In this code we use the daily increment
+operator
+\[
+  \mathcal V_{\Delta t}\!\bigl(\bm x;\,\bm\theta,
+                                \mathrm{PAR}\bigr)
+\]
+to push a state $\bm x$ forward over a window of length $\Delta t$ days.
+
+\subsection{Per-member deterministic forecast}
+
+At the start of timestep $t$ the analysis state from the previous year is
+copied into entries $9{:}11$ of each ensemble member's parameter vector
+(the ``initial pools'' slot of \texttt{THETA}):
+\[
+  \bm\theta^{(i)}_{9:11} \leftarrow \bm x^{(i),a}_{t-1}.
+\]
+VSEM is then run for one year (365 days) per member with that year's
+PAR window, and the end-of-year pools are extracted:
+\[
+  \bm \mu^{(i)}_t
+  \;=\;
+  \mathcal V_{365}\!\bigl(\bm x^{(i),a}_{t-1};\,
+                          \bm\theta^{(i)},
+                          \mathrm{PAR}_{(t-1)\cdot 365 + 1 : t\cdot 365}
+                    \bigr).
+\]
+
+\subsection{Adaptive process noise on $C_w$}
+
+A Gaussian process-noise covariance $\bm Q \in \R^{3\times 3}$ is added
+to the deterministic forecast.  The diagonal entry for the wood pool,
+$Q_{ww}$, is updated sequentially via a conjugate Gamma update on the
+\emph{precision} $\tau = 1/Q_{ww}$.  We assume
+$Y_{t,w} \mid \bm \mu_t \sim
+ \mathcal N\!\bigl(\bar\mu_{t,w},\, Q_{ww}\bigr)$
+and place the prior
+$\tau \sim \mathrm{Gamma}(a_0, b_0)$
+with $a_0 = 1/0.1172475$, $b_0 = 1$.  After observing
+$Y_{t,w}$ in a year that is neither a known disturbance year nor the
+spin-up year, the conjugate update is
+\[
+  a_t \leftarrow a_t + \tfrac12,
+  \qquad
+  b_t \leftarrow b_t + \tfrac12 \bigl(Y_{t,w} - \bar\mu_{t,w}\bigr)^2,
+\]
+and we set
+\[
+  Q_{ww} \;\leftarrow\; \E\!\bigl[\tau\inv\bigr] \;=\; \frac{b_t}{a_t}.
+\]
+
+\subsection{Stochastic forecast and the disturbance mixture}
+
+Process noise is sampled per member,
+\(
+  \bm x^{(i),f}_t \sim \mathcal N\!\bigl(\bm\mu^{(i)}_t,\,\bm Q\bigr).
+\)
+A disturbance class is then drawn for each member from a flat ensemble
+prior
+\(
+  \pi_{\mathrm{ens}} = (0.5,\, 0.5/n_d, \dots, 0.5/n_d),
+\)
+and members assigned to class $d \ge 1$ are perturbed by
+\texttt{disturbance.p}, which kills a fraction of foliage and wood
+according to the class-$d$ removal distribution
+$\mathcal N(\bm\mu^{0}_d, \bm V^{0}_d)$.
+
+For each disturbance class $d \in \{1,\dots,n_d\}$, the empirical
+moments of the perturbed sub-ensemble give the per-class \emph{forecast
+prior}:
+\[
+  \bm\mu^{f}_{d+1}
+  = \frac{1}{|S_d|}\sum_{i \in S_d} \bm x^{(i),f}_t,
+  \qquad
+  \bm C^{f}_{d+1}
+  = \mathrm{Cov}\bigl(\{\bm x^{(i),f}_t\}_{i \in S_d}\bigr),
+  \qquad
+  \bm P^{f}_{d+1} = \bigl(\bm C^{f}_{d+1}\bigr)\inv,
+\]
+where $S_d$ is the set of members in class $d$.  If a sub-ensemble is
+too small or its covariance is singular, the algorithm falls back to the
+class's prior moments.  The undisturbed component $d=1$ is computed
+analogously from the unperturbed members.  All states are then truncated
+at zero by the helper \texttt{tobit}.
+
+The result of the forecast step is the Gaussian-mixture forecast
+distribution
+\begin{equation}
+  p^{f}(\bm x_t)
+  \;=\;
+  \sum_{d=1}^{N} \pi^{f}_d\,
+                 \mathcal N\!\bigl(\bm x_t;\, \bm\mu^{f}_d,\, \bm C^{f}_d\bigr),
+  \label{eq:forecast-mixture}
+\end{equation}
+together with the prior weights $\pi_d \equiv pD[d]$ supplied by the
+external disturbance product for year $t$.
+
+\bigskip
+
+\section{Analysis: per-component closed-form Gaussian update}
+\label{sec:analysis}
+
+\subsection{Observation model}
+
+A scalar observation $y_t = Y_{t,H}$ is available for one of the three
+state components (in the Oregon application, the wood pool $C_w$, so
+$H = 3$).  We encode the observed component with the row vector
+$\bm H \in \R^{1 \times 3}$ that has a single $1$ in column $H$, so
+$\bm H \bm x_t = x_{t,H}$.  Observation noise is heteroskedastic and
+proportional-plus-intercept in the observed value:
+\[
+  R_H \;=\; m\, y_t + b,
+  \qquad (m, b) = \texttt{Rparams},
+\]
+with the likelihood $y_t \mid \bm x_t \sim \mathcal N(\bm H \bm x_t, R_H)$.
+
+\subsection{Posterior derivation, per component}
+
+Conditional on disturbance class $d$, the prior is Gaussian
+$\bm x_t \sim \mathcal N(\bm\mu^{f}_d, \bm C^{f}_d)$ with precision
+$\bm P^{f}_d$.  The conditional posterior under the Gaussian likelihood
+is also Gaussian by conjugacy.  Working in canonical (precision /
+information) form, the posterior precision is the sum of the prior
+precision and the contribution from the data,
+\begin{equation}
+  \bm P^{a}_d
+  \;=\; \bm P^{f}_d + \bm H\T R_H\inv \bm H,
+  \label{eq:precision-update}
+\end{equation}
+so that the posterior covariance is
+\begin{equation}
+  \boxed{\;
+  \bm C^{a}_d \;=\;
+   \bigl(\bm P^{f}_d + \bm H\T R_H\inv \bm H\bigr)\inv.
+  \;}
+  \label{eq:CA}
+\end{equation}
+The information-form (precision-weighted mean) update is
+$\bm P^{a}_d \bm\mu^{a}_d
+   = \bm P^{f}_d \bm\mu^{f}_d + \bm H\T R_H\inv y_t$, hence
+\begin{equation}
+  \boxed{\;
+  \bm\mu^{a}_d \;=\;
+   \bm C^{a}_d
+   \bigl(\bm P^{f}_d \bm\mu^{f}_d
+         + \bm H\T R_H\inv y_t\bigr).
+  \;}
+  \label{eq:muA}
+\end{equation}
+This pair of formulas is computed per disturbance class in the loop
+\begin{lstlisting}
+CA[d,,] <- solve(pf + t(mat_H) %*% ((1/R_H) * mat_H))
+muA[d,] <- CA[d,,] %*% (pf %*% muf + (t(mat_H) * (1/R_H) * Y[t,H]))
+\end{lstlisting}
+which directly transcribes \eqref{eq:CA} and \eqref{eq:muA}.
+
+\subsection{Mixture-weight update via the marginal likelihood}
+
+Treating the disturbance class $D$ as a discrete latent variable with
+prior $\Pr(D=d) = \pi_d$, Bayes' rule gives
+\[
+  \Pr(D = d \mid y_t)
+  \;=\;
+  \frac{p(y_t \mid D=d)\,\pi_d}{\sum_{d'} p(y_t \mid D=d')\,\pi_{d'}}.
+\]
+The component marginal likelihood is obtained by integrating out
+$\bm x_t$ against the Gaussian prior,
+\[
+  p(y_t \mid D=d)
+  \;=\;
+  \int \mathcal N(y_t;\, \bm H \bm x_t, R_H)\,
+       \mathcal N(\bm x_t;\, \bm\mu^{f}_d, \bm C^{f}_d)\, d\bm x_t
+  \;=\;
+  \mathcal N\!\bigl(y_t;\,
+                    \bm H \bm\mu^{f}_d,\;
+                    \bm H \bm C^{f}_d \bm H\T + R_H\bigr).
+\]
+This is the standard predictive distribution of a linear-Gaussian
+state-space model.  In code, the unnormalized weights and their
+normalization are
+\begin{lstlisting}
+lik   <- dnorm(Y[t,H], mean = mat_H %*% muf,
+                       sd   = sqrt(mat_H %*% Cf %*% t(mat_H) + R_H))
+wA[d] <- lik * pD[d]
+...
+wA <- wA / sum(wA)
+\end{lstlisting}
+yielding the posterior mixture weights $w^{a}_d = \Pr(D=d \mid y_t)$.
+
+\subsection{Posterior summaries}
+
+Given the per-component posteriors $(\bm\mu^{a}_d, \bm C^{a}_d)$ and
+weights $w^{a}_d$, the algorithm reports
+\begin{itemize}
+  \item the overall posterior mean
+        $\bm\mu^{a} = \sum_d w^{a}_d \bm\mu^{a}_d$,
+  \item the disturbed-component conditional mean
+        $\bm\mu^{a}_D = \sum_{d\ge 2} \frac{w^{a}_d}{\sum_{d'\ge 2}w^{a}_{d'}}
+                          \bm\mu^{a}_d$,
+  \item the undisturbed mean $\bm\mu^{a}_N = \bm\mu^{a}_1$,
+  \item the total disturbance probability
+        $\Pr(D \neq 0 \mid y_t) = \sum_{d\ge 2} w^{a}_d$,
+  \item and per-component credible intervals from the most likely
+        component, $\arg\max_d w^{a}_d$.
+\end{itemize}
+
+\bigskip
+
+\section{Ensemble adjustment: \texttt{multi.analytical.ens.adj}}
+\label{sec:adjustment}
+
+The analysis step yields per-class posterior moments
+$(\bm\mu^{a}_d, \bm C^{a}_d, w^{a}_d)$, but the next forecast step
+needs an explicit ensemble of \emph{members}
+$\{\bm x^{(i),a}_t\}$ that VSEM can be initialized from.
+\texttt{multi.analytical.ens.adj} produces this ensemble by
+deterministically transforming the forecast members so that, class by
+class, the empirical moments of the ensemble match the analytical
+posterior moments.  This is the same idea that underlies the EAKF, here
+generalized to a Gaussian mixture.
+
+\subsection{Class reassignment}
+
+Let
+\(
+  f_d \;=\; \frac{1}{n_e}\sum_{i} \mathbf 1\{c^{(i)}_f = d\}
+\)
+be the empirical frequency of class $d$ in the forecast ensemble, and
+let $w^{a}_d$ be the analysis weights.  We need the new class labels
+$c^{(i)}_a$ to have empirical frequencies that approximate $w^{a}_d$.
+The routine moves members \emph{out of} classes whose weight
+\emph{decreased} ($w^{a}_d < f_d$) and \emph{into} classes whose weight
+\emph{increased}, in proportion to the positive part of the gap.
+Define
+\[
+  \Delta_d \;=\; \max\!\bigl(w^{a}_d - f_d,\; 0\bigr),
+  \qquad
+  q_d \;=\; \Delta_d \,\Big/\, \textstyle\sum_{d'} \Delta_{d'}.
+\]
+Then for each class $d$ with $w^{a}_d < f_d$, every member currently in
+class $d$ is reassigned to a new class drawn from the categorical
+distribution $q_{1:N}$.  Members in classes that grew or stayed the
+same keep their forecast label.  The resulting labels $c^{(i)}_a$ have
+expected frequencies equal to $w^{a}_d$ while changing as few labels
+as necessary.
+
+\subsection{Whitening: forecast $\to$ standard Gaussian}
+
+Within each forecast class $d$, decompose the forecast covariance via
+SVD,
+\(
+  \bm C^{f}_d = \bm V^{f}_d \diag(\bm L^{f}_d) (\bm V^{f}_d)\T.
+\)
+Each member is then mapped to a standardized vector
+\begin{equation}
+  \bm z^{(i)}
+  \;=\;
+  \diag(\bm L^{f}_d)^{-1/2} (\bm V^{f}_d)\T
+  \bigl(\bm x^{(i),f}_t - \bm\mu^{f}_d\bigr),
+  \qquad i \in S_d.
+  \label{eq:whiten}
+\end{equation}
+By construction, if the within-class forecast empirical moments equal
+$(\bm\mu^{f}_d, \bm C^{f}_d)$ exactly, then
+$\{\bm z^{(i)}\}_{i \in S_d}$ has zero empirical mean and identity
+empirical covariance.
+
+\subsection{Recoloring: standard Gaussian $\to$ analysis posterior}
+
+Now decompose each \emph{analysis} covariance,
+\(
+  \bm C^{a}_d = \bm V^{a}_d \diag(\bm L^{a}_d) (\bm V^{a}_d)\T,
+\)
+and recolor each member according to its \emph{new} class label
+$c^{(i)}_a = d$:
+\begin{equation}
+  \bm x^{(i),a}_t
+  \;=\;
+  \bm V^{a}_d \, \diag(\bm L^{a}_d)^{1/2}\, \bm z^{(i)}
+  + \bm\mu^{a}_d.
+  \label{eq:color}
+\end{equation}
+The composition \eqref{eq:whiten}--\eqref{eq:color} is an affine map
+that exactly preserves higher-order ensemble structure (skewness, joint
+dependencies between members) while shifting the per-class mean to
+$\bm\mu^{a}_d$ and the per-class covariance to $\bm C^{a}_d$.  In other
+words: each forecast member is mapped \emph{deterministically} to an
+analysis member by ``unrotating'' it using the forecast-class moments
+and ``re-rotating'' it using the analysis-class moments, with a
+possible class swap in between.  Because the transformation is
+deterministic, no Monte-Carlo sampling noise is added by the analysis
+step.  Pseudocode:
+\begin{lstlisting}
+for k in 1..N:
+    SVD of forecast Pf[k]:           V_f, L_f
+    for each forecast member i in class k:
+        z[i] = (1/sqrt(L_f)) * V_f^T (Xf[i] - mu.f[k])
+
+for k in 1..N:
+    SVD of analysis Pp.Pa[k]:        V_a, L_a
+    for each member i with new class k (cA[i] == k):
+        X_a[i] = V_a * diag(sqrt(L_a)) * z[i] + Pp.mu.a[k]
+\end{lstlisting}
+
+\subsection{Why this yields a valid analysis ensemble}
+
+If the per-class forecast empirical moments equal the assumed
+$(\bm\mu^{f}_d, \bm C^{f}_d)$, the post-adjustment per-class empirical
+moments equal $(\bm\mu^{a}_d, \bm C^{a}_d)$ exactly, and the empirical
+class frequencies equal $w^{a}_d$.  Thus the adjusted ensemble is a
+size-$n_e$ representation of the Gaussian-mixture posterior
+\[
+  p^{a}(\bm x_t \mid y_t)
+  \;=\;
+  \sum_{d=1}^{N} w^{a}_d\,
+                 \mathcal N\!\bigl(\bm x_t;\, \bm\mu^{a}_d,\, \bm C^{a}_d\bigr)
+\]
+that we derived in Section~\ref{sec:analysis}, and it can be fed
+straight into the next year's VSEM forecast as the new ICs
+$\bm x^{(i),a}_t$.  Negative pools that arise from the affine map are
+truncated to zero by \texttt{tobit} before the next forecast.
+
+\bigskip
+
+\noindent
+\textbf{Summary.}  Each annual cycle of \texttt{SSSD.model} (with the
+analytical posterior and ensemble adjustment turned on) is a
+mixture-of-Gaussians Kalman update: VSEM provides the per-class forecast
+moments, the closed-form expressions \eqref{eq:CA}--\eqref{eq:muA} give
+the per-class analysis moments, the marginal likelihood updates the
+class weights, and \texttt{multi.analytical.ens.adj} converts those
+moments back into a discrete ensemble for the next forecast step.
+
+\end{document}
