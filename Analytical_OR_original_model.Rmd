@@ -76,8 +76,10 @@ plot(metTime,rad[1,],type='l')
 ##' @param useAdjustment if true, use ensemble adjustment. If false, just sample from the posterior.
 ##' @param use_analytical_posterior if true use analytical posterior, if false use MCMC to sample from the posterior
 SSSD.model <- function(Y,Rparams,Q,PAR,Xic,THETA,dist,updateQ=TRUE, useAdjustment=TRUE, use_analytical_posterior=TRUE){
-  
-  ## init
+
+  ## Set up loop dimensions and pre-allocate arrays for forecast (muF/CF/pF) and
+  ## analysis (muA/CA/wA) moments across the dist$n+1 mixture components
+  ## (1 undisturbed + dist$n disturbance classes). Ensure THETA is per-ensemble.
   NT = length(PAR)/365
   Nf = Nmu = Na = Xic
   ne = nrow(Xic)
@@ -90,124 +92,115 @@ SSSD.model <- function(Y,Rparams,Q,PAR,Xic,THETA,dist,updateQ=TRUE, useAdjustmen
   if(!is.matrix(THETA)) THETA = matrix(THETA,nrow=ne,ncol=length(THETA),byrow = TRUE)
   Forecast = Analysis = Debug = list()
   ProcessErrors = list()
-  
-  AnalysisSSMDMP <- "
-    model{
-      ## Forecast priors
-      for(i in 1:N){
-        x[1:3, i] ~ dmnorm(muf[i,], pf[i,,])
-      }
-    
-      ## --- Categorical disturbance selection without dmulti ---
-      ## rho[1:N] is one-hot with probabilities p[1:N]
-    
-      # First category
-      rho[1] ~ dbern(p[1])
-    
-      # Intermediate categories
-      for(k in 2:(N-1)){
-        z[k] ~ dbern(p[k] / (1 - sum(p[1:(k-1)])))
-        rho[k] <- z[k] * (1 - sum(rho[1:(k-1)]))
-      }
-    
-      # Last category (absorbs remaining probability)
-      rho[N] <- 1 - sum(rho[1:(N-1)])
-      
-      ## --- Analysis --- 
-      for(j in 1:3){ 
-        X[j] <- sum(rho[1:N] * x[j,1:N]) 
-      }
-      
-      # Model observation
-      Y[3] ~ dmnorm(X[3], R)
-    }
-  "
-  
-  
-  a_t = 1/0.1172475 # place a prior on process precision: (1/Q) ~ Gamma(a_0, b_0).
+
+  ## Hyperparameters of conjugate Gamma prior on the wood-pool process precision
+  ## (1/Q[3,3]) ~ Gamma(a_t, b_t); years in `ignoreyears` are excluded from the
+  ## sequential update (initial spin-up year, and a known disturbance year).
+  a_t = 1/0.1172475
   b_t = 1
   ignoreyears <- c(1, 15)
-  
+
   for(t in 1:NT){
-    
-    ## update IC
-    THETA[,9:11]  <- Na    ## Multinomial
-    
-    # print("starting forecast...")
-    
-    ## Forecast 
+
+    ## Seed VSEM ICs (foliage / soil / wood pools) with the previous timestep's
+    ## analysis state for each ensemble member.
+    THETA[,9:11]  <- Na
+
+    ## Deterministic forecast: run VSEM forward 365 days for each ensemble
+    ## member using that year's PAR driver, and grab end-of-year pools.
     for(i in 1:ne){
-      tsel    = (t-1)*365 + 1:365             ## Select days from driver files
-      Nmu[i,] = VSEM(THETA[i,], PAR = PAR[tsel])[365,2:4] ## deterministic simulation
+      tsel    = (t-1)*365 + 1:365
+      Nmu[i,] = VSEM(THETA[i,], PAR = PAR[tsel])[365,2:4]
     }
-    
-    ## update process error (if we have observed data)
-    ## assume Y ~ N(mu, Q). We will pick Q using the posterior: Q = 1/(E[p((1/Q) | y)]) = 1/E[Gamma(a_t, b_t)] = b_t / a_t
-    if (!is.na(Y[t,3]) && updateQ && length(which(ignoreyears == t)) == 0) { # filter out disturbance years / start year (where ensemble is noisy )
+
+    ## Conjugate update of process precision using the wood-pool obs Y[t,3].
+    ## Posterior is Gamma(a_t + 1/2, b_t + 1/2 (y - mean)^2). We use the
+    ## posterior mean of the variance, b_t / a_t, as the new Q[3,3].
+    if (!is.na(Y[t,3]) && updateQ && length(which(ignoreyears == t)) == 0) {
       a_t <- a_t + 0.5
       b_t <- b_t + 0.5 * (Y[t,3] - colMeans(Nmu)[3])^2
       Q[3, 3] = b_t / a_t
     }
     ProcessErrors[[t]] <- Q[3, 3]
-    
-    ## Add process error
+
+    ## Add Gaussian process error to each ensemble member's deterministic forecast.
     for(i in 1:ne) {
-      # Nf[i, ] <- Nmu[i, ]
-      Nf[i,]  = mvtnorm::rmvnorm(1,Nmu[i,],Q) ## process error
+      Nf[i,]  = mvtnorm::rmvnorm(1,Nmu[i,],Q)
     }
-    
-    
-    ## Disturbance forecast model
+
+
+    ## Mixture forecast over disturbance classes: draw a class for each
+    ## ensemble member from a flat (50/50 undisturbed vs. evenly split among
+    ## disturbed) prior, then apply the disturbance perturbation to disturbed
+    ## members and record per-class forecast mean (muF), covariance (CF), and
+    ## precision (pF). Falls back to the disturbance prior moments if the
+    ## per-class subsample is too small or singular.
     d.ens.p <- c(0.5, rep(0.5 / dist$n, dist$n))
     d.forecast <- rmultinom(ne, 1, d.ens.p)
     d.class <- apply(d.forecast,2,which.max) - 1
     sel.undisturbed <- !as.logical(d.class)
-    
+
     for (d in 1:(dist$n)) {
       sel.dist = which(d.class == d)
       if(sum(!sel.undisturbed)>2) {
         for(j in sel.dist){
           Nf[j,] = disturbance.p(Nf[j,],
                       mu0=dist$vals[[d]]$mu0,
-                      V0=dist$vals[[d]]$V0, 
+                      V0=dist$vals[[d]]$V0,
                       alloc.soil=dist$alloc.soil)
         }
         muF[d+1,]  = colMeans(Nf[sel.dist,])
         CF[d+1,,] = var(Nf[sel.dist,])
         pF[d+1,,] = try(solve(CF[d+1,,]))
-      } 
-      # backup values if the ensemble stats fail
+      }
       if(sum(!sel.undisturbed) <= 2 || "try-error" %in% class(pF[d+1,,])) {
-        muF[d+1,] = c(dist$vals[[d]]$mean[1], mean(Nf[,2]),  dist$vals[[d]]$mean[2])   
+        muF[d+1,] = c(dist$vals[[d]]$mean[1], mean(Nf[,2]),  dist$vals[[d]]$mean[2])
         CF[d+1,,] = diag(c(dist$vals[[d]]$cov[1,1],0.25,dist$vals[[d]]$cov[2,2]))
         pF[d+1,,] = solve(CF[d+1,,])
       }
     }
+    ## Truncate negative pools to zero, then compute undisturbed-class
+    ## forecast moments from the unperturbed members.
     Nf <- tobit(Nf)
     muF[1,] = colMeans(Nf[sel.undisturbed,])
     CF[1,,] = var(Nf[sel.undisturbed,])
     pF[1,,] = solve(CF[1,,])
-    
-    # save forecast stats
+
+    ## Save summary stats of the forecast ensemble (separately for the
+    ## disturbed/undisturbed sub-ensembles) for later diagnostics.
     mufd <- colMeans(Nf[!sel.undisturbed,])
     mufn <- colMeans(Nf[sel.undisturbed,])
     qs <- c(0.025,0.25,0.5,0.75,0.975)
     cid <- apply(Nf[!sel.undisturbed,], 2, quantile, qs)
     cin <- apply(Nf[sel.undisturbed,], 2, quantile, qs)
     Forecast[[t]] <- list(muD = mufd, muN = mufn, ciN = cin, ciD = cid)
-    
-    ## Analysis
+
+    ## Analysis step. pD is the prior probability of each mixture component
+    ## at this timestep (from the disturbance product). H is the index of the
+    ## observed state variable (only proceed if exactly one is observed).
     pD = as.numeric(dist$p[,t])
     H = which(!is.na(Y[t,]))
-    
-    if (length(H) == 1) { ## data observed, run filter
+
+    if (length(H) == 1) {
+      ## Build the 1x3 observation operator (selects the observed pool) and
+      ## the heteroskedastic observation variance R_H = m * y + b.
       run.adjustment = TRUE
       H = as.numeric(H[1])
       mat_H = matrix(0, 1, 3)
       mat_H[H] <- 1
-      R_H <- Y[t,H] * Rparams[1] + Rparams[2] # compute heteroskedastic observation error
-      
-      if (use_analytical_posterior) { ## use analytical posterior
+      R_H <- Y[t,H] * Rparams[1] + Rparams[2]
+
+      if (use_analytical_posterior) {
+        ## Per-mixture-component conjugate Gaussian update. For prior
+        ##   x ~ N(muF[d], CF[d])  (precision pF[d] = CF[d]^-1)
+        ## and likelihood
+        ##   y ~ N(H x, R_H),
+        ## the posterior is Gaussian with
+        ##   CA[d]  = (pF[d] + H^T R_H^-1 H)^-1     (posterior covariance)
+        ##   muA[d] = CA[d] (pF[d] muF[d] + H^T R_H^-1 y)   (posterior mean)
+        ## The component weight wA[d] is the prior pD[d] times the marginal
+        ## likelihood of y under that component, p(y | d) = N(H muF[d],
+        ## H CF[d] H^T + R_H). Weights are then normalized to sum to 1.
         for (d in 1:(dist$n + 1)) {
           muf <- muF[d,]
           Cf <- CF[d,,]
@@ -217,123 +210,43 @@ SSSD.model <- function(Y,Rparams,Q,PAR,Xic,THETA,dist,updateQ=TRUE, useAdjustmen
           lik <- dnorm(Y[t,H], mean=mat_H %*% muf, sd = sqrt(mat_H %*% Cf %*% t(mat_H) + R_H))
           wA[d] <- lik * pD[d]
         }
-        
+
         if (sum(wA) > 0) {
-          wA <- wA / sum(wA) 
+          wA <- wA / sum(wA)
         } else {
           wA <- rep(1/"nclass", "nclass")
         }
-        
-        # -------------------------------
-        # test: compute MCMC posterior approximation
-        # -------------------------------
-        
-        ## number of disturbance types
-        # N <- nrow(muF)
-        # 
-        # ## normalize disturbance probabilities
-        # p.model <- dist$p[, t]
-        # p.model <- p.model / sum(p.model)
-        # 
-        # ## data list passed to JAGS
-        # update <- list(
-        #   N   = N,
-        #   p   = p.model,
-        #   muf = muF,   # [3 x N]
-        #   pf  = pF,    # [3 x 3 x N]
-        #   Y   = Y[t,],
-        #   R   = R_H
-        # )
-        # 
-        # ## initialize and adapt model
-        # mod <- rjags::jags.model(
-        #   file      = textConnection(AnalysisSSMDMP),
-        #   data      = update,
-        #   n.adapt   = 1000,
-        #   n.chains  = 3,
-        #   quiet     = TRUE
-        # )
-        # 
-        # ## draw posterior samples
-        # jdat <- rjags::coda.samples(
-        #   mod,
-        #   variable.names = c("X", "rho", "x"),
-        #   n.iter = 50000
-        # )
-        # 
-        # save(jdat, file="debugging-or.RData")
-        # 
-        # ## convert to matrix
-        # dat <- as.matrix(jdat)
-        # 
-        # ## extract posterior samples
-        # Xsel   <- grep("X", colnames(dat))
-        # rhosel <- grep("rho", colnames(dat))
-        # 
-        # Xa  <- dat[, Xsel]     # analysis state samples
-        # rho <- dat[, rhosel]  # disturbance indicator samples
-        # ca <- apply(rho,1,which.max)
-        # 
-        # muXa = colMeans(Xa)
-        # print("overall mean MCMC...")
-        # print(muXa)
-        # 
-        # print("undisturbed mean MCMC")
-        # rows.undist <- dat[,"rho[1]"] > 0
-        # print(colMeans(Xa[rows.undist,]))
-        # 
-        # print("disturbed mean MCMC")
-        # rows.dist <- dat[,"rho[1]"] == 0
-        # print(colMeans(Xa[rows.dist,]))
-        # 
-        # print("Y value...")
-        # print(Y[t, 3])
-        
-        
-      } else { ## run MCMC
-        
-        # 
-        # print("computed disturbed mean from MCMC")
-        # print(colMeans(Xa[ca==1,]))
-        # print("computed undisturbed mean from MCMC")
-        # print(colMeans(Xa[ca==0,]))
-        # print("computed disturbed mean from MCMC (directly from muD samples)")
-        # XDa = dat[,grep(pattern="^muD", x=colnames(dat))]
-        # print(colMeans(XDa))
-        # print("computed 50% quantile of muD samples")
-        # print(apply(XDa,2,quantile,c(0.5)))
-        # print("computed undisturbed mean from MCMC (directly from muN samples)")
-        # XNa = dat[,grep(pattern="^muN", x=colnames(dat))]
-        # print(colMeans(XNa))
-        # print("computed 50% quantile of muN samples")
-        # print(apply(XNa,2,quantile,c(0.5)))
-        # print("mufD:")
-        # print(mufD)
-        # print("mufN")
-        # print(mufN)
+      } else {
+        ## MCMC branch (not currently active in this script).
       }
-    } else { # if we don't have observed data
-      Na = Nf # analysis = forecast
+    } else {
+      ## No observation this timestep: analysis = forecast, no update.
+      Na = Nf
       ca = 1
       run.adjustment = FALSE
     }
-      ## draw new IC
+
+    ## Resample / adjust the ensemble to reflect the analysis posterior, so
+    ## the next timestep's VSEM can be initialized from analysis members.
     if(run.adjustment){
-      if(useAdjustment && use_analytical_posterior) { 
-        ## run ensemble adjustment
+      if(useAdjustment && use_analytical_posterior) {
+        ## Ensemble-adjustment: deterministically shifts/rescales each
+        ## forecast member to match the analytical per-class posterior
+        ## moments, while reassigning class membership using weights wA.
         Na <- multi.analytical.ens.adj(
             Xf   = Nf,
             cf   = d.class,
             mu.f = muF,
-            Pf   = CF,  # covariance matrices for undisturbed / disturbed ensemble states
+            Pf   = CF,
             Pp.mu.a = muA,
             Pp.Pa = CA,
             Pp.w = wA,
             uc = 0:dist$n)
-        Ca <- Na[,1] ## updated class assignments
+        Ca <- Na[,1]
         Na <- tobit(Na[,-1])
       } else if (!useAdjustment && use_analytical_posterior) {
-        ## sample directly from the posterior
+        ## Direct sampling: draw a class then a state from the per-class
+        ## Gaussian posterior for each ensemble member.
         Ca <- rbinom(nrow(Na), size=1, prob=pD_star)
         Pp.mu.a <- t(cbind(m_starN, m_starD))
         Pp.Pa <- abind::abind(C_starN, C_starD, along=3)
@@ -358,38 +271,37 @@ SSSD.model <- function(Y,Rparams,Q,PAR,Xic,THETA,dist,updateQ=TRUE, useAdjustmen
       } else {
         stop("useAdjustment = FALSE and use_analytical_posterior = FALSE is not supported")
       }
-      
+
     } else {
       Na <- tobit(Na)
-      Ca <- rep(0, ne) ## dummy data
+      Ca <- rep(0, ne)
     }
-    
-    ## Compute post-analysis means and CIs
-    if (run.adjustment) { ## if we did run analysis (since we had data)
-      if (use_analytical_posterior) { ## if we used analytical posterior
+
+    ## Summarize the analysis posterior for output: per-component CIs from
+    ## the most-likely component, posterior mean as the wA-weighted mixture
+    ## mean, separate disturbed/undisturbed mean summaries, and total
+    ## probability of disturbance (sum of disturbed-component weights).
+    if (run.adjustment) {
+      if (use_analytical_posterior) {
         AnalysisCIs <- matrix(NA, nrow=5, ncol=3)
         quantiles <- c(0.025,0.25,0.5,0.75,0.975)
-        
-        # compute analysis CIs from most likely component
+
         ci.idx <- which.max(wA)
         for (i in 1:3) {
           AnalysisCIs[,i] <- normal_quantile(quantiles, muA[ci.idx, i], CA[ci.idx, i, i])
         }
-        
-        # compute overall mean
+
         mu.post = rep(0, 3)
         for (i in 1:(dist$n + 1)) {
           mu.post <- mu.post + wA[i] * muA[i,]
         }
-        
-        # compute mean of just disturbed components
+
         mu.post.D = rep(0, 3)
         wA.sumdist <- sum(wA[2:dist$n+1])
         for (d in 2:(dist$n + 1)) {
           mu.post.D <- mu.post.D + (wA[d] / wA.sumdist) * muA[d,]
         }
-        
-        # mean of undisturbed
+
         mu.post.N = muA[1, ]
 
         prob.dist <- sum(wA[2:(dist$n + 1)])
@@ -401,14 +313,9 @@ SSSD.model <- function(Y,Rparams,Q,PAR,Xic,THETA,dist,updateQ=TRUE, useAdjustmen
                               mu.N = mu.post.N,
                               probD = prob.dist
                               )
-        
-      } else { ## if we used MCMC
+
+      } else {
         mu.post.D <- sum(ca == 1, na.rm = TRUE) / length(ca)
-        # print(paste0("year ", t))
-        # print("means of Xa")
-        # print(colMeans(Xa))
-        # print("0.5 quantiles of Xa")
-        # print(apply(Xa,2,quantile,c(0.5)))
         Analysis[[t]] <- list(Na = Na,
                               Ca = Ca,
                               CI = apply(Xa,2,quantile,c(0.025,0.25,0.5,0.75,0.975)),
@@ -416,7 +323,8 @@ SSSD.model <- function(Y,Rparams,Q,PAR,Xic,THETA,dist,updateQ=TRUE, useAdjustmen
                               m_starD = colMeans(Xa[ca==1,]),
                               muD = mu.post.D)
       }
-    } else { ## if we didn't have data
+    } else {
+      ## No-data fallback: summarize directly from the (unupdated) ensemble.
       AnalysisCIs <- apply(Na,2,quantile,c(0.025,0.25,0.5,0.75,0.975))
       mu.post <- apply(Na,2,mean,na.rm=TRUE)
       mu.post.D <- 0.1
@@ -561,33 +469,30 @@ pairs(ICprior)
 ##' @param expName name of experiment to use in output file names
 runDA <- function(Rparams, useDistProduct, updateQ, useAdjustment, use_analytical_posterior, siteIndices, expName) {
   for(i in siteIndices){
+    ## Build per-site output path encoding experiment name and zero-padded
+    ## site index (e.g. "experiments/final/<expName>_OR_SD_007.RData").
     ofile = paste0(
         "experiments/final/",
         expName, "_OR_SD_",
         formatC(i, width = 3, format = "d", flag = "0"),
         ".RData"
     )
-    
+
     print(ofile)
+
+    ## Assemble per-site DA inputs: number of years from PAR driver length,
+    ## NT x 3 observation matrix with the wood-pool obs in column 3, and a
+    ## diagonal process-error covariance Q built from per-pool SDs.
     NT = floor(ncol(rad)/365)
-    Yi = matrix(NA,NT,3)  ## observed data
-    Yi[1:ncol(Yw),3] = Yw[i,]  ## only Cw observed (Question: where do Yi observations come from?)
-    Q = diag(c(Ql,Qsoil,Qw)^2)  ## process error
-    
-    
-    # dtype = which(names(d.prior) == dextract[i,"t2004"]) ## 0 = none, 10 = other, 20 = cut, 30 = road, 40 = fire, 50 = biotic
-    # d.class.str = as.character(dextract[i,"t2004"])
-    # d.class.mu0 = dist.forecastparams[[d.class.str]]$mu0
-    # d.class.V0 = dist.forecastparams[[d.class.str]]$V0
-    # if(length(dtype)==0) break
-    # p.dist = rep(d.prior[dtype],NT) ## set background rate
-    # if (useDistProduct) {
-    #   users_accuracy = c(1-d.prior[1],.77,.92,.77,.78,.78) #Kennedy et al 2015 table 6
-    #   has.dist = which(dextract[i,] > 0)
-    #   p.dist[has.dist] = users_accuracy[dextract[i,has.dist]/10 + 1]
-    # }
-    
-    # load disturbance class priors
+    Yi = matrix(NA,NT,3)
+    Yi[1:ncol(Yw),3] = Yw[i,]
+    Q = diag(c(Ql,Qsoil,Qw)^2)
+
+    ## Build the (n.dist + 1) x NT prior probability matrix p.dist over
+    ## mixture components (row 1 = undisturbed, rows 2..n.dist+1 = each
+    ## disturbance sub-class). For each forecast component we look up the
+    ## background disturbance-type probability d.prior by matching the
+    ## component's name to one of "other"/"cut"/"fire"/"biotic".
     n.dist = length(dist.forecastparams)
     p.dist = array(NA, dim=c(n.dist + 1, NT))
     distname.toidx <- list("other"=2, "cut"=3, "fire"=4, "biotic"=5)
@@ -599,14 +504,15 @@ runDA <- function(Rparams, useDistProduct, updateQ, useAdjustment, use_analytica
         }
       }
     })
-    
-    # print(length(dist.prior.probs))
-    # print(nrow(p.dist))
-    # print(dist.prior.probs)
+
+    ## Initialize every year with the background prior (same column for all t).
     for (t in 1:NT) {
       p.dist[1:(n.dist+1),t] <- as.numeric(c(d.prior[1], unlist(dist.prior.probs)))
     }
-    
+
+    ## If using the disturbance product, override the prior in years where
+    ## a disturbance was detected: replace that class's prior probability
+    ## with the user's-accuracy estimate (Kennedy et al. 2015 table 6).
     if (useDistProduct) {
       users_accuracy = c(1-d.prior[1],.77,.92,.77,.78,.78)
       for (d in seq(names(dist.priors))) {
@@ -615,16 +521,20 @@ runDA <- function(Rparams, useDistProduct, updateQ, useAdjustment, use_analytica
         p.dist[d+1, has.dist] <- users_accuracy[dextract[i,has.dist]/10 + 1]
       }
     }
-    
-    disturb.params <- list(              
+
+    ## Bundle the disturbance prior + per-class forecast params expected by
+    ## SSSD.model (probabilities, count, prior moments, soil reallocation).
+    disturb.params <- list(
       p = p.dist,
       n = n.dist,
       vals = dist.forecastparams,
-      alloc.soil = 0.05        ## made up  
+      alloc.soil = 0.05
     )
+
+    ## Run the DA filter for this site and persist the result.
     test = SSSD.model(Y = Yi,Rparams=Rparams,Q=Q,
                     PAR=rad[i,],Xic=ICprior,THETA=theta[1:11],
-                    dist = disturb.params, useAdjustment=useAdjustment, updateQ=updateQ, 
+                    dist = disturb.params, useAdjustment=useAdjustment, updateQ=updateQ,
                     use_analytical_posterior = use_analytical_posterior)
     save(test,file=ofile)
   }
