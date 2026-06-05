@@ -151,6 +151,12 @@ Classes 100-160 are based on pixel-level labels based on the temporal signature 
 
 ```{r}
 dtime = 1985:2012
+#freq(dis)
+print(freq(disS))
+```
+
+```{r}
+dtime = 1985:2012
 fd = freq(dis)
 fdS = freq(disS)
 dclass <- unique(unlist(sapply(fdS,function(x){x[,1]}))) ## disturbance classes
@@ -200,6 +206,15 @@ rcl = matrix(
          73, 10  # 'Landslide',
          ),ncol=2,byrow = TRUE)
 
+```
+
+```{r}
+disR = raster::subs(disS,as.data.frame(rcl))
+disR <- raster::resample(disR,cover,method="ngb")
+disR <- writeRaster(disR, "disR.tif", overwrite = TRUE)
+```
+
+```{r}
 disR = raster::subs(disS,as.data.frame(rcl))
 save(disR,file=dis.processed)
 raster::writeRaster(disR,"dis.processed.tif",format="GTiff",overwrite=TRUE)
@@ -267,7 +282,7 @@ for(i in seq_along(dclass)){
   disR <- raster::resample(disR,cover,method="ngb")
   dis.resamp = "disR.resamp.RData"
   save(disR,fdS,file=dis.resamp)
-
+disR <- writeRaster(disR, "disR.tif", overwrite = TRUE)
 ## save year for figure
 dis04 = disR[[which(dtime==2004)]]
 #dis04 = ratify(dis04)
@@ -278,6 +293,9 @@ dis04 = disR[[which(dtime==2004)]]
 #dis04 <- raster::projectRaster(dis04,crs=crs("+proj=longlat +datum=WGS84"))
 
 ```
+
+
+
 ## write raster
 ```{r}
 NAvalue(dis04) <- -9999

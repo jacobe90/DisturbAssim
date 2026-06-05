@@ -152,10 +152,16 @@ for (disttype in seq(0, 50, by=10)) {
 }
 dev.off()
 ```
+```{r}
+library(raster)
+
+disR <- writeRaster(disR, "disR.tif", overwrite = TRUE)
+
+```
 
 ## load a larger number of disturbed pixels
 ```{r}
-# load("state-transition-saved.RData")
+#load("state-transition-saved.RData")
 
 ## sample disturbances for target year
 nsamp = 15000
@@ -171,8 +177,11 @@ for (c in seq_along(dclass)) {
   nc <- length(which(fsamp[,2] == dclass[c]))
   print(paste("class", dclass[c], ":", nc, "samples"))  
 }
+```
 
+```{r}
 # extract disturbance / biomass data
+disR <- stack("disR.tif")
 dextract.large = raster::extract(disR,fsamp[,1])
 bextract.large = raster::extract(bioS,fsamp[,1])
 B2C = 0.5

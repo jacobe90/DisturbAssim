@@ -1,0 +1,225 @@
+---
+title: "OR_joint_update_analysis"
+output: html_document
+author: "Jacob Epstein"
+---
+
+Postprocessing + analyses for the joint-update runs saved by
+`run_joint_update_sites()` in `OR_joint_update.Rmd`. Each run is an `hist` list
+saved to `experiments/jointUpdate/site_<idx>_distprod_<TF>_<source>_<model>.rds`,
+containing per-timestep vectors `probD`, `overall.analysis`, and the 5-quantile
+wood-pool CI matrix `ci5`.
+
+## set up
+
+```{r}
+B2C <- 0.5
+load("extract.h03v04.RData")                 # bextract, dextract, points
+dtime <- 1985:2012
+colnames(dextract) <- paste0("t", dtime)
+dextract[is.na(dextract)] <- 0
+Yw <- bextract * B2C * 1000 * 1e-4            # nsite x nyears observed
+
+indir <- "experiments/jointUpdate"
+t04 <- 15          # reference disturbance-assessment timestep (fixed reference year)
+tlo <- 28          # last-observation timestep
+qprobs <- c(0.025, 0.25, 0.5, 0.75, 0.975)
+```
+
+## postprocessing
+
+```{r}
+## Detect the joint-update run files and parse site index + experiment label
+## (experiment = distprod + Rparams source + model, e.g. "distprod_TRUE_GEDI_het").
+runs  <- dir(indir, pattern = "^site_.*\\.rds$")
+parts <- strsplit(sub("\\.rds$", "", runs), "_", fixed = TRUE)
+sites <- sapply(parts, function(x) as.numeric(x[2]))
+exp   <- sapply(parts, function(x) paste(x[3:length(x)], collapse = "_"))
+exps  <- unique(exp)
+print(exps)
+
+elist <- list()
+for (i in seq_along(exps)) {
+  esel  <- which(exp == exps[i])
+  nsite <- nrow(dextract)
+  distrate   <- rep(NA, nsite)                              # posterior prob. of disturbance
+  nisbar     <- rep(NA, nsite)                              # per-site average NIS over timesteps
+  cfbar      <- q33bar <- Rbar <- rep(NA, nsite)            # per-site mean S components
+  predist    <- distsize <- divergence <- matrix(NA, nsite, 6)  # mean + 5 quantiles
+  for (j in seq_along(esel)) {
+    res <- readRDS(file.path(indir, runs[esel[j]]))
+    k   <- sites[esel[j]]
+
+    ## detection rate at the assessment year
+    distrate[k]      <- res$probD[t04]
+
+    ## average normalized innovation squared over observed timesteps
+    nisbar[k]        <- mean(res$nis, na.rm = TRUE)
+
+    ## per-site mean innovation-variance components (S = CF + q33 + R)
+    cfbar[k]         <- mean(res$nis.cf,  na.rm = TRUE)
+    q33bar[k]        <- mean(res$nis.q33, na.rm = TRUE)
+    Rbar[k]          <- mean(res$nis.R,   na.rm = TRUE)
+
+    ## capture of the disturbance change (pre / during)
+    predist[k, 1]    <- res$overall.analysis[t04 - 1]; predist[k, 2:6]    <- res$ci5[t04 - 1, ]
+    distsize[k, 1]   <- res$overall.analysis[t04];     distsize[k, 2:6]   <- res$ci5[t04, ]
+
+    ## filter divergence at the last observation
+    divergence[k, 1] <- res$overall.analysis[tlo];     divergence[k, 2:6] <- res$ci5[tlo, ]
+  }
+  elist[[exps[i]]] <- list(distrate = distrate, nisbar = nisbar,
+                           cfbar = cfbar, q33bar = q33bar, Rbar = Rbar,
+                           predist = predist,
+                           distsize = distsize, divergence = divergence)
+}
+
+## grab matching observations
+obs.pre   <- Yw[, t04 - 1]            # observation before disturbance
+obs.dist  <- Yw[, t04]               # observation during disturbance
+obs.tlo   <- Yw[, tlo]               # observation at last timestep
+obs.class <- dextract[, "t2004"] / 10
+save(elist, obs.pre, obs.dist, obs.tlo, obs.class,
+     file = file.path(indir, "elist.RData"))
+```
+
+## analyses
+
+```{r}
+pdf(file.path(indir, "exps_diagnostics.pdf"))
+trim <- function(x, lo = 0.0001, hi = 0.9999) {
+  x[x < lo] <- lo
+  x[x > hi] <- hi
+  return(x)
+}
+betatrim <- function(y) {
+  n.obs <- sum(!is.na(y))
+  (y * (n.obs - 1) + 0.5) / n.obs
+}
+stats <- list()
+
+classnames <- c("other", "cut", "road", "fire", "biotic")  # disturbance types
+class_vals <- sort(unique(obs.class))
+class_vals <- class_vals[class_vals != 0]                   # drop 0 (no disturbance)
+classes_in_data <- classnames[class_vals]
+
+## colour by disturbance class; offset by 1 so class 0 (undisturbed) isn't col 0,
+## which base R draws in the (invisible) background colour.
+class.cols <- c("grey70", "black", "red", "green3", "blue", "cyan", "magenta")  # index = class+1
+pt.col <- class.cols[obs.class + 1]
+
+## 95% interval for the mean of n.obs per-step NIS values (chi-sq_N / N)
+n.obs  <- ncol(Yw)
+nis.ci <- qchisq(c(0.025, 0.975), df = n.obs) / n.obs
+
+for (i in seq_along(exps)) {
+  ## normalized innovation squared (per-site average; replaces filter divergence)
+  div = elist[[i]]$nisbar
+  div.reg    = lm(div ~ obs.tlo)
+  div.median = median(div, na.rm = TRUE)
+  div.cov    = sum(div > nis.ci[1] & div < nis.ci[2], na.rm = TRUE) / sum(!is.na(div))
+
+  plot(obs.tlo, div, col = pt.col, main = exps[i],
+       ylab = "mean NIS", ylim = range(c(0, div, nis.ci), na.rm = TRUE))
+  legend("topright", legend = classes_in_data, col = class.cols[class_vals + 1],
+         pch = 21, bty = "n", title = "disturbance type")
+  abline(h = nis.ci, lty = 2)            # 95% chi-sq_N / N interval
+  abline(div.reg, col = 2)
+
+  ## innovation-variance decomposition: stacked bars of mean S = CF + q33 + R per site,
+  ## ordered by total S, so it's clear which term dominates (q33 is the Qmult-deflatable one)
+  cf  <- elist[[i]]$cfbar; q33 <- elist[[i]]$q33bar; Rv <- elist[[i]]$Rbar
+  ok  <- which(is.finite(cf) & is.finite(q33) & is.finite(Rv))
+  if (length(ok) > 0) {
+    ord <- ok[order(cf[ok] + q33[ok] + Rv[ok])]
+    barplot(rbind(cf[ord], q33[ord], Rv[ord]),
+            names.arg = ord, las = 2, cex.names = 0.6,
+            col = c("grey60", "orange", "steelblue"),
+            main = paste(exps[i], "- mean innovation variance S"),
+            xlab = "site (ordered by total S)", ylab = "variance (kgC m-2)^2")
+    legend("topleft", bty = "n",
+           legend = c("CF (forecast spread)", "q33 (process, x Qmult)", "R (obs error)"),
+           fill = c("grey60", "orange", "steelblue"))
+  }
+
+  ## Disturbance detection
+  distrate <- elist[[i]]$distrate
+
+  ## Disturbance skill
+  ord <- order(distrate)
+  dist.bar   = mean(distrate, na.rm = TRUE)
+  dist.class = tapply(distrate, obs.class, mean, na.rm = TRUE)
+
+  ## vs predisturbance biomass
+  distrate2 = betatrim(distrate)
+  pred.seq = data.frame(obs.pre = seq(0, max(obs.pre, na.rm = TRUE), length = 500),
+                        distprop = seq(-1, 1, length = 500))
+  dist.reg.pre  = lm(distrate ~ obs.pre)
+  dist.beta.pre = betareg::betareg(distrate2 ~ obs.pre,
+                                   na.action = na.omit, link = "logit")
+
+  ## vs proportional disturbance size
+  distprop = 1 - elist[[i]]$distsize[, 1] / elist[[i]]$predist[, 1]  ## predicted
+  distprop = 1 - obs.dist / obs.pre                                  ## observed
+  dist.beta.prop = betareg::betareg(distrate2 ~ distprop,
+                                    na.action = na.omit, link = "logit")
+
+  ## vs ABSOLUTE disturbance size
+  distabs = obs.pre - obs.dist
+  pred.seq$distabs = seq(min(distabs, na.rm = TRUE), max(distabs, na.rm = TRUE), length = 500)
+  dist.beta.abs = betareg::betareg(distrate2 ~ distabs | distabs,
+                                   na.action = na.omit,
+                                   link = "logit",
+                                   link.phi = "log",
+                                   start = c(0, 5, 0.5, 0),
+                                   type = "BR")
+  dist.qb.abs = glm(distrate2 ~ distabs,
+                    na.action = na.omit,
+                    family = quasibinomial("logit"))
+  dist.bin.abs = glm(round(distrate) ~ distabs,
+                     na.action = na.omit,
+                     family = binomial("logit"))
+  plot(distabs, distrate, col = pt.col, main = exps[i])
+  legend("topright", legend = classes_in_data, col = class.cols[class_vals + 1],
+         pch = 21, bty = "n", title = "disturbance type")
+  lines(pred.seq$distabs, predict(dist.beta.abs, newdata = pred.seq, type = "quantile"), col = "green")
+  lines(pred.seq$distabs, predict(dist.beta.abs, newdata = pred.seq, type = "quantile", at = 0.75), col = "green", lty = 2)
+  lines(pred.seq$distabs, predict(dist.beta.abs, newdata = pred.seq, type = "quantile", at = 0.25), col = "green", lty = 2)
+  lines(pred.seq$distabs, predict(dist.qb.abs, newdata = pred.seq, type = "response"), col = "purple")
+  lines(pred.seq$distabs, predict(dist.bin.abs, newdata = pred.seq, type = "response"), col = "blue")
+  #
+  # ## vs divergence
+  absdiv = abs(div)
+  dist.beta.absdiv = betareg::betareg(distrate2 ~ absdiv,
+                                       na.action = na.omit, link = "logit")
+  dist.bin.absdiv = glm(round(distrate) ~ absdiv,
+                         na.action = na.omit,
+                         family = binomial("logit"))
+  pred.seq$absdiv = seq(0, max(absdiv, na.rm = TRUE), length = 500)
+  #
+  dist.qb.combo = glm(distrate2 ~ obs.pre + distprop +
+                         distabs + absdiv + obs.class,
+                       na.action = na.omit,
+                       family = quasibinomial("logit"))
+  # dist.bin.combo = glm(round(distrate) ~ obs.pre + distprop +
+  #                         distabs + absdiv + as.factor(obs.class),
+  #                       na.action = na.omit,
+  #                       family = binomial("logit"))
+
+  stats[[i]] <- list(
+    div.reg = div.reg,
+    div.median = div.median,
+    div.cov = div.cov,
+    dist.bar = dist.bar,
+    dist.class = dist.class,
+    dist.pre =  dist.beta.pre,
+    dist.prop = dist.beta.prop,
+    dist.beta.abs =  dist.beta.abs,
+    dist.bin.abs  = dist.bin.abs,
+    dist.absdiv   = dist.beta.absdiv
+    #dist.combo = dist.bin.combo
+  )
+}
+dev.off()
+save(stats, file = file.path(indir, "stats.RData"))
+```

@@ -31,6 +31,7 @@ d.prior = d.prior[-6]
 ## Load Calibration
 load("fit.RData")
 Qsoil = Qs
+
 ```
 
 ## drivers
@@ -64,7 +65,7 @@ plot(metTime,rad[1,],type='l')
 
 ## functions
 
-```{r,echo=FALSE,results='hide',message=FALS}
+```{r,echo=FALSE,results='hide',message=FALSE}
 ##' Single Site, Single Disturbance
 ##' @param Y observed data
 ##' @param Rparams 2 element list [slope, intercept] mapping data value to observation error (R) value
@@ -152,8 +153,6 @@ SSSD.model <- function(Y,Rparams,Q,PAR,Xic,THETA,dist,updateQ=TRUE, useAdjustmen
         muF[d+1,]  = colMeans(Nf[sel.dist,])
         CF[d+1,,] = var(Nf[sel.dist,])
         pF[d+1,,] = try(solve(CF[d+1,,]))
-        # print(paste("precision, class: ", d, "value: ", pF[d+1,1,1]))
-        # print(class(pF[d+1,1,1]))
       } 
       # backup values if the ensemble stats fail
       
@@ -166,11 +165,9 @@ SSSD.model <- function(Y,Rparams,Q,PAR,Xic,THETA,dist,updateQ=TRUE, useAdjustmen
       
       pF <- array(as.numeric(pF), dim = dim(pF), dimnames = dimnames(pF))
       
-      
-      
     }
     ## Truncate negative pools to zero, then compute undisturbed-class
-    ## forecast moments from the unperturbed members.
+    ## forecast moments from the undisturbed members.
     Nf <- tobit(Nf)
     muF[1,] = colMeans(Nf[sel.undisturbed,])
     CF[1,,] = var(Nf[sel.undisturbed,])
@@ -266,18 +263,7 @@ SSSD.model <- function(Y,Rparams,Q,PAR,Xic,THETA,dist,updateQ=TRUE, useAdjustmen
         }
         Na <- tobit(Na)
       } else if (useAdjustment && !use_analytical_posterior) {
-        Na <- multi.ens.adj(
-          Xf = Nf,
-          cf = d.forecast,
-          mu.f = rbind(mufN, mufD),
-          Pf   = abind::abind(CfN,
-                   CfD,
-                   along=3),
-          Xa = Xa,
-          ca = ca
-        )
-        Ca <- Na[,1]
-        Na <- tobit(Na[,-1])
+        stop("useAdjustment = TRUE and use_analytical_posterior = FALSE is not supported")
       } else {
         stop("useAdjustment = FALSE and use_analytical_posterior = FALSE is not supported")
       }
@@ -356,18 +342,6 @@ SSSD.model <- function(Y,Rparams,Q,PAR,Xic,THETA,dist,updateQ=TRUE, useAdjustmen
   }
   return(list(Forecast=Forecast,Analysis=Analysis,Y=Y, ProcessErrors=ProcessErrors, Debug=Debug))
 }
-```
-
-```{r}
-load("debugging-or.RData")
-
-# pf <- matrix(
-#   as.numeric(pf),
-#   nrow = nrow(pf),
-#   ncol = ncol(pf)
-# )
-# solve(pf + t(mat_H) %*% ((1/R_H) * mat_H))
-
 ```
 
 ## Load disturbance parameters
@@ -523,7 +497,7 @@ runDA <- function(Rparams, useDistProduct, updateQ, useAdjustment, use_analytica
       vals = dist.forecastparams,
       alloc.soil = 0.05
     )
-
+    
     ## Run the DA filter for this site and persist the result.
     test = SSSD.model(Y = Yi,Rparams=Rparams,Q=Q,
                     PAR=rad[i,],Xic=ICprior,THETA=theta[1:11],
@@ -541,7 +515,7 @@ od = c(83:176,264:356)
 fullRun = c(224:356)
 debug = c(90, 91, 94, 104, 106, 125, 152, 153, 165, 175) # high abs dist, low dist prob
 testRun = seq(551, ne, by=10)
-
+testOne = c(250)
 RGEDImean <- 0.8848249 # kg / m^2
 RLandTrendrmean <- 3.79986 # kg / m^2
 RparamsGEDIfixed <- c(0, RGEDImean)
@@ -554,7 +528,7 @@ RparamsGEDIheteroskedastic <- c(0.01331, 0.09761) # from regular regression (m_G
 Cwmean <- (RGEDImean - RparamsGEDIheteroskedastic[2]) / RparamsGEDIheteroskedastic[1] # m_G * Cwmean + b_G = RGEDImean
 Landtrendrslope <- RparamsGEDIheteroskedastic[1] # set m_L = m_G
 Landtrendrintercept <- RLandTrendrmean - Landtrendrslope * Cwmean # m_L * Cwmean + b_L = RLandTrendrmean
-RparamsLandtrendrheteroskedastic <- c(Landtrendrslope, Landtrendrintercept) # (m_L, b_G)
+RparamsLandtrendrheteroskedastic <- c(Landtrendrslope, Landtrendrintercept) # (m_L, b_L)
 
 # # experiment Rgedi_Hfalse_Dfalse
 # runDA(Rparams=RparamsGEDIfixed, useDistProduct = FALSE, updateQ=TRUE, useAdjustment=TRUE, use_analytical_posterior=TRUE, siteIndices=fullRun, expName="Rgedi_Hfalse_Dfalse") # R = (gedi, landtrendr), H = heteroskedastic = (true, false), D = disturbance product = (true, false)
@@ -575,7 +549,7 @@ RparamsLandtrendrheteroskedastic <- c(Landtrendrslope, Landtrendrintercept) # (m
 # runDA(Rparams=RparamsLandTrendrfixed, updateQ=TRUE, useDistProduct = TRUE, useAdjustment=TRUE, use_analytical_posterior=TRUE, siteIndices=fullRun, expName="Rlandtrendr_Hfalse_Dtrue") # R = (gedi, landtrendr), H = heteroskedastic = (true, false), D = disturbance product = (true, false)
 
 # experiment Rgedi_Htrue_Dtrue
-runDA(Rparams=RparamsGEDIheteroskedastic, updateQ=TRUE, useDistProduct=TRUE, useAdjustment=TRUE, use_analytical_posterior=TRUE, siteIndices=fullRun, expName="Rgedi_Htrue_Dtrue") # R = (gedi, landtrendr), H = heteroskedastic = (true, false), D = disturbance product = (true, false)
+runDA(Rparams=RparamsGEDIheteroskedastic, updateQ=TRUE, useDistProduct=TRUE, useAdjustment=TRUE, use_analytical_posterior=TRUE, siteIndices=testOne, expName="Rgedi_Htrue_Dtrue") # R = (gedi, landtrendr), H = heteroskedastic = (true, false), D = disturbance product = (true, false)
 
 # experiment Rlandtrendr_Htrue_Dtrue
 # runDA(Rparams=RparamsLandtrendrheteroskedastic, useDistProduct = TRUE, updateQ=TRUE, useAdjustment=TRUE, use_analytical_posterior=TRUE, siteIndices=fullRun, expName="Rlandtrendr_Htrue_Dtrue") # R = (gedi, landtrendr), H = heteroskedastic = (true, false), D = disturbance product = (true, false)
@@ -733,6 +707,7 @@ for (site in 100:356) {
   }
 }
 ```
+
 
 ## postprocessing
 

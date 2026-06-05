@@ -1,5 +1,5 @@
 ##' @title multi.analytical ens.adj
-##' @name  multi.analytica.ens.adj
+##' @name  multi.analytical.ens.adj
 ##' @author Jacob Epstein 
 ##' 
 ##' 
