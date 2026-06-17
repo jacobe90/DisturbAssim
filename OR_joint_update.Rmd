@@ -13,7 +13,9 @@ date: "5/30/26"
 ```{r}
 library(statmod)
 library(pracma)
+library(BayesianTools)       # VSEM forest model
 source("StatsAuxiliary.R")   # normal_quantile(p, mean, variance)
+source("disturbance.R")      # disturbance.p() forecast perturbation
 ## Load disturbance rate, state&transition, disturbed biomass stats
 load("STprior.RData")
 load("extract.h03v04.RData")
@@ -55,6 +57,7 @@ for(i in seq_along(dm)){
 plot(metTime,rad[1,],type='l')
 ## plot(date,PAR,col=2) ## calibration data
 ```
+
 ```{r}
 dist <- list()
 dist_name <- c(
@@ -125,6 +128,7 @@ hist(age)
 colnames(ICprior) <- c("Cv","Cs","CR") 
 pairs(ICprior)
 ```
+
 ```{r}
 
 ## ---- Site-independent setup (computed once) --------------------------------
@@ -153,6 +157,9 @@ gamInit <- c(a, b)
 
 ## Default heteroskedastic Rparams for GEDI (slope, intercept).
 Rparams.GEDI.het <- c(0.01331, 0.09761)
+Rparams.GEDI.fixed <- c(0.0000000, 0.8848249)
+Rparams.Landtrendr.het <- c(0.013310, 3.012645)
+Rparams.Landtrendr.fixed <- c(0.000, 3.79986)
 
 ## ---- Per-site argument builder ---------------------------------------------
 ## make_or_args(site, useDistProduct) assembles the site-specific inputs to
@@ -172,11 +179,11 @@ make_or_args <- function(site, useDistProduct = TRUE) {
   ## disturbance was detected at this site: replace that class's prior with the
   ## user's-accuracy estimate (Kennedy et al. 2015 table 6). Then give each
   ## component a share of the disturbance probability proportional to its weight,
-  ## and rescale each column to its original sum (1 - p(NA in raster)).
+  ## and the disturbed values to sum to 1 if they sum to greater than 1, and else
+  ## set the undisturbed value to 1 - p(disturbed).
   if (useDistProduct) {
     distidx.toname = list("10"="OTHER", "20"="CUT", "40"="FIRE", "50"="PEST")
-    users_accuracy = c(1-d.prior[1], .77, .92, .77, .78, .78)
-    total.prob <- sum(d.prior[1:5])
+    users_accuracy = c(1-d.prior[1], .77, .92, .77, .78, .78) ## 0 = none, 10 = other, 20 = cut, 30 = road, 40 = fire, 50 = biotic
     weights <- unlist(sapply(dist.priors, function(x) x$weights))
 
     for (d in seq(names(dist.priors))) {
@@ -188,9 +195,21 @@ make_or_args <- function(site, useDistProduct = TRUE) {
       }
     }
 
+    ## Combine into a per-year categorical prior. Keep the within-class `weights`
+    ## (mclust mixture proportions, sum to 1 per class) so a class's probability is
+    ## split across its cluster components without over-counting. Then set the
+    ## undisturbed prior to the *remaining* mass (= 1 - product accuracy in flagged
+    ## years, = background otherwise) instead of renormalizing against the large
+    ## background undisturbed prior, so the raw disturbance-product probability is
+    ## preserved rather than diluted.
     for (j in 1:ncol(p.dist)) {
-      p.dist[2:(n.dist+1), j] <- (p.dist[2:(n.dist+1), j] * weights)
-      p.dist[, j] <- (p.dist[, j] / sum(p.dist[, j])) * total.prob
+      p.dist[2:(n.dist+1), j] <- p.dist[2:(n.dist+1), j] * weights   # split class prob across clusters
+      dist.mass <- sum(p.dist[2:(n.dist+1), j])
+      if (dist.mass > 1) {                                           # guard: cap total disturbed mass at 1
+        p.dist[2:(n.dist+1), j] <- p.dist[2:(n.dist+1), j] / dist.mass
+        dist.mass <- 1
+      }
+      p.dist[1, j] <- 1 - dist.mass                                  # undisturbed = remaining mass
     }
   }
 
@@ -258,7 +277,7 @@ solve_digamma_log <- function(c, tol = 1e-12, maxiter = 100, a.max = 1e4) {
 ##' @param THETA parameter matrix
 ##' @param dist  disturbance list: p.dist, mu0[3], V0[3,3], alloc soil
 
-ORJointUpdate <- function(gamInit,Y,Rparams,Q,PAR,Xic,THETA,dist,Qmult=0.5,infl=0.005) {
+ORJointUpdate <- function(gamInit,Y,Rparams,Q,PAR,Xic,THETA,dist) {
   # initialize variables
   NT <- length(PAR)/365
   Nf = Na = array(Xic, dim = c(nrow(Xic), ncol(Xic), dist$n + 1))
@@ -291,7 +310,7 @@ ORJointUpdate <- function(gamInit,Y,Rparams,Q,PAR,Xic,THETA,dist,Qmult=0.5,infl=
                ci5=matrix(NA,NT,5),              # 5 wood-pool quantiles (2.5/25/50/75/97.5)
                nis=rep(NA,NT),                   # normalized innovation squared (wood pool)
                nis.cf=rep(NA,NT),                # S decomposition: forecast ensemble spread
-               nis.q33=rep(NA,NT),               #                  process variance (x Qmult)
+               nis.q33=rep(NA,NT),               #                  process variance
                nis.R=rep(NA,NT),                 #                  observation error
                nis.innov=rep(NA,NT))             #                  innovation (y - forecast)
 
@@ -306,7 +325,7 @@ ORJointUpdate <- function(gamInit,Y,Rparams,Q,PAR,Xic,THETA,dist,Qmult=0.5,infl=
     if (is.na(y)) {
       tsel <- (t-1)*365 + 1:365
       for (i in 1:(dist$n+1)) {
-        Q[3,3] <- Qmult / (gamFinal[i,1] / gamFinal[i,2])   # per-component process error (deflated)
+        Q[3,3] <- 1 / (gamFinal[i,1] / gamFinal[i,2])   # per-component process error
         if (!is.finite(Q[3,3]) || Q[3,3] <= 0) Q[3,3] <- 1e-6
         THETA[,9:11] <- Na[,,i]
         for (j in 1:ne) Nf[j,,i] <- VSEM(THETA[j,], PAR = PAR[tsel])[365, 2:4]
@@ -349,8 +368,8 @@ ORJointUpdate <- function(gamInit,Y,Rparams,Q,PAR,Xic,THETA,dist,Qmult=0.5,infl=
         Nf[j,,i] = VSEM(THETA[j,], PAR = PAR[tsel])[365,2:4]
       }
       
-      # compute process error (deflated by Qmult)
-      Q[3, 3] <- Qmult / (gamFinal[i, 1] / gamFinal[i, 2])
+      # compute process error
+      Q[3, 3] <- 1 / (gamFinal[i, 1] / gamFinal[i, 2])
       if (!is.finite(Q[3, 3]) || Q[3, 3] <= 0) Q[3, 3] <- 1e-6
 
       
@@ -505,8 +524,7 @@ ORJointUpdate <- function(gamInit,Y,Rparams,Q,PAR,Xic,THETA,dist,Qmult=0.5,infl=
     # analysis Gaussian N(muFinal[g,], CFinal[g,,]). Symmetrize and add a little noise to
     # the covariance (additive inflation) so the draw stays positive-definite and the
     # ensemble spread cannot collapse. Sample via SVD for robustness to near-singular cov.
-    # `infl` (function argument) is the relative noise added per pool; kept small so the
-    # forecast spread CF isn't inflated (it scales with mu^2, so it dominates S at high biomass).
+    infl <- 0.02                                   # relative noise added per pool
     for (g in 1:(dist$n+1)) {
       Cg <- (CFinal[g,,] + t(CFinal[g,,])) / 2     # symmetrize
       Cg <- Cg + diag((infl * muFinal[g,])^2 + 1e-8, 3)   # add noise for stability
@@ -544,7 +562,7 @@ ORJointUpdate <- function(gamInit,Y,Rparams,Q,PAR,Xic,THETA,dist,Qmult=0.5,infl=
     } else {
       idx   <- which(omegaA == max(omegaA, na.rm = TRUE), arr.ind = TRUE)[1, ]
       gstar <- idx[1]; istar <- idx[2]
-      q33 <- if (gstar == 1) { v <- Qmult/(gamFinal[istar,1]/gamFinal[istar,2]); if (!is.finite(v) || v <= 0) 1e-6 else v } else 0
+      q33 <- if (gstar == 1) { v <- 1/(gamFinal[istar,1]/gamFinal[istar,2]); if (!is.finite(v) || v <= 0) 1e-6 else v } else 0
       S <- CF[gstar,3,3,istar] + q33 + R
       hist$nis[t] <- if (is.finite(S) && S > 0) (y - muF[gstar,3,istar])^2 / S else NA
       ## store the S decomposition so nis.cf + nis.q33 + nis.R == S exactly
@@ -571,9 +589,7 @@ run_joint_update_sites <- function(site.idx, Rparams = Rparams.GEDI.het,
                                    useDistProduct = TRUE,
                                    Rparams.source = c("GEDI", "LandTrendr"),
                                    Rparams.model  = c("het", "con"),
-                                   Qmult = 0.5,
-                                   infl = 0.005,
-                                   outdir = "experiments/jointUpdate") {
+                                   outdir = "experiments/jointUpdateYear15") {
   Rparams.source <- match.arg(Rparams.source)
   Rparams.model  <- match.arg(Rparams.model)
   if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
@@ -583,7 +599,7 @@ run_joint_update_sites <- function(site.idx, Rparams = Rparams.GEDI.het,
     args <- make_or_args(site, useDistProduct)
     out <- ORJointUpdate(gamInit = gamInit, Y = args$Y, Rparams = Rparams,
                          Q = Q, PAR = args$PAR, Xic = ICprior,
-                         THETA = theta[1:11], dist = args$disturb.params, Qmult = Qmult, infl = infl)
+                         THETA = theta[1:11], dist = args$disturb.params)
     fname <- file.path(outdir,
                        sprintf("site_%d_distprod_%s_%s_%s.rds",
                                site, useDistProduct, Rparams.source, Rparams.model))
@@ -595,9 +611,44 @@ run_joint_update_sites <- function(site.idx, Rparams = Rparams.GEDI.het,
 ```
 
 ```{r}
+run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.GEDI.het, useDistProduct = TRUE,
+                       Rparams.source = "GEDI", Rparams.model = "het")
+```
+
+```{r}
+run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.GEDI.het, useDistProduct = TRUE,
+                       Rparams.source = "GEDI", Rparams.model = "het")
+run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.Landtrendr.het, useDistProduct = TRUE,
+                       Rparams.source = "LandTrendr", Rparams.model = "het")
+run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.GEDI.fixed, useDistProduct = TRUE,
+                       Rparams.source = "GEDI", Rparams.model = "con")
+run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.Landtrendr.fixed, useDistProduct = TRUE,
+                       Rparams.source = "LandTrendr", Rparams.model = "con")
+```
+
+
+```{r}
 ## Run + save for the site(s) of interest.
-run_joint_update_sites(site.idx = seq(61, ne, by=10), Rparams = Rparams.GEDI.het, useDistProduct = TRUE,
-                       Rparams.source = "GEDI", Rparams.model = "het", Qmult = 1)
+run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.GEDI.het, useDistProduct = FALSE,
+                       Rparams.source = "GEDI", Rparams.model = "het")
+
+run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.GEDI.fixed, useDistProduct = TRUE,
+                       Rparams.source = "GEDI", Rparams.model = "con")
+
+run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.GEDI.fixed, useDistProduct = FALSE,
+                       Rparams.source = "GEDI", Rparams.model = "con")
+
+run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.Landtrendr.fixed, useDistProduct = TRUE,
+                       Rparams.source = "LandTrendr", Rparams.model = "con")
+
+run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.Landtrendr.fixed, useDistProduct = FALSE,
+                       Rparams.source = "LandTrendr", Rparams.model = "con")
+
+run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.Landtrendr.het, useDistProduct = TRUE,
+                       Rparams.source = "LandTrendr", Rparams.model = "het")
+
+run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.Landtrendr.het, useDistProduct = FALSE,
+                       Rparams.source = "LandTrendr", Rparams.model = "het")
 ```
 
 

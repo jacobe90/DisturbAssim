@@ -549,7 +549,7 @@ RparamsLandtrendrheteroskedastic <- c(Landtrendrslope, Landtrendrintercept) # (m
 # runDA(Rparams=RparamsLandTrendrfixed, updateQ=TRUE, useDistProduct = TRUE, useAdjustment=TRUE, use_analytical_posterior=TRUE, siteIndices=fullRun, expName="Rlandtrendr_Hfalse_Dtrue") # R = (gedi, landtrendr), H = heteroskedastic = (true, false), D = disturbance product = (true, false)
 
 # experiment Rgedi_Htrue_Dtrue
-runDA(Rparams=RparamsGEDIheteroskedastic, updateQ=TRUE, useDistProduct=TRUE, useAdjustment=TRUE, use_analytical_posterior=TRUE, siteIndices=testOne, expName="Rgedi_Htrue_Dtrue") # R = (gedi, landtrendr), H = heteroskedastic = (true, false), D = disturbance product = (true, false)
+# runDA(Rparams=RparamsGEDIheteroskedastic, updateQ=TRUE, useDistProduct=TRUE, useAdjustment=TRUE, use_analytical_posterior=TRUE, siteIndices=testOne, expName="Rgedi_Htrue_Dtrue") # R = (gedi, landtrendr), H = heteroskedastic = (true, false), D = disturbance product = (true, false)
 
 # experiment Rlandtrendr_Htrue_Dtrue
 # runDA(Rparams=RparamsLandtrendrheteroskedastic, useDistProduct = TRUE, updateQ=TRUE, useAdjustment=TRUE, use_analytical_posterior=TRUE, siteIndices=fullRun, expName="Rlandtrendr_Htrue_Dtrue") # R = (gedi, landtrendr), H = heteroskedastic = (true, false), D = disturbance product = (true, false)

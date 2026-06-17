@@ -95,6 +95,7 @@ raster::plot(bio04,col=c('#ffffff','#edf8fb','#ccece6','#99d8c9','#66c2a4','#2ca
 ## estimate cover frequencies, select those of interest
 
 ```{r}
+cover = raster("conus_land_cover_ARD_tile_h03v04.tif")
 f = freq(cover)
 ## most frequent class is 42 = evergreen forest
 
@@ -150,6 +151,7 @@ Classes 100-160 are based on pixel-level labels based on the temporal signature 
 ## Estimate disturbance probability for each cover class
 
 ```{r}
+disS = stack(x = "Cmonster_disturbance_class_ARD_tile_h03v04.tif")
 dtime = 1985:2012
 #freq(dis)
 print(freq(disS))
@@ -176,6 +178,7 @@ rcl = matrix(
     ## Untriggered  
        c(1,   0, # Undisturbed
          100, 0, # Ukn Slow Disturbance
+         110, 0, # Ukn Abrupt Disturbance
          160, 0, # Recovery
          200, 0, # No Vis Change
          201, 0, # False Change
@@ -321,6 +324,10 @@ nd = length(dclass)-1
 tmat = matrix(0,10,nd) ## transition matrix
 bioBar=bioSq=pbioBar=pbioSq = tmat ## sums for biomass and proportional biomass change
 nsamp = 100
+disR = stack("disR.tif")
+covS  = stack("conus_land_cover_ARD_tile_h03v04.tif")
+bioS = stack("conus_biomass_ARD_tile_h03v04.tif")
+ctime = 1990:2017
 
 ## loop over years
 ttime = ctime[ctime<2004][-1] ## training years
