@@ -154,7 +154,7 @@ Classes 100-160 are based on pixel-level labels based on the temporal signature 
 disS = stack(x = "Cmonster_disturbance_class_ARD_tile_h03v04.tif")
 dtime = 1985:2012
 #freq(dis)
-print(freq(disS))
+# print(freq(disS))
 ```
 
 ```{r}
@@ -201,6 +201,7 @@ rcl = matrix(
          11, 10,  # 'Other '
          30, 10, # Development'      ## Development
          31, 10, # Road
+         60, 10, # Not listed
          61, 10,  # 'Water',
          62, 10,  # 'Wind',
          70, 10,  # 'Avalanche-Chute',
@@ -432,7 +433,7 @@ save(d.prior,TRANS,PBBAR,PBVAR,file="STprior.RData")
 ## select sites of interest, save
 
 ```{r}
-load("state-transition-saved.RData")
+#load("state-transition-saved.RData")
 
 ## sample disturbances for target year
 nsamp = 150

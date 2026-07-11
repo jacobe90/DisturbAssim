@@ -5,10 +5,6 @@ author: "Jacob Epstein"
 date: "5/30/26"
 ---
 
-```{r}
-# TODOs
-# - get prior parameters
-```
 
 ```{r}
 library(statmod)
@@ -23,7 +19,7 @@ load("dis.postprocessed.RData")
 dtime <- 1985:2012
 colnames(dextract) <- paste0("t",dtime)
 dextract[is.na(dextract)] <- 0
-d.prior["0"] = d.prior["0"] + d.prior[6]                         ## change at runtime (removes <NA>)
+d.prior["UN"] = d.prior["UN"] + d.prior[6]                         ## change at runtime (removes <NA>)
 d.prior = d.prior[-6]
 
 ## Load Calibration
@@ -181,10 +177,12 @@ make_or_args <- function(site, useDistProduct = TRUE) {
   ## component a share of the disturbance probability proportional to its weight,
   ## and the disturbed values to sum to 1 if they sum to greater than 1, and else
   ## set the undisturbed value to 1 - p(disturbed).
+  ## within-class mixture weights (mclust proportions; sum to 1 within each class)
+  weights <- unlist(sapply(dist.priors, function(x) x$weights))
+
   if (useDistProduct) {
     distidx.toname = list("10"="OTHER", "20"="CUT", "40"="FIRE", "50"="PEST")
     users_accuracy = c(1-d.prior[1], .77, .92, .77, .78, .78) ## 0 = none, 10 = other, 20 = cut, 30 = road, 40 = fire, 50 = biotic
-    weights <- unlist(sapply(dist.priors, function(x) x$weights))
 
     for (d in seq(names(dist.priors))) {
       d.name <- names(dist.priors)[d]
@@ -194,23 +192,24 @@ make_or_args <- function(site, useDistProduct = TRUE) {
         p.dist[is.dist, has.dist] <- users_accuracy[dextract[site, has.dist]/10 + 1]
       }
     }
+  }
 
-    ## Combine into a per-year categorical prior. Keep the within-class `weights`
-    ## (mclust mixture proportions, sum to 1 per class) so a class's probability is
-    ## split across its cluster components without over-counting. Then set the
-    ## undisturbed prior to the *remaining* mass (= 1 - product accuracy in flagged
-    ## years, = background otherwise) instead of renormalizing against the large
-    ## background undisturbed prior, so the raw disturbance-product probability is
-    ## preserved rather than diluted.
-    for (j in 1:ncol(p.dist)) {
-      p.dist[2:(n.dist+1), j] <- p.dist[2:(n.dist+1), j] * weights   # split class prob across clusters
-      dist.mass <- sum(p.dist[2:(n.dist+1), j])
-      if (dist.mass > 1) {                                           # guard: cap total disturbed mass at 1
-        p.dist[2:(n.dist+1), j] <- p.dist[2:(n.dist+1), j] / dist.mass
-        dist.mass <- 1
-      }
-      p.dist[1, j] <- 1 - dist.mass                                  # undisturbed = remaining mass
+  ## Build the per-year categorical prior for BOTH the product and no-product paths:
+  ## split each class's probability across its clusters via `weights` (so multi-cluster
+  ## classes are not over-counted), then set the undisturbed prior to the remaining mass
+  ## (= 1 - product accuracy in flagged years, = background otherwise). Applying this on
+  ## the no-product path too means an UNflagged year has the same prior with or without
+  ## the product -- the product only changes flagged years. Previously this lived inside
+  ## the useDistProduct branch, so the no-product path kept an un-split, over-counted
+  ## disturbance background that inflated probD relative to the product on unflagged sites.
+  for (j in 1:ncol(p.dist)) {
+    p.dist[2:(n.dist+1), j] <- p.dist[2:(n.dist+1), j] * weights   # split class prob across clusters
+    dist.mass <- sum(p.dist[2:(n.dist+1), j])
+    if (dist.mass > 1) {                                           # guard: cap total disturbed mass at 1
+      p.dist[2:(n.dist+1), j] <- p.dist[2:(n.dist+1), j] / dist.mass
+      dist.mass <- 1
     }
+    p.dist[1, j] <- 1 - dist.mass                                  # undisturbed = remaining mass
   }
 
   ## Bundle the disturbance prior + per-class forecast params.
@@ -243,10 +242,17 @@ KalmanUpdate <- function(m, C, H, R, y) {
   return(list(m_hat=m_hat, C_hat=C_hat, L_hat=L_hat))
 }
 
+# gauss laguerre nodes / weights
+# desired integral is \int_0^\infty f(\tau) \tau^{\alpha} e^{-\beta \tau} d\tau
+# make the substitution x = \beta \cdot \tau
+# integral with substitution is \int_0^\infty f(x / \beta) x^{\alpha} \beta^{-(\alpha+1)} e^{-x} dx
+# this integral is now in the standard form, and gets approximated with weights 
+# w_k \cdot \beta^{-(\alpha+1)} and nodes x_k / \beta
+# where the weights w_k and nodes x_k come from gauss-laguerre quadrature
 gauss_laguerre_rate <- function(n, alpha, beta) {
   gq <- gauss.quad(n, kind = "laguerre", alpha = alpha)  # weight x^alpha e^{-x}
-  list(nodes   = gq$nodes / beta,
-       weights = gq$weights / beta^(alpha + 1))
+  list(nodes   = gq$nodes / beta, # \tau = x / \beta
+       weights = gq$weights / beta^(alpha + 1)) # transform weights to tau^alpha e^{-beta \cdot tau}
 }
 
 integrate_gl <- function(f, gq) sum(gq$weights * sapply(gq$nodes, f))
@@ -589,7 +595,7 @@ run_joint_update_sites <- function(site.idx, Rparams = Rparams.GEDI.het,
                                    useDistProduct = TRUE,
                                    Rparams.source = c("GEDI", "LandTrendr"),
                                    Rparams.model  = c("het", "con"),
-                                   outdir = "experiments/jointUpdateYear15") {
+                                   outdir = "experiments/jointUpdateFinal") {
   Rparams.source <- match.arg(Rparams.source)
   Rparams.model  <- match.arg(Rparams.model)
   if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
@@ -610,41 +616,28 @@ run_joint_update_sites <- function(site.idx, Rparams = Rparams.GEDI.het,
 }
 ```
 
-```{r}
-run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.GEDI.het, useDistProduct = TRUE,
-                       Rparams.source = "GEDI", Rparams.model = "het")
-```
-
-```{r}
-run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.GEDI.het, useDistProduct = TRUE,
-                       Rparams.source = "GEDI", Rparams.model = "het")
-run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.Landtrendr.het, useDistProduct = TRUE,
-                       Rparams.source = "LandTrendr", Rparams.model = "het")
-run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.GEDI.fixed, useDistProduct = TRUE,
-                       Rparams.source = "GEDI", Rparams.model = "con")
-run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.Landtrendr.fixed, useDistProduct = TRUE,
-                       Rparams.source = "LandTrendr", Rparams.model = "con")
-```
-
 
 ```{r}
 ## Run + save for the site(s) of interest.
-run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.GEDI.het, useDistProduct = FALSE,
-                       Rparams.source = "GEDI", Rparams.model = "het")
+# run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.GEDI.het, useDistProduct = TRUE,
+#                        Rparams.source = "GEDI", Rparams.model = "het")
+# 
+# run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.GEDI.het, useDistProduct = FALSE,
+#                        Rparams.source = "GEDI", Rparams.model = "het")
+# 
+# run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.GEDI.fixed, useDistProduct = TRUE,
+#                        Rparams.source = "GEDI", Rparams.model = "con")
+# 
+# run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.GEDI.fixed, useDistProduct = FALSE,
+#                        Rparams.source = "GEDI", Rparams.model = "con")
+# 
+# run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.Landtrendr.fixed, useDistProduct = TRUE,
+#                        Rparams.source = "LandTrendr", Rparams.model = "con")
 
-run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.GEDI.fixed, useDistProduct = TRUE,
-                       Rparams.source = "GEDI", Rparams.model = "con")
+# run_joint_update_sites(site.idx = seq(504, ne, by=1), Rparams = Rparams.Landtrendr.fixed, useDistProduct = FALSE,
+#                        Rparams.source = "LandTrendr", Rparams.model = "con")
 
-run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.GEDI.fixed, useDistProduct = FALSE,
-                       Rparams.source = "GEDI", Rparams.model = "con")
-
-run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.Landtrendr.fixed, useDistProduct = TRUE,
-                       Rparams.source = "LandTrendr", Rparams.model = "con")
-
-run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.Landtrendr.fixed, useDistProduct = FALSE,
-                       Rparams.source = "LandTrendr", Rparams.model = "con")
-
-run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.Landtrendr.het, useDistProduct = TRUE,
+run_joint_update_sites(site.idx = seq(359, ne, by=1), Rparams = Rparams.Landtrendr.het, useDistProduct = TRUE,
                        Rparams.source = "LandTrendr", Rparams.model = "het")
 
 run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.Landtrendr.het, useDistProduct = FALSE,
