@@ -1,0 +1,304 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[colorlinks=true, linkcolor=blue!60!black, urlcolor=blue!60!black,
+            citecolor=blue!60!black]{hyperref}
+\usepackage{listings}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  frame=single,
+  framesep=4pt,
+  backgroundcolor=\color{gray!7},
+  xleftmargin=6pt,
+}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\bigO}{\mathcal{O}}
+
+\title{Making \texttt{ORJointUpdate} Faster:\\
+A Cost Model and Ranked Set of Speedups}
+\author{Notes on \texttt{OR\_joint\_update.Rmd}}
+\date{15 July 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+The joint disturbance/biomass filter \code{ORJointUpdate} is slow because it runs
+the VSEM forest model once per ensemble member, per mixture component, per
+Gauss--Laguerre precision node, per timestep, per site. This note builds an explicit
+cost model, identifies the single dominant term, and lists concrete speedups ranked by
+expected impact. The headline result is that the precision quadrature (a factor of
+$G\!\approx\!20$) currently multiplies the VSEM cost even though \emph{VSEM does not
+depend on the precision node} --- so most of that work is redundant and can be removed
+either exactly (parallelism, pruning, batching) or with a well-justified approximation
+(Rao--Blackwellizing the precision, sigma-point forecasting).
+\end{abstract}
+
+\section{Where the time goes: a cost model}
+\label{sec:cost}
+
+The expensive object is a single 365-day VSEM simulation. Every other operation
+(Kalman update of a $3\times3$ system, moment-matching collapse, log-sum-exp over
+$G$ nodes) is cheap by comparison. Counting VSEM calls therefore counts the cost.
+
+The forecast step \code{forecast\_split} (\code{OR\_joint\_update.Rmd:330}) contains
+the hotspot,
+\begin{lstlisting}
+for (j in 1:J) Nf[j, ] <- VSEM(THETA[j, ], PAR = PAR[tsel])[365, 2:4]
+\end{lstlisting}
+and \code{forecast\_split} is called inside three nested loops --- over timesteps
+$t=1{:}NT$, precision nodes $g=1{:}G$, and input components $c=1{:}K_{\text{in}}$
+(with $K_{\text{in}}=1$ at $t=1$ and $K_{\text{in}}=D$ afterwards). The whole
+\code{ORJointUpdate} call is itself run once per site. Hence
+
+\begin{equation}
+\label{eq:cost}
+\underbrace{N_{\text{VSEM}}}_{\text{365-day sims}}
+\;\approx\;
+N_{\text{sites}} \cdot NT \cdot G \cdot D \cdot J,
+\end{equation}
+
+where
+\begin{itemize}[nosep]
+  \item $J = \code{ne} = \code{nrow(Xic)}$ is the ensemble size per component/node;
+  \item $D = \code{dist\$n}+1 = 5$ (one undisturbed label $+$ four disturbance
+        classes: other, cut, fire, biotic);
+  \item $G = 20$ is the number of Gauss--Laguerre nodes for the precision $\tau$;
+  \item $NT \approx 33$ timesteps.
+\end{itemize}
+
+With these defaults a single site costs $\approx 33\cdot20\cdot5\cdot J = 3300\,J$
+VSEM runs, and the site loop (\code{run\_joint\_update\_sites},
+\code{OR\_joint\_update.Rmd:588}) runs them one site at a time. Every factor in
+Eq.~\eqref{eq:cost} is a lever. The rest of this note attacks them in order of payoff.
+
+\paragraph{Summary of expected gains.}
+\begin{center}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\# & Idea & Expected speedup & Kind \\
+\midrule
+1 & Rao--Blackwellize the precision (drop the per-node VSEM) & $\sim G \approx 20\times$ & approximation \\
+2 & Sigma-point / EKF forecast instead of $J$-member MC     & $\sim J/7$ (often $10\text{--}15\times$) & approximation \\
+3 & Prune negligible nodes and disturbance labels           & $2\text{--}5\times$ (data-dependent) & near-exact \\
+4 & Parallelize sites (and the $g$/$j$ loops)               & $\sim$ \#cores & exact \\
+5 & Batch/Rcpp VSEM (one call for all members)              & $2\text{--}10\times$ constant & exact \\
+6 & Micro-optimizations (preallocation, hoisting)           & $1.2\text{--}2\times$ & exact \\
+\bottomrule
+\end{tabular}
+\end{center}
+Ideas 1 and 2 are multiplicative with each other and with 3--6. Combining 1, 2 and 4
+would turn $G\cdot D\cdot J$ VSEM runs per step into $D\cdot 7$ runs spread over all
+cores --- roughly a $\bigO(10^2\text{--}10^3)$ overall reduction.
+
+\section{Idea 1 --- Rao--Blackwellize the precision quadrature}
+\label{sec:rb}
+
+\paragraph{The observation.} VSEM's output is a deterministic function of the state
+ensemble (written into \code{THETA[,9:11]}) and the driver \code{PAR[tsel]}. It does
+\emph{not} depend on the precision node $\tau_g$. In the current code $\tau_g$ enters
+only \emph{after} VSEM, as the analytically-added process error on the wood pool,
+\begin{lstlisting}
+Qg <- Q; Qg[3, 3] <- 1 / tau_g          # OR_joint_update.Rmd:334
+...
+cSig[[1]] <- Sig.ens + Qg               # OR_joint_update.Rmd:348
+\end{lstlisting}
+So of the $G\cdot D\cdot J$ VSEM runs per step, the $G$ factor is almost entirely
+redundant work: the same nonlinear pushforward is recomputed 20 times and then
+perturbed by 20 different additive $3\times3$ covariances.
+
+\paragraph{Why it is currently repeated.} The filter carries a \emph{separate
+ensemble per node}, \code{ens[,,c,g]} (\code{OR\_joint\_update.Rmd:371}), because the
+node-specific analysis posterior --- resampled at
+\code{OR\_joint\_update.Rmd:488--494} --- differs by $g$ through $Q_g$. Different
+incoming ensembles $\Rightarrow$ different VSEM inputs $\Rightarrow$ VSEM must run
+again. The precision has leaked into the Monte-Carlo state representation.
+
+\paragraph{The fix.} Move $\tau$ out of the ensemble and into the analytic covariance
+layer, i.e.\ Rao--Blackwellize (marginalize) the precision. Concretely:
+\begin{enumerate}[nosep]
+  \item Carry a \emph{single}, node-independent analysis mixture forward (per label
+        $k$, per input component $c$) --- the $\tau$-marginal posterior --- rather
+        than $G$ copies.
+  \item Run VSEM once per $(c)$ on that shared ensemble to get the pushforward mean
+        and covariance $(\hat\mu_c,\ \Sigma^{\text{ens}}_c)$.
+  \item For each node $g$, form the forecast covariance
+        $\Sigma^{\text{ens}}_c + Q_g$ \emph{analytically} (exactly what line 348 already
+        does), run the Kalman update, and accumulate the node evidence $L_t(\tau_g)$
+        and posterior weight $W_g$ as today.
+\end{enumerate}
+This turns the VSEM count from $G\cdot D\cdot J$ into $D\cdot J$ per step --- a factor
+$G\approx 20$ --- while leaving the precision quadrature, the evidence accumulation,
+and the $W_g$ log-sum-exp untouched (they operate on the shared moments).
+
+\paragraph{What is approximated.} The only $\tau$-dependence we drop is second order:
+today, last step's $Q_g$ changes each node's analysis covariance, which changes the
+resampled ensemble, which changes \emph{this} step's VSEM inputs. Because the wood-pool
+process error $1/\tau$ is small relative to the state and VSEM is smooth, the
+pushforward is nearly identical across nodes, so a shared ensemble plus per-node $Q_g$
+is an excellent approximation. It is exactly the standard Rao--Blackwellized /
+marginalized-particle construction: sample the state once, integrate the nuisance
+parameter ($\tau$) analytically. If one is cautious, keep a handful of
+\emph{representative} nodes with distinct ensembles (say the 3 highest-$W_g$) and share
+the rest --- a tunable accuracy/speed knob.
+
+\section{Idea 2 --- Replace the $J$-member forecast with a deterministic transform}
+\label{sec:sigma}
+
+Downstream, the forecast ensemble is used \emph{only} to form a mean and a $3\times3$
+covariance (\code{colMeans(Nf[su,])}, \code{var(Nf[su,])},
+\code{OR\_joint\_update.Rmd:346--347}); the members themselves are never propagated
+(they are re-drawn from the collapsed analysis Gaussian each step). So there is no
+reason to push $J\!\approx\!100$ random members through VSEM just to estimate two
+moments.
+
+\paragraph{Unscented transform.} For a 3-D state, the unscented transform uses
+$2n+1=7$ deterministic sigma points and reproduces the pushforward mean and covariance
+of a smooth map to second order. Replace the $J$-loop with 7 VSEM evaluations at the
+sigma points, then reconstruct $(\hat\mu,\Sigma^{\text{ens}})$ with the standard UT
+weights. This also \emph{removes the Monte-Carlo noise} that currently forces $J$ to be
+large enough for a stable $3\times3$ \code{var()}.
+
+\paragraph{Extended KF alternative.} Even cheaper: run VSEM once at the ensemble mean
+and take a finite-difference Jacobian $F$ (3 extra runs), giving
+$\Sigma^{\text{ens}} \approx F\,\Sigma_{\text{in}}\,F^\top$ --- about 4 evaluations.
+Slightly less accurate than UT for strong nonlinearity; VSEM's annual pool dynamics are
+mild, so either is defensible.
+
+Combined with Idea~1, the per-step VSEM count drops from $G\cdot D\cdot J \approx
+20\cdot5\cdot100 = 10^4$ to $D\cdot 7 = 35$.
+
+\paragraph{Caveat.} The disturbance labels apply the stochastic operator
+\code{disturbance.p} (\code{OR\_joint\_update.Rmd:353}) after VSEM. Its post-disturbance
+biomass draw is itself Monte-Carlo; the UT/EKF pushforward should cover the pre-disturbance
+VSEM step, with the disturbance-model moments added analytically (its mean/covariance are
+available in closed form from $\mu_0$, $V_0$) rather than by resampling. This keeps the
+disturbance branches cheap too.
+
+\section{Idea 3 --- Prune negligible mixture components}
+\label{sec:prune}
+
+The mixture has $D\cdot G = 100$ components per node-set, but their weights are very
+uneven, and forecasting a component whose weight is $\sim\!10^{-6}$ is wasted VSEM time.
+The code already skips empty inputs (\code{if (bar.w[c, g] <= 0) next},
+\code{OR\_joint\_update.Rmd:427}); extend this to an $\varepsilon$-threshold on the
+effective weight.
+
+\begin{itemize}[nosep]
+  \item \textbf{Precision nodes.} After a few timesteps the node posterior $W_g$
+        concentrates on a few $\tau$ values. Skip forecasting for nodes with
+        $W_g < \varepsilon_W$ (they contribute negligibly to the final $\Pi_D$ and to
+        $W_g\,\alpha^{c,k,g}$ at \code{OR\_joint\_update.Rmd:516}). Re-evaluate the
+        active set each step so a node can re-enter if evidence shifts.
+  \item \textbf{Disturbance labels.} The incoming weight of a disturbance branch is
+        $\code{bar.w[c,g]}\cdot\beta_k$ with $\beta_k = p_t/\code{dist\$n}$
+        (\code{OR\_joint\_update.Rmd:392}). In years with a tiny disturbance prior
+        $p_t$, all four disturbance branches carry almost no mass; skip their VSEM +
+        Kalman work when $\code{bar.w[c,g]}\cdot\beta_k < \varepsilon_\beta$.
+  \item \textbf{Component merging.} Near-duplicate components across $c$ can be merged
+        (moment-matched) \emph{before} the forecast, not just after, keeping
+        $K_{\text{in}}$ small.
+\end{itemize}
+This is near-exact: with a conservative $\varepsilon$ the dropped mass is provably
+below the threshold. \textbf{Log what was pruned each step} so a silent truncation never
+masquerades as full coverage.
+
+\section{Idea 4 --- Parallelize}
+\label{sec:parallel}
+
+Nothing in the cost model requires serial execution across the independent axes.
+\begin{itemize}[nosep]
+  \item \textbf{Sites} (\code{run\_joint\_update\_sites}, \code{OR\_joint\_update.Rmd:588})
+        are embarrassingly parallel and each writes its own \code{.rds}. Swap the
+        \code{for (site in site.idx)} loop for \code{parallel::mclapply} /
+        \code{future.apply::future\_lapply}. This is the safest, largest win for batch
+        runs and composes with everything else --- near-linear in cores.
+  \item \textbf{The $g$-loop} (\code{OR\_joint\_update.Rmd:417}) is independent across
+        nodes (evidence is combined only afterward), and \textbf{the $j$ VSEM loop}
+        (\code{OR\_joint\_update.Rmd:333}) is independent across members. Either can be
+        an \code{mclapply}. If Idea~1 is adopted the $g$-loop is no longer the VSEM
+        bottleneck, so prefer parallelizing sites and/or the VSEM member evaluations.
+\end{itemize}
+Watch RNG: use \code{parallel}'s L'Ecuyer streams (\code{RNGkind("L'Ecuyer-CMRG")}) so
+parallel runs are reproducible.
+
+\section{Idea 5 --- Make VSEM itself cheaper}
+\label{sec:vsem}
+
+\code{BayesianTools::VSEM} is an R-level wrapper with per-call overhead, invoked $J$
+times in a tight loop.
+\begin{itemize}[nosep]
+  \item \textbf{Batch the call.} VSEM's dynamics are a simple daily update; a vectorized
+        or Rcpp reimplementation that accepts a \emph{matrix} of parameter sets and
+        returns all members from one call eliminates both the per-call wrapper overhead
+        and the R-level \code{for (j in 1:J)} loop. This is a constant-factor win
+        ($2\text{--}10\times$) that stacks on the structural ideas. (Largely moot if
+        Idea~2 shrinks $J$ to $\sim 7$, but still helps the sigma-point evaluations.)
+  \item \textbf{Avoid redundant re-slicing.} \code{PAR[tsel]} and the
+        \code{tsel <- (t-1)*365 + 1:365} index can be precomputed once per $t$; minor,
+        but free.
+\end{itemize}
+
+\section{Idea 6 --- Micro-optimizations (exact, low-risk)}
+\label{sec:micro}
+
+\begin{itemize}[nosep]
+  \item \textbf{Preallocate the accumulators.} \code{allk.*}, \code{allf.*},
+        \code{up.*}, \code{fc.acc.*} grow with \code{c(...)} inside the loops
+        (\code{OR\_joint\_update.Rmd:432--469}). Repeated \code{c()} reallocates and
+        copies --- $\bigO(n^2)$ over a step. Preallocate fixed-size lists (length
+        $D\cdot G\cdot K_{\text{in}}$) and fill by index.
+  \item \textbf{Hoist invariants.} When $R$ is constant, precompute $R^{-1}$ and the
+        $H$-projected quantities in \code{KalmanUpdate} (\code{OR\_joint\_update.Rmd:235})
+        outside the loops instead of re-forming them per component.
+  \item \textbf{Cheaper categorical draw.} Replace
+        \code{apply(rmultinom(J,1,p),2,which.max)} (\code{OR\_joint\_update.Rmd:336})
+        with a single \code{sample(0:dist\$n, J, replace=TRUE, prob=...)}.
+  \item \textbf{Symmetrize once.} The \code{(Ck+t(Ck))/2 + diag(1e-6,3)} guard
+        (\code{OR\_joint\_update.Rmd:491}) is fine; just avoid the \code{method="svd"}
+        \code{rmvnorm} cost once $J$ is small (Idea~2).
+\end{itemize}
+
+\section{Recommended plan}
+\label{sec:plan}
+
+Order the work by payoff-to-risk:
+\begin{enumerate}[nosep]
+  \item \textbf{Parallelize sites (Idea~4).} Immediate, exact, near-linear; no change to
+        results. Do this first for batch runs.
+  \item \textbf{Prune nodes and labels (Idea~3).} Near-exact, easy, and $2\text{--}5\times$;
+        log the dropped mass.
+  \item \textbf{Rao--Blackwellize the precision (Idea~1).} The structural $\sim\!20\times$.
+        Validate against the current filter on a few sites (compare $\Pi_D$, \code{probD},
+        NIS calibration) before trusting it broadly.
+  \item \textbf{Sigma-point forecast (Idea~2).} Another $\sim\!10\times$ and removes MC
+        noise; validate the same way.
+  \item \textbf{Batch/Rcpp VSEM and micro-opts (Ideas~5--6).} Constant-factor polish once
+        the structure is settled.
+\end{enumerate}
+
+\paragraph{Validation.} Ideas 1, 2 and 3 change the numbers (1--2 are approximations,
+3 drops sub-$\varepsilon$ mass), so before adopting them, run the current and the fast
+version on the same handful of sites and check that (i) the posterior disturbance
+probability \code{probD} and the overall analysis mean/CI agree within Monte-Carlo error,
+and (ii) the NIS calibration (the $\chi^2_T/T$ band derived in
+\code{claude-nis-6.13.26.tex}) is unchanged. Ideas 4, 5 and the micro-optimizations are
+exact and need only a regression check that outputs are bit-for-bit (or RNG-stream)
+identical.
+
+\paragraph{Note on saved runs.} The existing \code{.rds} outputs in
+\code{experiments/jointUpdateNewTest} predate the recent algorithm fixes (the
+\code{bar.*} carry-forward, the full-mixture $\Pi_D$/NIS, and the analytic $q_{33}$).
+Any speed refactor should regenerate them, and that regeneration is the natural moment
+to fold in Ideas 1--4.
+
+\end{document}

@@ -1,0 +1,511 @@
+\documentclass{article}
+\usepackage[utf8]{inputenc}
+\usepackage[english]{babel}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\usepackage{mathtools}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Norm}{\mathcal{N}}
+\newcommand{\Dt}{\mathcal{D}_t}
+\newcommand{\chmu}{\check{\mu}}
+\newcommand{\chSig}{\check{\Sigma}}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  columns=fullflexible,
+  showstringspaces=false,
+  language=R,
+  commentstyle=\color{gray},
+}
+
+\title{Normalized Innovation Squared (NIS) in \texttt{OR\_joint\_update.Rmd}}
+\author{Claude}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Purpose}
+
+The Normalized Innovation Squared (NIS) is a \emph{filter-consistency} diagnostic. At
+each assimilation step the filter produces a one-step-ahead \emph{forecast predictive}
+distribution for the observation; NIS measures how far the actual observation falls in
+the tail of that predictive, scaled by the predictive's own spread. A well-calibrated
+filter produces innovations whose squared, covariance-normalized magnitude is $O(1)$;
+systematic departures reveal an over- or under-dispersed filter (or a biased forecast).
+
+This note documents exactly how NIS is computed in \texttt{ORJointUpdate}
+(\texttt{OR\_joint\_update.Rmd}), where the forecast predictive is a Gauss--Laguerre
+quadrature mixture over the process precision $\tau$.
+
+\section{Notation and the observation model}
+
+The state is $x_t \in \R^3$ (foliage, soil, wood/AGB pools). Only the wood pool is
+observed, through
+\[
+  y_t \mid x_t \sim \Norm(H x_t,\, R_t), \qquad H = (0,\ 0,\ 1),
+\]
+so $H x_t = (x_t)_3$ picks out the wood pool. The observation error is
+\emph{heteroskedastic},
+\[
+  R_t = m_R\, y_t + b_R,
+\]
+implemented as \lstinline{R <- y * Rparams[1] + Rparams[2]} (\lstinline{Rparams} $=
+(m_R, b_R)$). On timesteps with no observation ($y_t = \texttt{NA}$) NIS is left as
+\texttt{NA}.
+
+\section{The forecast predictive in this filter}
+
+Conditional on the precision node $\tau_g$ (a Gauss--Laguerre node for the
+$\mathrm{Gamma}(a,b)$ prior on $\tau$), the filter carries, for each mixture label
+$k \in \{1,\dots,D\}$ (label $1 =$ undisturbed, $2,\dots,D =$ disturbance classes), a
+Gaussian \emph{forecast} component in state space,
+\[
+  \Norm\!\big(x_t;\ \chmu_t^{\,k,g},\ \chSig_t^{\,k,g}\big),
+  \qquad \text{with forecast weight } \varpi_t^{\,k,g}.
+\]
+These are obtained by pushing each ensemble through VSEM, splitting members into the
+undisturbed group (with process error $Q(\tau_g)=\mathrm{diag}(q_l,q_s,\tau_g^{-1})$
+added) and the disturbance groups (disturbance model applied), and taking sample moments.
+In code these are \lstinline{fc.mu[k,,g]}, \lstinline{fc.Sig[k,,,g]}, and
+\lstinline{fc.w[k,g]}; the forecast weight is
+\[
+  \varpi_t^{\,k,g} \;=\; \sum_{c} \bar\omega^{\,c,g}_{t-1}\, \beta_k,
+  \qquad \beta_k = \big(\texttt{dist\$p}\big)_{k,t},
+\]
+i.e.\ the previous components' weights times the per-label prior probability $\beta_k$
+(a moment-matched collapse over the input components $c$, matching the algorithm's
+$\Pi_K$ operator).
+
+\paragraph{Process error is folded into $\chSig$.}
+Because $Q(\tau_g)$ is added to the ensemble members \emph{before} the sample covariance
+is taken, $\chSig_t^{\,k,g}$ for the undisturbed label already contains the wood-pool
+process variance $\tau_g^{-1}$. There is no separate additive $Q$ term at the NIS stage.
+
+\section{Collapsing to a single predictive Gaussian}
+
+NIS is evaluated against \emph{one} Gaussian predictive, chosen as the
+\textbf{posterior-dominant label}
+\[
+  k^\star \;=\; \arg\max_{k}\ \eta_t^{k},
+\]
+where $\eta_t^{k}$ is the final (post-update, cross-node) posterior weight of label $k$
+(\lstinline{gs <- which.max(eta)} in code). The forecast components of that label are
+then collapsed across the quadrature nodes $g$ by moment matching, weighting each node by
+its posterior mass $W_g^{(t)}$ times the forecast weight:
+\[
+  \pi_g \;\propto\; W_g^{(t)}\,\varpi_t^{\,k^\star,g}, \qquad g = 1,\dots,G .
+\]
+The moment-match operator $\Pi$ (function \lstinline{mm}) maps a weighted Gaussian set
+$\{(\pi_g, \mu_g, \Sigma_g)\}$ to a single Gaussian $\Norm(\bar\mu,\bar\Sigma)$ with
+\[
+  \bar\mu = \sum_g \tilde\pi_g\, \mu_g,
+  \qquad
+  \bar\Sigma = \sum_g \tilde\pi_g\Big[\Sigma_g + (\mu_g-\bar\mu)(\mu_g-\bar\mu)^\top\Big],
+  \qquad \tilde\pi_g = \frac{\pi_g}{\sum_h \pi_h}.
+\]
+Applying $\Pi$ to the dominant label's forecast components yields the collapsed forecast
+predictive mean and covariance $(\hat\mu_t,\ \hat\Sigma_t)$ (\lstinline{fck$mu},
+\lstinline{fck$Sigma}).
+
+\section{The NIS formula as implemented}
+
+With the collapsed forecast $(\hat\mu_t,\hat\Sigma_t)$, define the innovation and its
+covariance,
+\[
+  z_t \;=\; y_t - H\hat\mu_t \;=\; y_t - (\hat\mu_t)_3,
+  \qquad
+  S_t \;=\; H\hat\Sigma_t H^\top + R_t \;=\; (\hat\Sigma_t)_{33} + R_t,
+\]
+and the (scalar) normalized innovation squared,
+\[
+  \boxed{\ \mathrm{NIS}_t \;=\; z_t^\top S_t^{-1} z_t \;=\; \dfrac{\big(y_t - (\hat\mu_t)_3\big)^2}{(\hat\Sigma_t)_{33} + R_t}\ }
+\]
+Because the wood pool is the only observation, $H\hat\Sigma_t H^\top = (\hat\Sigma_t)_{33}$
+is a scalar and $S_t^{-1}$ is just a reciprocal.
+
+The corresponding code block (guarded by \lstinline{is.finite(S) && S > 0}):
+\begin{lstlisting}
+S <- fck$Sigma[3, 3] + R
+hist$nis[t]     <- (y - fck$mu[3])^2 / S
+hist$nis.cf[t]  <- fck$Sigma[3, 3]   # forecast spread (incl. process error)
+hist$nis.q33[t] <- 0                 # process error folded into nis.cf
+hist$nis.R[t]   <- R
+hist$nis.innov[t] <- y - fck$mu[3]
+\end{lstlisting}
+
+\paragraph{Stored decomposition.} The denominator $S_t$ is recorded in additive parts so
+its composition can be inspected downstream:
+\[
+  S_t \;=\; \underbrace{(\hat\Sigma_t)_{33}}_{\texttt{nis.cf}}
+        \;+\; \underbrace{0}_{\texttt{nis.q33}}
+        \;+\; \underbrace{R_t}_{\texttt{nis.R}},
+  \qquad z_t = \texttt{nis.innov}.
+\]
+Here \texttt{nis.q33} is $0$ by convention because, as noted above, the process variance
+$\tau_g^{-1}$ is already inside the forecast spread \texttt{nis.cf}; the split is kept only
+so the field layout matches earlier versions of the code.
+
+\section{Aggregation and calibration reference}
+
+The per-step values are averaged over the observed timesteps (in
+\texttt{OR\_joint\_update\_analysis.Rmd}),
+\[
+  \overline{\mathrm{NIS}} \;=\; \frac{1}{T}\sum_{t=1}^{T} \mathrm{NIS}_t .
+\]
+Under a correctly specified filter the innovation is $z_t \sim \Norm(0, S_t)$, so each
+$\mathrm{NIS}_t \sim \chi^2_{1}$ (one scalar observation) and, treating steps as
+independent, $T\,\overline{\mathrm{NIS}} \sim \chi^2_{T}$. The calibration check therefore
+asks whether $\overline{\mathrm{NIS}}$ lies in
+\[
+  \Big[\ \tfrac{1}{T}\,\chi^2_{T,\,0.025},\ \ \tfrac{1}{T}\,\chi^2_{T,\,0.975}\ \Big],
+\]
+a band centered near $1$. Values persistently below the band indicate an
+\emph{over-dispersed} filter ($S_t$ too large relative to the innovations); values above
+indicate \emph{under-dispersion} or a biased forecast (a squared bias enters the numerator
+but not the variance $S_t$).
+
+The three distributional claims used here --- $z_t \sim \Norm(0, S_t)$,
+$\mathrm{NIS}_t \sim \chi^2_1$, and $T\,\overline{\mathrm{NIS}} \sim \chi^2_T$ --- are
+derived in Appendix~\ref{app:derivations}.
+
+\section{Why the forecast, not the analysis}
+\label{sec:fc-not-analysis}
+
+NIS is deliberately built from the \emph{forecast} (prior/predictive) mean and covariance,
+never the \emph{analysis} (posterior) ones. This is not incidental --- it is what makes NIS
+a valid consistency test.
+
+\paragraph{The innovation is a forecast quantity by definition.}
+The innovation is the one-step-ahead prediction error,
+\[
+  z_t \;=\; y_t - \E[\,y_t \mid \Dt[t-1]\,] \;=\; y_t - H\hat\mu_t,
+\]
+where $\hat\mu_t$ is the \emph{forecast} mean, conditioned only on past data
+$\mathcal{D}_{t-1}=(p_{1:t-1}, y_{1:t-1})$ and \textbf{not} on $y_t$. Its covariance is the
+predictive covariance of the observation,
+\[
+  S_t \;=\; \mathrm{Cov}(y_t \mid \mathcal{D}_{t-1}) \;=\; H\hat\Sigma_t H^\top + R_t,
+\]
+and $\mathrm{NIS}_t = z_t^\top S_t^{-1} z_t$ tests the calibration of the one-step
+predictive $p(y_t \mid \mathcal{D}_{t-1})$.
+
+\paragraph{The consistency theorem requires it.}
+For a correctly specified linear--Gaussian filter, the innovation sequence
+$\{z_t\}$ is zero-mean, \emph{white} (temporally uncorrelated), and Gaussian with
+covariance $S_t$~\cite{kalman1960,barshalom2001}. Hence $z_t \sim \Norm(0, S_t)$ and
+$\mathrm{NIS}_t \sim \chi^2_{n_y}$. Checking the normalized innovation against a $\chi^2$
+reference is precisely the standard NIS / NEES filter-consistency test
+\cite[Ch.~5]{barshalom2001}; innovation-whiteness diagnostics of this kind originate with
+\cite{mehra1970}. The theorem is a statement about the \emph{innovations}; there is no
+analogous $\chi^2$ result for posterior residuals.
+
+\paragraph{The analysis residual is circular and mis-scaled.}
+The analysis (posterior) mean has already been pulled toward the observation,
+\[
+  \hat\mu^{\,a}_t \;=\; \hat\mu_t + K_t z_t, \qquad K_t = \hat\Sigma_t H^\top S_t^{-1},
+\]
+so the analysis residual is a \emph{shrunken} copy of the innovation,
+\[
+  r_t \;=\; y_t - H\hat\mu^{\,a}_t \;=\; (I - H K_t)\,z_t \;=\; R_t S_t^{-1} z_t .
+\]
+Two problems follow.
+\begin{enumerate}
+  \item \textbf{Circularity (in-sample fit).} $r_t$ measures how well the analysis fits the
+  very observation it was just updated with. It is small \emph{by construction} and shrinks
+  further as the filter trusts the data more; it says nothing about whether the predictive
+  distribution was calibrated. Only the forecast is genuinely out-of-sample --- $y_t$ was
+  not used to form $\hat\mu_t$ --- so only $z_t$ is a real predictive check.
+  \item \textbf{Wrong normalization.} The analysis residual does not have covariance $S_t$:
+  \[
+    \mathrm{Cov}(r_t) \;=\; R_t S_t^{-1} R_t \;\ne\; S_t,
+    \qquad\text{(scalar case: } \mathrm{Var}(r_t)=R_t^2/S_t < R_t \le S_t).
+  \]
+  Forming $r_t^\top S_t^{-1} r_t$ would therefore be systematically too small and would read
+  below the $\chi^2$ band regardless of calibration. (Conversely, normalizing $r_t$ by its
+  \emph{own} covariance $R_t S_t^{-1} R_t$ recovers $z_t^\top S_t^{-1} z_t$ exactly --- the
+  only informative content is, once again, the innovation.)
+\end{enumerate}
+Using the analysis would thus mask exactly the over-/under-dispersion that NIS is meant to
+detect: the update always drags the analysis toward $y_t$, so an analysis-based statistic
+looks well-calibrated even when the forecast is badly wrong.
+
+\paragraph{Data-assimilation terminology.}
+The innovation is the observation-minus-background (OMB, or ``background departure''); the
+analysis residual is observation-minus-analysis (OMA). Both are used \emph{together} in
+observation-space error diagnostics to separately estimate observation-, background-, and
+analysis-error statistics~\cite{desroziers2005}, but the $\chi^2$ calibration of the
+predictive uses OMB. The same principle governs ensemble-filter consistency checks (rank
+histograms; verifying the observation against the \emph{prior} ensemble spread, never the
+posterior)~\cite{anderson2001}. General treatments of innovation-based consistency appear in
+standard filtering texts~\cite{sarkka2013}.
+
+\paragraph{In this implementation.}
+The $(\hat\mu_t, \hat\Sigma_t)$ used above are the collapsed \emph{forecast} predictive of
+the dominant label (\lstinline{fc.mu}, \lstinline{fc.Sig}, collapsed into \lstinline{fck}),
+taken \emph{before} the Kalman step. The analysis quantities (\lstinline{eta},
+\lstinline{mu.k}, \lstinline{Sig.k} in the code) are intentionally \emph{not} used for NIS;
+they drive the state estimate and CI reporting instead.
+
+\section{Design choices and caveats}
+
+\begin{itemize}
+  \item \textbf{Single dominant component.} NIS is computed against the collapsed
+  predictive of the single posterior-dominant label $k^\star$, not the full
+  $D\times G$ mixture. This makes NIS interpretable as a standard scalar innovation, but
+  it discards the between-component spread of the mixture; if a non-dominant label carries
+  substantial mass, $S_t$ understates the true predictive variance.
+
+  \item \textbf{Forecast, not analysis.} NIS uses the \emph{forecast} (pre-Kalman)
+  predictive $(\hat\mu_t,\hat\Sigma_t)$, not the analysis; see
+  Section~\ref{sec:fc-not-analysis} for why the innovation --- and not the analysis
+  residual --- is the correct consistency statistic.
+
+  \item \textbf{Quadrature over $\tau$.} The collapse across nodes weights each $\tau_g$
+  by its current posterior mass $W_g^{(t)}$, so the reported predictive variance reflects
+  the filter's uncertainty about the process precision as well as the state.
+
+  \item \textbf{Scalar observation.} With $H=(0,0,1)$ the reference distribution has one
+  degree of freedom per step; the $\chi^2_T$ aggregation assumes (approximately)
+  independent innovations across time.
+\end{itemize}
+
+\appendix
+\section{Derivations for Section~6}
+\label{app:derivations}
+
+\paragraph{Assumptions.} We use the standard linear--Gaussian consistency assumptions,
+which the collapsed single-Gaussian predictive of Sections~4--5 is taken to satisfy:
+\begin{itemize}
+  \item[(A1)] The one-step forecast predictive of the state is Gaussian,
+  $x_t \mid \mathcal{D}_{t-1} \sim \Norm(\hat\mu_t, \hat\Sigma_t)$, with $\hat\Sigma_t \succ 0$.
+  (In the mixture filter this is the single-Gaussian moment match of the exact forecast
+  mixture derived in Appendix~\ref{app:forecast-mixture}; it is exact in the purely
+  linear--Gaussian, single-component case.)
+  \item[(A2)] The observation is linear--Gaussian, $y_t = H x_t + v_t$ with
+  $v_t \sim \Norm(0, R_t)$, and $v_t$ independent of $x_t$ given $\mathcal{D}_{t-1}$.
+  \item[(A3)] The filter is correctly specified, so $\hat\mu_t,\hat\Sigma_t$ are the true
+  conditional moments (needed for the whiteness step in Claim~3).
+\end{itemize}
+
+\paragraph{Claim 1: $z_t \mid \mathcal{D}_{t-1} \sim \Norm(0, S_t)$ with
+$S_t = H\hat\Sigma_t H^\top + R_t$.}
+Substituting (A2) into the definition $z_t = y_t - H\hat\mu_t$,
+\[
+  z_t = (H x_t + v_t) - H\hat\mu_t = H(x_t - \hat\mu_t) + v_t .
+\]
+Condition on $\mathcal{D}_{t-1}$. By (A1), $x_t - \hat\mu_t \sim \Norm(0,\hat\Sigma_t)$;
+by (A2), $v_t \sim \Norm(0,R_t)$ independent of $x_t$. Thus $z_t$ is an affine function of
+independent Gaussian vectors and is itself Gaussian, with
+\[
+  \E[z_t \mid \mathcal{D}_{t-1}] = H\cdot 0 + 0 = 0,
+\]
+\[
+  \mathrm{Cov}(z_t \mid \mathcal{D}_{t-1})
+  = H\,\mathrm{Cov}(x_t\mid\mathcal{D}_{t-1})\,H^\top + \mathrm{Cov}(v_t)
+  = H\hat\Sigma_t H^\top + R_t = S_t,
+\]
+where the cross term vanishes by independence of $x_t$ and $v_t$. Hence
+$z_t \mid \mathcal{D}_{t-1} \sim \Norm(0, S_t)$. \hfill$\square$
+
+\paragraph{Claim 2: $\mathrm{NIS}_t = z_t^\top S_t^{-1} z_t \sim \chi^2_{n_y}$, i.e.
+$\chi^2_1$ here.}
+This is the Mahalanobis-norm fact for a centered Gaussian. Since $S_t \succ 0$ it has a
+symmetric positive-definite square root $S_t^{1/2}$; define the whitened vector
+$w_t = S_t^{-1/2} z_t$. By Claim~1 and the affine-transformation rule for Gaussians,
+\[
+  w_t \sim \Norm\!\big(0,\ S_t^{-1/2} S_t\, S_t^{-1/2}\big) = \Norm(0, I_{n_y}),
+\]
+so its components $w_{t,1},\dots,w_{t,n_y}$ are i.i.d.\ $\Norm(0,1)$. Then
+\[
+  \mathrm{NIS}_t = z_t^\top S_t^{-1} z_t
+  = z_t^\top S_t^{-1/2} S_t^{-1/2} z_t = w_t^\top w_t = \sum_{i=1}^{n_y} w_{t,i}^2
+  \;\sim\; \chi^2_{n_y}
+\]
+by the definition of the chi-square distribution (a sum of $n_y$ squared independent
+standard normals). Here only the wood pool is observed, $H=(0,0,1)$, so $n_y=1$ and
+$\mathrm{NIS}_t = z_t^2/S_t \sim \chi^2_1$. \hfill$\square$
+
+\paragraph{Claim 3: $T\,\overline{\mathrm{NIS}} = \sum_{t=1}^T \mathrm{NIS}_t \sim \chi^2_T$.}
+First a whiteness lemma: \emph{under (A1)--(A3) the innovations are independent across time.}
+For $s < t$, $z_s$ is a function of $y_{1:s}$ and hence
+$\mathcal{D}_{t-1}$-measurable, while $\E[z_t \mid \mathcal{D}_{t-1}] = 0$ (Claim~1).
+Therefore, by the tower property,
+\[
+  \E[z_t z_s^\top]
+  = \E\!\big[\,\E[z_t z_s^\top \mid \mathcal{D}_{t-1}]\,\big]
+  = \E\!\big[\,\E[z_t \mid \mathcal{D}_{t-1}]\, z_s^\top\,\big]
+  = \E[\,0\cdot z_s^\top\,] = 0,
+\]
+so the innovations are uncorrelated. The stacked vector $(z_1,\dots,z_T)$ is jointly
+Gaussian (each $z_t$ is affine in the jointly Gaussian states and noises), and for jointly
+Gaussian variables uncorrelated implies independent; hence $\{z_t\}$ are mutually
+independent. Consequently the whitened $w_t = S_t^{-1/2} z_t$ are independent
+$\Norm(0, I_{n_y})$, and the pooled collection $\{w_{t,i} : 1\le t\le T,\ 1\le i\le n_y\}$
+consists of $T n_y$ i.i.d.\ $\Norm(0,1)$ variables. Since $T\,\overline{\mathrm{NIS}} = \sum_t
+\mathrm{NIS}_t = \sum_t w_t^\top w_t = \sum_{t,i} w_{t,i}^2$ is their total sum of squares,
+\[
+  T\,\overline{\mathrm{NIS}} \;\sim\; \chi^2_{T n_y}
+  \;\xrightarrow{\ n_y = 1\ }\; \chi^2_T .
+\]
+Equivalently, this is the additivity of the chi-square law: a sum of $T$ independent
+$\chi^2_1$ variables (the individual $\mathrm{NIS}_t$) is $\chi^2_T$. It follows that
+$\E[\,\overline{\mathrm{NIS}}\,] = T/T = 1$, which is why a well-calibrated filter has mean
+NIS near $1$, and that the $95\%$ band is $[\,\chi^2_{T,0.025}/T,\ \chi^2_{T,0.975}/T\,]$.
+\hfill$\square$
+
+\paragraph{Caveats (why these hold only approximately here).}
+Three features of the implementation make the results ``$\approx$'' rather than exact.
+(i)~The true forecast predictive is a $G\times K\times D$ mixture, not a single Gaussian;
+(A1) uses its dominant-label collapse, so Claim~1's covariance ignores the between-component
+spread. (ii)~The heteroskedastic $R_t = m_R y_t + b_R$ depends on the realized $y_t$ rather
+than on a $\mathcal{D}_{t-1}$-measurable quantity, so $S_t$ is mildly data-dependent.
+(iii)~Whiteness (Claim~3) requires the correctly specified optimal filter (A3); model error
+or the mixture approximation induces weak serial correlation, so $\chi^2_T$ is an
+approximation and the interval is a reference rather than an exact test.
+
+\section{The exact forecast predictive $p(x_t \mid \mathcal{D}_{t-1})$}
+\label{app:forecast-mixture}
+
+Assumption (A1) approximates the one-step state predictive by a single Gaussian. Here we
+derive the exact object it collapses --- a mixture of (non-Gaussian) pushforward densities,
+approximated in turn by a Gaussian mixture via the ensemble. Write
+$\mathcal{D}_{t-1}=(p_{1:t-1}, y_{1:t-1})$ and take the disturbance prior $p_t$ as given.
+
+\paragraph{Posterior at $t-1$.} The filter represents the joint state/precision posterior at
+$t-1$ as a quadrature-weighted mixture over the $G$ Gauss--Laguerre precision nodes
+$\{\tau_g\}$ and, conditional on each node, a $K$-component Gaussian mixture of the state:
+\[
+  p(x_{t-1}, \tau \mid \mathcal{D}_{t-1})
+  \;\approx\;
+  \sum_{g=1}^{G} W^{(t-1)}_g\, \delta(\tau - \tau_g)
+  \sum_{c=1}^{K} \bar\omega^{\,c,g}_{t-1}\,
+  \Norm\!\big(x_{t-1};\, \bar\mu^{\,c,g}_{t-1},\, \bar\Sigma^{\,c,g}_{t-1}\big),
+\]
+with $\sum_g W^{(t-1)}_g = 1$ and $\sum_c \bar\omega^{\,c,g}_{t-1} = 1$ for every $g$ (in code
+\lstinline{W}, \lstinline{bar.w}, \lstinline{bar.mu}, \lstinline{bar.Sig}).
+
+\paragraph{Transition.} Conditional on $x_{t-1}$ and $\tau$, the generative model makes the
+next state a label mixture,
+\[
+  p(x_t \mid x_{t-1}, \tau) = \sum_{k=1}^{D} \beta_k\, f_k(x_t \mid x_{t-1}, \tau),
+\]
+\[
+  f_1 = \Norm\!\big(x_t;\, m_{1,t}(x_{t-1}),\, C_{1,t}(x_{t-1}) + Q(\tau)\big),
+  \qquad
+  f_k = \Norm\!\big(x_t;\, m_{k,t}(x_{t-1}),\, C_{k,t}(x_{t-1})\big)\ (k \ge 2),
+\]
+where $\beta_1 = 1-p_t$ (undisturbed), $\beta_k = p_t\,\pi_k$ ($k\ge2$; here
+$\pi_k = 1/(D-1)$, the uniform forecast type-mixing), $Q(\tau)=\mathrm{diag}(q_l,q_s,\tau^{-1})$,
+and $m_{k,t}(\cdot), C_{k,t}(\cdot)$ are the \emph{nonlinear} VSEM-plus-disturbance forecast
+mean and covariance given $x_{t-1}$.
+
+\paragraph{One-step prediction (Chapman--Kolmogorov).} Marginalizing $x_{t-1}$ and $\tau$,
+\begin{align*}
+  p(x_t \mid \mathcal{D}_{t-1}, p_t)
+  &= \int\!\!\int p(x_t \mid x_{t-1}, \tau)\, p(x_{t-1}, \tau \mid \mathcal{D}_{t-1})\, dx_{t-1}\, d\tau \\
+  &= \sum_{g=1}^{G} \sum_{c=1}^{K} \sum_{k=1}^{D}
+     W^{(t-1)}_g\, \bar\omega^{\,c,g}_{t-1}\, \beta_k \,
+     \underbrace{\int f_k(x_t \mid x_{t-1}, \tau_g)\,
+       \Norm\!\big(x_{t-1};\, \bar\mu^{\,c,g}_{t-1},\, \bar\Sigma^{\,c,g}_{t-1}\big)\, dx_{t-1}}_{=:\ q^{\,c,g,k}_t(x_t)} .
+\end{align*}
+The $\tau$-integral collapses onto the nodes (the $\delta$'s), and the three sums come from
+the transition label mixture ($k$), the carried state mixture ($c$), and the precision grid
+($g$).
+
+\paragraph{Exact predictive = mixture.} Hence
+\[
+  \boxed{\;
+  p(x_t \mid \mathcal{D}_{t-1}, p_t)
+  = \sum_{g,c,k} \tilde\omega^{\,c,g,k}_t\, q^{\,c,g,k}_t(x_t),
+  \qquad
+  \tilde\omega^{\,c,g,k}_t = W^{(t-1)}_g\, \bar\omega^{\,c,g}_{t-1}\, \beta_k \;}
+\]
+a mixture of $G\cdot K\cdot D$ components whose weights sum to one, since
+$\big(\sum_g W_g\big)\big(\sum_c \bar\omega^{c,g}\big)\big(\sum_k \beta_k\big) = 1$. Each
+component $q^{c,g,k}_t$ is the pushforward of the Gaussian prior on $x_{t-1}$ through the
+transition $f_k$; because $m_{k,t}(\cdot), C_{k,t}(\cdot)$ are nonlinear, $q^{c,g,k}_t$ is in
+general \emph{not} Gaussian, so the exact predictive is a mixture of non-Gaussian densities.
+
+\paragraph{Ensemble (Gaussian-mixture) approximation.} Each pushforward is moment-matched to a
+Gaussian, $q^{c,g,k}_t(x_t) \approx \Norm(x_t;\, \check\mu^{c,g,k}_t,\, \check\Sigma^{c,g,k}_t)$,
+with, by the laws of total expectation and total variance,
+\[
+  \check\mu^{c,g,k}_t = \E\!\big[m_{k,t}(x_{t-1})\big],
+  \qquad
+  \check\Sigma^{c,g,k}_t = \E\!\big[C_{k,t}(x_{t-1})\big] + \mathrm{Cov}\!\big[m_{k,t}(x_{t-1})\big]
+  \;\big(+\, Q(\tau_g)\ \text{if } k=1\big),
+\]
+expectations over $x_{t-1}\sim\Norm(\bar\mu^{c,g}_{t-1},\bar\Sigma^{c,g}_{t-1})$ and estimated by
+the sample mean/covariance of the ensemble $\{x^{c,g,j}_{t-1}\}$ pushed through VSEM and the
+disturbance model (in code \lstinline{fc.mu}/\lstinline{fc.Sig}). This gives the \emph{forecast
+mixture of Gaussians}
+\[
+  p(x_t \mid \mathcal{D}_{t-1}, p_t)
+  \;\approx\; \sum_{g,c,k} \tilde\omega^{\,c,g,k}_t\,
+  \Norm\!\big(x_t;\, \check\mu^{c,g,k}_t,\, \check\Sigma^{c,g,k}_t\big).
+\]
+
+\paragraph{Collapse to (A1).} Assumption (A1) replaces this mixture by its single-Gaussian
+moment match $\Norm(\hat\mu_t,\hat\Sigma_t)$ (the $\Pi_1$ operator, \lstinline{mm} in code),
+\[
+  \hat\mu_t = \sum_i \tilde\omega_i\, \check\mu_i,
+  \qquad
+  \hat\Sigma_t = \sum_i \tilde\omega_i\Big[\check\Sigma_i
+     + (\check\mu_i - \hat\mu_t)(\check\mu_i - \hat\mu_t)^\top\Big],
+\]
+with $i$ ranging over $(g,c,k)$. The mean $\hat\mu_t$ is exact for the mixture; the single
+covariance $\hat\Sigma_t$ folds the between-component spread $(\check\mu_i-\hat\mu_t)(\cdots)^\top$
+into one Gaussian. NIS further restricts this collapse to the dominant label $k^\star$ (over
+$g,c$); dropping the other labels' components is precisely why the $S_t$ of Claim~1
+under-represents the true predictive spread --- the sense in which (A1) holds only
+approximately.
+
+\begin{thebibliography}{9}
+
+\bibitem{kalman1960}
+R.~E. Kalman (1960).
+\newblock A New Approach to Linear Filtering and Prediction Problems.
+\newblock \emph{Journal of Basic Engineering}, 82(1):35--45.
+\newblock \href{https://doi.org/10.1115/1.3662552}{doi:10.1115/1.3662552}.
+
+\bibitem{barshalom2001}
+Y.~Bar-Shalom, X.-R. Li, T.~Kirubarajan (2001).
+\newblock \emph{Estimation with Applications to Tracking and Navigation}.
+\newblock Wiley (NIS/NEES consistency tests, Ch.~5).
+\newblock \href{https://doi.org/10.1002/0471221279}{doi:10.1002/0471221279}.
+
+\bibitem{mehra1970}
+R.~K. Mehra (1970).
+\newblock On the Identification of Variances and Adaptive Kalman Filtering.
+\newblock \emph{IEEE Transactions on Automatic Control}, 15(2):175--184.
+\newblock \href{https://doi.org/10.1109/TAC.1970.1099422}{doi:10.1109/TAC.1970.1099422}.
+
+\bibitem{desroziers2005}
+G.~Desroziers, L.~Berre, B.~Chapnik, P.~Poli (2005).
+\newblock Diagnosis of Observation, Background and Analysis-Error Statistics in Observation Space.
+\newblock \emph{Quarterly Journal of the Royal Meteorological Society}, 131(613):3385--3396.
+\newblock \href{https://doi.org/10.1256/qj.05.108}{doi:10.1256/qj.05.108}.
+
+\bibitem{anderson2001}
+J.~L. Anderson (2001).
+\newblock An Ensemble Adjustment Kalman Filter for Data Assimilation.
+\newblock \emph{Monthly Weather Review}, 129(12):2884--2903.
+\newblock \href{https://doi.org/10.1175/1520-0493(2001)129<2884:AEAKFF>2.0.CO;2}{doi:10.1175/1520-0493(2001)129\textless2884:AEAKFF\textgreater2.0.CO;2}.
+
+\bibitem{sarkka2013}
+S.~S\"arkk\"a (2013).
+\newblock \emph{Bayesian Filtering and Smoothing}.
+\newblock Cambridge University Press.
+\newblock \href{https://users.aalto.fi/~ssarkka/pub/cup_book_online_20131111.pdf}{Free PDF}.
+
+\end{thebibliography}
+
+\end{document}

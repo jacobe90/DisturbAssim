@@ -1,0 +1,449 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{bm}
+\usepackage[colorlinks=true, linkcolor=blue!60!black, urlcolor=blue!60!black,
+            citecolor=blue!60!black]{hyperref}
+\usepackage{listings}
+
+\lstset{
+  basicstyle=\ttfamily\small, breaklines=true, columns=fullflexible,
+  keepspaces=true, frame=single, framesep=4pt,
+  backgroundcolor=\color{gray!7}, xleftmargin=6pt,
+}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Cov}{\mathrm{Cov}}
+\newcommand{\bx}{\bm{x}}
+\newcommand{\by}{\bm{y}}
+\newcommand{\bm}[1]{\boldsymbol{#1}}
+\newcommand{\bmu}{\bm{\mu}}
+\newcommand{\bSig}{\bm{\Sigma}}
+\newcommand{\half}{\tfrac{1}{2}}
+\DeclareMathOperator{\diag}{diag}
+
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}{Proposition}
+
+\title{The Sigma-Point (Unscented) Forecast for \texttt{ORJointUpdate}:\\
+Seven Points for the Undisturbed and Every Disturbance Class}
+\author{Notes on \texttt{OR\_joint\_update.Rmd}}
+\date{15 July 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Profiling showed that the joint filter's cost is essentially \emph{linear in the
+ensemble size} $J$: the VSEM pushforward, the disturbance draws, and the analysis
+resample all run once per ensemble member. This note develops the alternative that
+removes the $J$ axis entirely. The forecast step needs only the \emph{mean and
+$3\times3$ covariance} of the pushforward for each mixture label, so we replace the
+$J\!\approx\!100$ random members by $2n+1=7$ deterministic \emph{sigma points} (for the
+$n=3$ state) and reconstruct those two moments with the unscented transform. The central
+observation is that all $D$ labels --- undisturbed and each of the \code{dist\$n}
+disturbance classes --- are pushforwards of the \emph{same} input Gaussian through maps
+that \emph{share the same expensive VSEM stage}. So VSEM is evaluated at the seven points
+\emph{once}; each label then reuses those seven propagated points and applies only its own
+cheap, closed-form post-map. The disturbance operator's intrinsic randomness is folded in
+analytically by the law of total variance, using conditional moments we derive in closed
+form. Net effect: $7$ VSEM calls per component per step instead of $J$, no Monte-Carlo
+subsetting noise, and the ensemble representation (and its resample) disappears.
+\end{abstract}
+
+\tableofcontents
+
+\section{Why this helps, in one paragraph}
+\label{sec:why}
+
+The Rao--Blackwellization of the precision (companion note
+\code{claude-speedups-7.15.26.tex}, Idea~1) removed the quadrature factor $G$ from the
+VSEM cost. Profiling the result revealed that VSEM was never the dominant term: the run
+time scales \emph{linearly in $J$}, dominated by (i) the per-member disturbance draw
+\code{disturbance.p}, (ii) the Kalman/collapse arithmetic, and (iii) VSEM itself, each
+paid $\bigO(J)$ times per component. The forecast only ever \emph{uses} a mean and a
+$3\times3$ covariance per label (see \code{vsem\_pushforward}, which returns
+\code{colMeans} / \code{var} of the pushforward). Estimating two moments of a smooth map
+does not require $100$ random samples --- $7$ well-placed deterministic points do it to
+second order. That is the unscented transform, and it collapses the $J$ axis to a
+constant $7$.
+
+\section{Setup and notation}
+\label{sec:setup}
+
+\paragraph{State.} The model state is the $n=3$ carbon-pool vector
+\[
+\bx = (x_1, x_2, x_3) = (C_v,\; C_s,\; C_R)
+   = (\text{foliage biomass},\; \text{soil carbon},\; \text{wood/AGB}),
+\]
+and the observation operator picks out the wood pool, $H=(0,0,1)$, so $x_3$ is the
+observed quantity (\code{OR\_joint\_update.Rmd}).
+
+\paragraph{Input to the forecast.} At each step, every mixture component $c$ carries a
+Gaussian analysis $\mathcal N(\bm m, \bm P)$ over $\bx$ (in the current code this is the
+$\Pi_D$ result \code{mu.k}/\code{Sig.k}, from which the ensemble \code{ens} is
+resampled). \emph{All $D$ labels forecast from this same $\mathcal N(\bm m,\bm P)$}; they
+differ only in the map applied.
+
+\paragraph{The two maps.} Let $f_v:\R^3\!\to\!\R^3$ be the deterministic VSEM
+integration over the year's PAR (the expensive stage). The labels are:
+\begin{itemize}[nosep]
+  \item \textbf{Undisturbed} ($k=1$): $\bx \mapsto f_v(\bx)$, then additive process error
+        $\mathcal N(\bm 0, Q_g)$ with $Q_g[3,3]=1/\tau_g$ folded in analytically (this is
+        the node-specific piece from the RB note; it does not touch VSEM).
+  \item \textbf{Disturbance class $d$} ($k=d+1$, $d=1..\code{dist\$n}$):
+        $\bx \mapsto g_d\!\big(f_v(\bx)\big)$, where $g_d$ is the \emph{stochastic}
+        disturbance operator \code{disturbance.p} with class parameters
+        $(\bmu_0^{(d)}, V_0^{(d)})$ and soil-allocation fraction $s=\code{alloc.soil}$.
+\end{itemize}
+The critical structural fact, which the whole speedup rests on:
+\begin{center}
+\fbox{\parbox{0.92\linewidth}{\centering
+$f_v$ is common to \emph{all} labels. Only the cheap post-map differs
+($\text{identity}+Q_g$ for undisturbed, $g_d$ for class $d$).}}
+\end{center}
+
+\paragraph{Notation.}
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+$n=3$ & state dimension \\
+$2n+1=7$ & number of sigma points \\
+$\bm m,\ \bm P$ & mean / covariance of the component's input Gaussian \\
+$\mathcal X_i,\ i=0..2n$ & sigma points \\
+$w_i^m,\ w_i^c$ & mean / covariance reconstruction weights \\
+$\mathcal Y_i=f_v(\mathcal X_i)$ & VSEM-propagated sigma points (\emph{shared across labels}) \\
+$\mu_d(\by),\ \Sigma_d(\by)$ & conditional mean/cov of $g_d$ given its input $\by$ \\
+$s$ & \code{alloc.soil}, soil allocation fraction \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{The unscented transform}
+\label{sec:ut}
+
+We want the mean and covariance of $\by=\phi(\bx)$ for a smooth map $\phi$, when
+$\bx\sim\mathcal N(\bm m,\bm P)$. The unscented transform
+\cite{julier2004,vandermerwe2004,sarkka2013} chooses $2n+1$ deterministic points that
+match $\bm m$ and $\bm P$ exactly, pushes them through $\phi$, and reconstructs the output
+moments as weighted sample statistics.
+
+\paragraph{Sigma points.} With scaling parameter $\lambda=\alpha^2(n+\kappa)-n$,
+\begin{equation}
+\label{eq:sigma}
+\mathcal X_0=\bm m,\qquad
+\mathcal X_i=\bm m+\big[\sqrt{(n+\lambda)\bm P}\,\big]_i,\qquad
+\mathcal X_{i+n}=\bm m-\big[\sqrt{(n+\lambda)\bm P}\,\big]_i,\quad i=1..n,
+\end{equation}
+where $\big[\sqrt{M}\,\big]_i$ is the $i$-th column of a matrix square root of $M$
+(a Cholesky factor $L$ with $LL^\top=M$ is the usual choice). For $n=3$ this is
+$\mathcal X_0$ plus $3$ ``$+$'' points and $3$ ``$-$'' points, i.e.\ \textbf{seven points},
+one at the mean and a symmetric pair along each principal direction of $\bm P$.
+
+\paragraph{Weights.}
+\begin{equation}
+\label{eq:weights}
+w_0^m=\frac{\lambda}{n+\lambda},\quad
+w_0^c=\frac{\lambda}{n+\lambda}+(1-\alpha^2+\beta),\quad
+w_i^m=w_i^c=\frac{1}{2(n+\lambda)}\ \ (i=1..2n).
+\end{equation}
+Standard Gaussian choices are $\alpha=10^{-3}$ (small spread), $\kappa=0$, $\beta=2$
+(optimal for Gaussians). The weights sum to one, $\sum_i w_i^m=1$.
+
+\paragraph{Reconstruction.} With $\mathcal Y_i=\phi(\mathcal X_i)$,
+\begin{equation}
+\label{eq:recon}
+\hat{\bm m}=\sum_{i=0}^{2n} w_i^m\,\mathcal Y_i,\qquad
+\hat{\bm P}=\sum_{i=0}^{2n} w_i^c\,(\mathcal Y_i-\hat{\bm m})(\mathcal Y_i-\hat{\bm m})^\top .
+\end{equation}
+
+\begin{proposition}[Exactness for affine maps]
+\label{prop:affine}
+If $\phi(\bx)=A\bx+\bm b$ then \eqref{eq:recon} returns $\hat{\bm m}=A\bm m+\bm b$ and
+$\hat{\bm P}=A\bm P A^\top$ exactly, for any valid $(\alpha,\beta,\kappa)$.
+\end{proposition}
+\noindent For nonlinear $\phi$ the transform is exact to second order in the Taylor
+expansion (third order in mean for symmetric points), which is why $7$ deterministic
+points beat $100$ random ones for estimating two moments: the random estimator carries
+$\bigO(J^{-1/2})$ Monte-Carlo error in $\hat{\bm P}$, while the UT has none for the
+affine part and small bias for the curvature. A short proof of
+Proposition~\ref{prop:affine} is in Appendix~\ref{app:affine}.
+
+\section{Seven points, shared across all labels}
+\label{sec:shared}
+
+This section answers the question directly: \emph{how do seven points serve the
+undisturbed label and every disturbance class at once?}
+
+\paragraph{Step 1 --- build the seven points from the input Gaussian.} Use
+\eqref{eq:sigma} on the component's $\mathcal N(\bm m,\bm P)$. This is pure linear
+algebra (one Cholesky of a $3\times3$), independent of any label.
+
+\paragraph{Step 2 --- push them through VSEM \emph{once}.} Evaluate
+\begin{equation}
+\label{eq:propagate}
+\mathcal Y_i=f_v(\mathcal X_i),\qquad i=0,1,\dots,6,
+\end{equation}
+i.e.\ \textbf{seven VSEM integrations total} (versus $J$ today). Because $f_v$ is the
+common stage of every label's map, the propagated set $\{\mathcal Y_i\}$ is all the
+expensive information any label needs. \emph{Nothing below re-runs VSEM.}
+
+\paragraph{Step 3a --- undisturbed moments.} Apply \eqref{eq:recon} to
+$\{\mathcal Y_i\}$ and add the process error analytically:
+\begin{equation}
+\label{eq:undist}
+\bm m_1=\sum_i w_i^m\,\mathcal Y_i,\qquad
+\bm P_1=\underbrace{\sum_i w_i^c\,(\mathcal Y_i-\bm m_1)(\mathcal Y_i-\bm m_1)^\top}_{\text{state pushforward spread}}
+        \;+\;\underbrace{Q_g}_{\text{process error}} .
+\end{equation}
+This mirrors exactly what the current code does with \code{colMeans}/\code{var} plus
+\code{+ Qg}; the process-error part $Q_g[3,3]=1/\tau_g$ is still isolated, so the NIS
+decomposition (\code{nis.q33}) is preserved unchanged.
+
+\paragraph{Step 3b --- each disturbance class.} Reuse the \emph{same}
+$\{\mathcal Y_i\}$; apply the class-$d$ operator. Because $g_d$ is stochastic we do
+\emph{not} sample it --- we use its closed-form conditional moments $\mu_d,\Sigma_d$
+(derived in \S\ref{sec:disturb}) and the law of total variance:
+\begin{align}
+\bm m_{d+1}&=\sum_i w_i^m\,\mu_d(\mathcal Y_i), \label{eq:distmean}\\
+\bm P_{d+1}&=\underbrace{\sum_i w_i^c\,\big(\mu_d(\mathcal Y_i)-\bm m_{d+1}\big)\big(\mu_d(\mathcal Y_i)-\bm m_{d+1}\big)^\top}_{\text{between-point: state uncertainty through }g_d}
+            \;+\;\underbrace{\sum_i w_i^m\,\Sigma_d(\mathcal Y_i)}_{\text{within: intrinsic disturbance noise}}. \label{eq:distcov}
+\end{align}
+Equations \eqref{eq:distmean}--\eqref{eq:distcov} are the multi-point law of total
+variance: $\Cov(g_d)=\Cov\big(\E[g_d\mid \by]\big)+\E\big[\Cov(g_d\mid \by)\big]$, with
+the outer $\by$-distribution represented by the seven propagated points and their
+weights. The first (``between'') term is the disturbance-model mean pushed through the
+state spread; the second (``within'') term is the disturbance draw's own variance,
+averaged over the points --- precisely the piece the current code gets by \emph{sampling}
+\code{disturbance.p} per member.
+
+\paragraph{Why this is legitimate --- and better.} In the ensemble code the multinomial
+split (\code{rmultinom}) assigns each member to one label, so each label's moments are
+estimated from a \emph{random subset} of members. That split is only a Monte-Carlo device
+to ``apply a different map to different draws''; it injects subsetting noise and makes a
+label's covariance depend on how many members happened to land in it. The label
+\emph{weights} $\beta_k$ come from the disturbance prior in the main loop, \emph{not} from
+the split counts. The UT version discards the split: it applies \emph{every} label's map
+to \emph{all seven} propagated points, deterministically. This is strictly more accurate
+(no subsetting noise, no small-count covariance blow-ups) and is what lets one shared
+seven-point set serve all $D$ labels.
+
+\paragraph{Cost.} Per component per step: one $3\times3$ Cholesky, $7$ VSEM integrations,
+and $1+\code{dist\$n}$ cheap analytic post-maps (each $\bigO(7)$ tiny operations). VSEM
+calls drop from $J$ to $7$; the disturbance draws ($\bigO(J)$ \code{rmvnorm} calls, the
+profiling hotspot) vanish entirely, replaced by closed-form $\mu_d,\Sigma_d$; and since
+we now carry $(\bm m,\bm P)$ directly, the per-step analysis \code{rmvnorm(J,\dots)}
+resample also disappears.
+
+\section{The disturbance operator's conditional moments}
+\label{sec:disturb}
+
+We now derive $\mu_d(\by)$ and $\Sigma_d(\by)$ used in
+\eqref{eq:distmean}--\eqref{eq:distcov}. Recall \code{disturbance.p} acting on a
+post-VSEM state $\by=(y_1,y_2,y_3)=(\text{leaf},\text{soil},\text{stem})$
+(\code{disturbance.R}). It treats the biomass pair $\bm u=(y_1,y_3)$ (indices
+\code{c(1,3)}), draws a post-disturbance biomass
+\begin{equation}
+\label{eq:draw}
+\bm b=(b_1,b_3)\sim\mathcal N\!\big(\bmu_0\odot\bm u,\; D_0(\bm u)\big),
+\qquad D_0(\bm u)=\big(\bm u\bm u^\top\big)\odot V_0,
+\end{equation}
+(the code's \code{tcrossprod(old.biomass)*V0}), then sets the new state
+\begin{equation}
+\label{eq:newstate}
+o_1=b_1,\qquad o_3=b_3,\qquad o_2=y_2+s\big[(y_1-b_1)+(y_3-b_3)\big],
+\end{equation}
+i.e.\ the removed biomass $\,r=(y_1-b_1)+(y_3-b_3)\,$ has a fraction $s$ deposited in
+soil. ($\bmu_0=\bmu_0^{(d)}$, $V_0=V_0^{(d)}$; $\odot$ is elementwise.)
+
+\paragraph{$g_d$ is affine in the Gaussian draw.} Holding $\by$ fixed, \eqref{eq:newstate}
+is linear in $\bm b$:
+\begin{equation}
+\label{eq:affine}
+\bm o = A\,\bm b + \bm c,\qquad
+A=\begin{pmatrix} 1 & 0\\ -s & -s\\ 0 & 1 \end{pmatrix},\qquad
+\bm c=\begin{pmatrix} 0\\ y_2+s(y_1+y_3)\\ 0\end{pmatrix},
+\end{equation}
+with $\bm b$ Gaussian from \eqref{eq:draw}. Hence $\bm o\mid\by$ is Gaussian and its
+moments are exact (no approximation in the disturbance operator itself; the only UT
+approximation is in the $f_v$ stage of \S\ref{sec:shared}).
+
+\paragraph{Conditional mean.} With $\E[\bm b\mid\by]=\bmu_0\odot\bm u
+=(\mu_{0,1}y_1,\ \mu_{0,2}y_3)$,
+\begin{equation}
+\label{eq:mu_d}
+\mu_d(\by)=A(\bmu_0\odot\bm u)+\bm c=
+\begin{pmatrix}
+\mu_{0,1}\,y_1\\[2pt]
+y_2+s\big[(1-\mu_{0,1})y_1+(1-\mu_{0,2})y_3\big]\\[2pt]
+\mu_{0,2}\,y_3
+\end{pmatrix}.
+\end{equation}
+This is exactly the deterministic disturbance: retain a fraction $\mu_{0,\cdot}$ of leaf
+and stem, and route fraction $s$ of what was removed into soil.
+
+\paragraph{Conditional covariance.} With $V_0=\diag(v_1,v_2)$ (as in the code), the draw
+covariance \eqref{eq:draw} is diagonal,
+$D_0(\bm u)=\diag\!\big(y_1^2 v_1,\; y_3^2 v_2\big)=:\diag(d_1,d_2)$. Then
+$\Sigma_d(\by)=A\,D_0\,A^\top$ evaluates to
+\begin{equation}
+\label{eq:Sig_d}
+\Sigma_d(\by)=
+\begin{pmatrix}
+d_1 & -s\,d_1 & 0\\
+-s\,d_1 & s^2(d_1+d_2) & -s\,d_2\\
+0 & -s\,d_2 & d_2
+\end{pmatrix},
+\qquad d_1=y_1^2\,v_1,\ \ d_2=y_3^2\,v_2 .
+\end{equation}
+The structure is intuitive: leaf ($o_1$) and stem ($o_3$) inherit the draw variances
+$d_1,d_2$; soil ($o_2$) absorbs fraction $s$ of both removals, giving variance
+$s^2(d_1+d_2)$ and negative covariances with leaf and stem (more retained $\Rightarrow$
+less to soil). Leaf and stem are uncorrelated because $V_0$ is diagonal; a full $V_0$
+would add the cross term $-\,(\cdot)$ and an $o_1$--$o_3$ entry, obtained the same way
+from $A D_0 A^\top$.
+
+\paragraph{Two practical caveats.}
+\begin{enumerate}[nosep]
+  \item \textbf{Retention clamp.} \code{disturbance.p} constrains
+        $b\le \bm u$ (no biomass gain) and applies \code{tobit} ($\ge 0$). The affine
+        moments \eqref{eq:mu_d}--\eqref{eq:Sig_d} ignore these truncations. Since
+        $\mu_{0,\cdot}<1$ the mean draw is safely below $\bm u$ and the clamp bites only
+        in the tail; the resulting bias in the moments is small. If needed it can be
+        corrected with truncated-Gaussian moment formulas, but for a forecast-covariance
+        estimate the uncorrected form is normally adequate.
+  \item \textbf{Backup branch.} The current code already falls back to fixed prior
+        disturbance moments when a class has too few members to form a covariance
+        (\code{OR\_joint\_update.Rmd}). Under the UT there is no member count, so this
+        branch simply disappears --- $\mu_d,\Sigma_d$ are always well defined from
+        \eqref{eq:mu_d}--\eqref{eq:Sig_d}.
+\end{enumerate}
+
+\section{Algorithm}
+\label{sec:algo}
+
+\begin{lstlisting}[caption={UT replacement for \code{vsem\_pushforward}, per component.}]
+ut_pushforward <- function(m, P, tsel) {          # m: 3-vec, P: 3x3
+  n <- 3; alpha <- 1e-3; beta <- 2; kappa <- 0
+  lam <- alpha^2 * (n + kappa) - n
+  L   <- t(chol((n + lam) * (P + diag(1e-9, 3)))) # columns = sqrt((n+lam)P)
+  X   <- cbind(m, m + L, m - L)                   # 3 x 7 sigma points
+  wm  <- c(lam/(n+lam), rep(1/(2*(n+lam)), 2*n))
+  wc  <- wm; wc[1] <- wc[1] + (1 - alpha^2 + beta)
+
+  Y <- apply(X, 2, function(x) VSEM(setTheta(x), PAR = PAR[tsel])[365, 2:4])  # 3 x 7
+  Y <- pmax(Y, 1e-6)                              # positivity (tobit) guard
+
+  ## --- undisturbed: reconstruct moments, add Qg analytically ---
+  m1 <- as.numeric(Y %*% wm)
+  P1 <- Reduce(`+`, lapply(1:7, function(i){d<-Y[,i]-m1; wc[i]*tcrossprod(d)})) + Qg
+  cmu <- list(m1); cSig <- list(P1)
+
+  ## --- each disturbance class d: reuse the SAME propagated Y ---
+  for (d in 1:dist$n) {
+    mu0 <- dist$vals[[d]]$mu0; V0 <- dist$vals[[d]]$V0; s <- dist$alloc.soil
+    MU <- sapply(1:7, function(i) mu_d(Y[,i], mu0, s))          # eq (mu_d), 3 x 7
+    md <- as.numeric(MU %*% wm)
+    between <- Reduce(`+`, lapply(1:7, function(i){e<-MU[,i]-md; wc[i]*tcrossprod(e)}))
+    within  <- Reduce(`+`, lapply(1:7, function(i) wm[i]*Sig_d(Y[,i], V0, s)))  # eq (Sig_d)
+    cmu[[d+1]] <- md; cSig[[d+1]] <- between + within
+  }
+  list(mu = cmu, Sig = cSig)                       # same interface as before (no q33 needed:
+}                                                  # undisturbed Sig = spread + Qg as in eq (undist))
+\end{lstlisting}
+
+\noindent The return value has the identical shape (\code{mu}, \code{Sig} lists of length
+$D$, undisturbed covariance $=$ spread $+Q_g$) that the main loop already consumes, so the
+Kalman update, $\Pi_K/\Pi_D$ collapses, evidence accumulation, and NIS code are unchanged.
+The single behavioural difference is upstream: the component now carries $(\bm m,\bm P)$
+and no ensemble, so the per-step resample \code{rmvnorm(J,\dots)} is deleted and $(\bm
+m,\bm P)$ is set directly from the $\Pi_D$ collapse.
+
+\section{Accuracy, failure modes, and a fallback}
+\label{sec:accuracy}
+
+\begin{itemize}[nosep]
+  \item \textbf{When the UT is excellent.} $f_v$ (VSEM annual pool dynamics) is smooth and
+        close to affine over the analysis-covariance scale, so the two-moment
+        reconstruction is very accurate; the disturbance operator is handled
+        \emph{exactly} (\S\ref{sec:disturb}), not approximated.
+  \item \textbf{When to be careful.} The UT tracks only the first two moments. If a
+        component's forecast is genuinely multimodal or heavy-tailed \emph{within a single
+        label}, the Gaussian summary loses that --- but the filter already summarizes each
+        label by a single Gaussian (\code{mm}), so no information is lost relative to the
+        current design. Strong nonlinearity of $f_v$ across a very wide $\bm P$ can bias
+        $\hat{\bm P}$; the scaling $\alpha$ controls the point spread and can be tuned.
+  \item \textbf{Positivity.} Sigma points can stray to nonphysical (negative) pools in the
+        tails; clamp with \code{tobit}/\code{pmax} before and after VSEM, as the ensemble
+        code already does.
+  \item \textbf{Near-singular $\bm P$.} Add a small jitter $\varepsilon I$ before the
+        Cholesky (shown in the listing), matching the existing
+        \code{(Ck+t(Ck))/2 + diag(1e-6,3)} guard.
+  \item \textbf{Validation / fallback.} Because the interface is unchanged, one can run
+        UT and the $J$-member ensemble side by side on a few sites and compare
+        \code{probD}, the analysis mean/CI, and the NIS calibration. Keep the ensemble
+        path behind a flag as a fallback for any site where the two diverge beyond
+        Monte-Carlo error.
+\end{itemize}
+
+\appendix
+\section{Proof of Proposition~\ref{prop:affine}}
+\label{app:affine}
+
+Let $\phi(\bx)=A\bx+\bm b$ and $\mathcal Y_i=\phi(\mathcal X_i)=A\mathcal X_i+\bm b$.
+Using $\sum_i w_i^m=1$ and the mean-matching property $\sum_i w_i^m\mathcal X_i=\bm m$
+(immediate from \eqref{eq:sigma}, since the $\pm$ pairs cancel and $w^m$ is symmetric),
+\[
+\hat{\bm m}=\sum_i w_i^m(A\mathcal X_i+\bm b)=A\Big(\sum_i w_i^m\mathcal X_i\Big)+\bm b
+          =A\bm m+\bm b .
+\]
+For the covariance, $\mathcal Y_i-\hat{\bm m}=A(\mathcal X_i-\bm m)$, so
+\[
+\hat{\bm P}=\sum_i w_i^c\,A(\mathcal X_i-\bm m)(\mathcal X_i-\bm m)^\top A^\top
+          =A\Big(\sum_i w_i^c(\mathcal X_i-\bm m)(\mathcal X_i-\bm m)^\top\Big)A^\top
+          =A\bm P A^\top,
+\]
+where the last equality is the covariance-matching property of the sigma set: with
+$\mathcal X_i-\bm m=\pm[\sqrt{(n+\lambda)\bm P}\,]_j$ for $i=j,\,j+n$ and
+$w_j^c=w_{j+n}^c=\tfrac{1}{2(n+\lambda)}$, each pair contributes
+$2\cdot\tfrac{1}{2(n+\lambda)}\,(n+\lambda)\,\ell_j\ell_j^\top=\ell_j\ell_j^\top$ with
+$\ell_j$ the $j$-th column of $\sqrt{\bm P}$, and $\sum_j\ell_j\ell_j^\top=\bm P$; the
+$i=0$ term drops because $\mathcal X_0-\bm m=\bm 0$. Both identities hold for any
+$(\alpha,\beta,\kappa)$ giving $n+\lambda\neq0$. \hfill$\qed$
+
+\begin{thebibliography}{9}
+
+\bibitem{julier2004}
+S.~J. Julier and J.~K. Uhlmann.
+\newblock Unscented filtering and nonlinear estimation.
+\newblock \emph{Proceedings of the IEEE}, 92(3):401--422, 2004.
+\newblock \href{https://doi.org/10.1109/JPROC.2003.823141}{doi:10.1109/JPROC.2003.823141}.
+
+\bibitem{wan2000}
+E.~A. Wan and R.~van der Merwe.
+\newblock The unscented Kalman filter for nonlinear estimation.
+\newblock In \emph{Proc. IEEE Adaptive Systems for Signal Processing,
+Communications, and Control (AS-SPCC)}, pages 153--158, 2000.
+\newblock \href{https://doi.org/10.1109/ASSPCC.2000.882463}{doi:10.1109/ASSPCC.2000.882463}.
+
+\bibitem{vandermerwe2004}
+R.~van der Merwe.
+\newblock \emph{Sigma-Point Kalman Filters for Probabilistic Inference in Dynamic
+State-Space Models}.
+\newblock PhD thesis, Oregon Health \& Science University, 2004.
+
+\bibitem{sarkka2013}
+S.~S\"arkk\"a.
+\newblock \emph{Bayesian Filtering and Smoothing}.
+\newblock Cambridge University Press, 2013.
+\newblock \href{https://doi.org/10.1017/CBO9781139344203}{doi:10.1017/CBO9781139344203}.
+
+\end{thebibliography}
+
+\end{document}

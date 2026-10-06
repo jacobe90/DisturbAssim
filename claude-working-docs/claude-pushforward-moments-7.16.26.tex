@@ -1,0 +1,366 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[colorlinks=true, linkcolor=blue!60!black, urlcolor=blue!60!black,
+            citecolor=blue!60!black]{hyperref}
+\usepackage{listings}
+
+\lstset{
+  basicstyle=\ttfamily\small, breaklines=true, columns=fullflexible,
+  keepspaces=true, frame=single, framesep=4pt,
+  backgroundcolor=\color{gray!7}, xleftmargin=6pt,
+}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\mathrm{Var}}
+\newcommand{\Cov}{\mathrm{Cov}}
+\newcommand{\Norm}{\mathcal{N}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\eqd}{\stackrel{d}{=}}
+\DeclareMathOperator*{\argmin}{arg\,min}
+\DeclareMathOperator{\diag}{diag}
+\DeclareMathOperator{\tr}{tr}
+
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}{Proposition}
+
+\title{Ensemble Pushforwards and Moment Matching in \texttt{ORJointUpdate}:\\
+How the Forecast Integral Becomes a Gaussian}
+\author{Notes on \texttt{OR\_joint\_update.Rmd}}
+\date{16 July 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+The filter's forecast step must evaluate, for each label and precision, the one-step
+predictive density $\int p(x_t\mid z_t,x_{t-1},\tau)\,p(x_{t-1}\mid\tau)\,dx_{t-1}$. For
+the nonlinear VSEM transition this integral has no closed form and is not Gaussian, yet
+the Kalman update downstream requires a Gaussian. This note derives the approximation
+that closes the loop. It has three ingredients: (i) \emph{moment matching}, i.e.\
+projecting the true predictive onto the Gaussian family in KL divergence, which is
+achieved exactly by matching the first two moments; (ii) a \emph{law-of-total-variance}
+decomposition of those two moments into a deterministic-pushforward part and an additive
+process-noise part; and (iii) a \emph{Monte-Carlo (ensemble)} estimate of the intractable
+pushforward moments. Worked in detail on the running example
+$\int p(x_1\mid z_1{=}0,x_0,\tau)\,p(x_0\mid\tau)\,dx_0\approx\Norm(x_1;\mu_{1,1},\Sigma_{1,1})$
+--- the undisturbed label at the first step --- where $(\mu_{1,1},\Sigma_{1,1})$ are the
+sample mean and covariance of an ensemble drawn from $p(x_0\mid\tau)=\Norm(m_{0,1},C_{0,1})$,
+run through VSEM, with the process error $Q(\tau)$ folded into the covariance.
+\end{abstract}
+
+\tableofcontents
+
+\section{Model and notation}
+\label{sec:setup}
+
+\paragraph{State and indices.} The state is the $3$-vector of carbon pools
+$x=(C_v,C_s,C_R)=(\text{foliage},\text{soil},\text{wood/AGB})$. We index a forecast
+component by the pair $(t,k)$: time $t$ and mixture label $k$. The label
+$z_t\in\{0,1,\dots,n_d\}$ marks the disturbance regime, $z_t=0$ undisturbed and
+$z_t=d\ge1$ the $d$-th disturbance class ($n_d=\code{dist\$n}$). We write $k=1$ for the
+undisturbed label and $k=d+1$ for class $d$. The process precision on the wood pool is
+$\tau$, treated by quadrature elsewhere; here $\tau$ is fixed.
+
+\paragraph{Transition model.} VSEM defines a deterministic one-year map
+$f_v:\R^3\to\R^3$, $f_v(x_{t-1})=\code{VSEM}(x_{t-1};\text{PAR}_t)$ evaluated at day $365$.
+Conditional on the undisturbed label the transition adds Gaussian process error,
+\begin{equation}
+\label{eq:transition}
+p(x_t\mid z_t{=}0,x_{t-1},\tau)=\Norm\!\big(x_t;\,f_v(x_{t-1}),\,Q(\tau)\big),
+\qquad Q(\tau)=\diag\!\big(Q_{11},Q_{22},\,1/\tau\big),
+\end{equation}
+i.e.\ ``VSEM $+$ process error'': a deterministic mean $f_v$ plus independent noise
+$w\sim\Norm(0,Q(\tau))$, with the wood-pool variance $1/\tau$ set by the precision and the
+foliage/soil variances fixed. The input at $t-1$ (the previous analysis, or the IC prior
+at $t=0$) is Gaussian conditional on $\tau$ and the label,
+\begin{equation}
+\label{eq:input}
+p(x_{t-1}\mid\tau)=\Norm(x_{t-1};\,m_{t-1},\,C_{t-1}).
+\end{equation}
+In the running example $t=1$ and the undisturbed input is $p(x_0\mid\tau)=\Norm(m_{0,1},C_{0,1})$.
+
+\section{The forecast integral}
+\label{sec:integral}
+
+The quantity we need is the label-conditional one-step predictive density, obtained by
+marginalizing the transition \eqref{eq:transition} over the input \eqref{eq:input}
+(Chapman--Kolmogorov):
+\begin{equation}
+\label{eq:ck}
+p(x_1\mid z_1{=}0,\tau)
+=\int_{\R^3} \underbrace{p(x_1\mid z_1{=}0,x_0,\tau)}_{\Norm(x_1;\,f_v(x_0),\,Q(\tau))}\;
+             \underbrace{p(x_0\mid\tau)}_{\Norm(x_0;\,m_{0,1},C_{0,1})}\,dx_0 .
+\end{equation}
+Because $f_v$ is nonlinear, \eqref{eq:ck} is a continuous Gaussian mixture --- \emph{not}
+itself Gaussian, and with no closed form. Two problems must be solved: (a) we need a
+\emph{Gaussian} surrogate so the downstream Kalman update stays closed; (b) even the
+moments of \eqref{eq:ck} are intractable integrals of $f_v$. Section~\ref{sec:mm} solves
+(a) by moment matching; \S\ref{sec:decomp} reduces the moments to pushforward integrals;
+\S\ref{sec:mc} solves (b) by Monte Carlo.
+
+\section{Moment matching is the KL projection onto Gaussians}
+\label{sec:mm}
+
+We approximate the true predictive $p(x_1\mid z_1{=}0,\tau)$ by the Gaussian
+$q=\Norm(\mu_{1,1},\Sigma_{1,1})$ that is closest to it in the (forward) KL sense. The
+following standard fact says ``closest'' means ``same first two moments.''
+
+\begin{lemma}[Gaussian M-projection $=$ moment matching]
+\label{lem:mproj}
+Let $p$ be any density on $\R^3$ with mean $\mu_\star=\E_p[x]$ and covariance
+$\Sigma_\star=\Cov_p[x]\succ0$. Then
+\[
+\argmin_{q=\Norm(\mu,\Sigma)}\ \KL\!\big(p\,\|\,q\big)
+=\Norm(\mu_\star,\Sigma_\star).
+\]
+\end{lemma}
+
+\begin{proof}
+$\KL(p\|q)=-H(p)-\E_p[\log q(x)]$, and only the second term depends on $q$. For
+$q=\Norm(\mu,\Sigma)$,
+\[
+-\E_p[\log q(x)]=\tfrac12\log\!\big((2\pi)^3|\Sigma|\big)
++\tfrac12\,\E_p\!\big[(x-\mu)^\top\Sigma^{-1}(x-\mu)\big].
+\]
+Minimizing over $\mu$: $\nabla_\mu=-\Sigma^{-1}\E_p[x-\mu]=0\Rightarrow\mu=\mu_\star$.
+Substituting $\mu_\star$, the quadratic term is
+$\tfrac12\tr\!\big(\Sigma^{-1}\Sigma_\star\big)$, so we minimize
+$\tfrac12\log|\Sigma|+\tfrac12\tr(\Sigma^{-1}\Sigma_\star)$; its gradient in $\Sigma$,
+$\tfrac12(\Sigma^{-1}-\Sigma^{-1}\Sigma_\star\Sigma^{-1})=0$, gives
+$\Sigma=\Sigma_\star$. Convexity in the natural parameters makes this the global
+minimum.
+\end{proof}
+
+Hence the moment-matched Gaussian is not an ad hoc choice: it is the information-optimal
+Gaussian summary of \eqref{eq:ck}. The task reduces to computing the two moments
+\begin{equation}
+\label{eq:targetmoments}
+\mu_{1,1}=\E[x_1\mid z_1{=}0,\tau],\qquad
+\Sigma_{1,1}=\Cov[x_1\mid z_1{=}0,\tau],
+\end{equation}
+the expectation being under the predictive \eqref{eq:ck}.
+
+\section{Decomposing the moments: total expectation and total variance}
+\label{sec:decomp}
+
+Write the forecast draw as $x_1=f_v(x_0)+w$ with $x_0\sim\Norm(m_{0,1},C_{0,1})$ and
+$w\sim\Norm(0,Q(\tau))$ \emph{independent} of $x_0$. Conditioning on $x_0$ and using
+$\E[w]=0$, $\Cov[w]=Q(\tau)$:
+
+\paragraph{Mean (tower rule).}
+\begin{equation}
+\label{eq:mean}
+\mu_{1,1}=\E_{x_0}\!\big[\E[x_1\mid x_0]\big]=\E_{x_0}\!\big[f_v(x_0)\big].
+\end{equation}
+The process noise contributes nothing to the mean.
+
+\paragraph{Covariance (law of total variance).}
+\begin{equation}
+\label{eq:cov}
+\Sigma_{1,1}
+=\underbrace{\E_{x_0}\!\big[\Cov(x_1\mid x_0)\big]}_{=\,Q(\tau)}
++\underbrace{\Cov_{x_0}\!\big(\E[x_1\mid x_0]\big)}_{=\,\Cov_{x_0}(f_v(x_0))}
+= \Cov_{x_0}\!\big(f_v(x_0)\big)\;+\;Q(\tau).
+\end{equation}
+(The first term is $Q(\tau)$ because $\Cov(x_1\mid x_0)=Q(\tau)$ for every $x_0$; the
+second is the pushforward covariance of the deterministic map. A one-line derivation of
+\eqref{eq:cov} is in Appendix~\ref{app:ltv}.) So:
+\begin{center}
+\fbox{\parbox{0.93\linewidth}{\centering
+\emph{forecast mean} $=$ expected VSEM pushforward\quad;\quad
+\emph{forecast covariance} $=$ pushforward covariance $+$ process error $Q(\tau)$.}}
+\end{center}
+This is the exact structure; the only thing left approximate is the two
+\emph{pushforward} integrals $\E_{x_0}[f_v(x_0)]$ and $\Cov_{x_0}(f_v(x_0))$, which still
+involve the nonlinear $f_v$.
+
+\section{Monte-Carlo estimate: the ensemble pushforward}
+\label{sec:mc}
+
+Estimate the pushforward integrals by drawing an ensemble from the input Gaussian and
+running it through VSEM.
+
+\paragraph{Ensemble.} Sample
+\begin{equation}
+\label{eq:draw}
+x_0^{(j)}\stackrel{\text{iid}}{\sim}\Norm(m_{0,1},C_{0,1}),\qquad j=1,\dots,J,
+\end{equation}
+and push each member through the model,
+\begin{equation}
+\label{eq:push}
+y^{(j)}=f_v\!\big(x_0^{(j)}\big)=\code{VSEM}\big(x_0^{(j)};\text{PAR}_1\big)[365].
+\end{equation}
+In the code, $x_0^{(j)}$ are the rows of \code{ens} (seeded from \code{Xic}) and
+$y^{(j)}$ are the rows of \code{Nf}:
+\begin{lstlisting}
+for (j in 1:J) Nf[j, ] <- VSEM(THETA[j, ], PAR = PAR[tsel])[365, 2:4]  # y^(j) = f_v(x0^(j))
+\end{lstlisting}
+
+\paragraph{Sample moments.} With $\bar y=\tfrac1J\sum_j y^{(j)}$ and
+$S_y=\tfrac{1}{J-1}\sum_j (y^{(j)}-\bar y)(y^{(j)}-\bar y)^\top$, plug the empirical
+pushforward moments into \eqref{eq:mean}--\eqref{eq:cov}:
+\begin{equation}
+\label{eq:est}
+\boxed{\;\hat\mu_{1,1}=\bar y,\qquad
+       \hat\Sigma_{1,1}=S_y+Q(\tau).\;}
+\end{equation}
+These are exactly \code{colMeans(Nf)} and \code{var(Nf) + Qg} (with
+$Q(\tau)[3,3]=1/\tau_g$):
+\begin{lstlisting}
+cmu[[1]]  <- colMeans(Nf[su, ])       # \hat\mu_{1,1} = \bar y
+cSig[[1]] <- var(Nf[su, ]) + Qg       # \hat\Sigma_{1,1} = S_y + Q(tau)
+\end{lstlisting}
+and the moment-matched forecast is $\Norm(x_1;\hat\mu_{1,1},\hat\Sigma_{1,1})$, i.e.\ the
+claimed approximation
+\[
+\int p(x_1\mid z_1{=}0,x_0,\tau)\,p(x_0\mid\tau)\,dx_0\;\approx\;\Norm(x_1;\mu_{1,1},\Sigma_{1,1}).
+\]
+
+\paragraph{Consistency.} $x_0^{(j)}$ are i.i.d.\ from the input, and $f_v$ is
+deterministic, so $y^{(j)}$ are i.i.d.\ from the pushforward law. By the strong law of
+large numbers $\bar y\to\E_{x_0}[f_v(x_0)]=\mu_{1,1}$ and $S_y\to\Cov_{x_0}(f_v(x_0))$
+a.s.\ as $J\to\infty$, hence $\hat\Sigma_{1,1}\to\Sigma_{1,1}$; the CLT gives the usual
+$\bigO(J^{-1/2})$ error. Combined with Lemma~\ref{lem:mproj}, the estimator targets the
+KL-optimal Gaussian summary of the exact predictive.
+
+\section{Why $Q$ is added analytically: Rao--Blackwellization}
+\label{sec:rb}
+
+There are two ways to bring in the process noise $w$, and the code deliberately uses the
+second.
+
+\paragraph{(A) Perturb each member.} Draw $w^{(j)}\sim\Norm(0,Q(\tau))$ and set
+$x_1^{(j)}=y^{(j)}+w^{(j)}$, then take the sample mean/covariance of $\{x_1^{(j)}\}$.
+This estimates $(\mu_{1,1},\Sigma_{1,1})$ but Monte-Carlos \emph{both} the pushforward
+and the process-noise contribution, so $Q(\tau)$ is only approximately recovered
+(with $\bigO(J^{-1/2})$ error) and the sample covariance can even lose positive-definiteness
+at small $J$.
+
+\paragraph{(B) Add $Q$ in closed form (used).} Keep the clean pushforward moments and add
+$Q(\tau)$ analytically, as in \eqref{eq:est}. This is a \emph{Rao--Blackwellization}: the
+conditional law $x_1\mid x_0\sim\Norm(f_v(x_0),Q(\tau))$ is Gaussian, so we integrate the
+noise out exactly rather than sampling it. Concretely, estimator (A) is the sample
+covariance of $x_1^{(j)}=y^{(j)}+w^{(j)}$; taking the conditional expectation over the
+$w^{(j)}$ given the $y^{(j)}$ replaces the noisy empirical $\widehat{\Cov}(w)$ by its exact
+value $Q(\tau)$ and yields (B). By the Rao--Blackwell theorem this conditioning cannot
+increase variance:
+\[
+\Var\big[\hat\Sigma^{(B)}\big]\;\le\;\Var\big[\hat\Sigma^{(A)}\big],
+\]
+and the process part is now exact rather than estimated. It is also cheaper (no $w^{(j)}$
+draws) and guarantees $\hat\Sigma_{1,1}\succeq Q(\tau)\succ0$. Because the forecast
+ensemble members are used \emph{only} to form these two moments --- they are never
+propagated further --- there is no statistical reason to carry the individual perturbed
+members, so (B) is strictly preferable. This decomposition is also what lets the
+process-error share $Q(\tau)[3,3]=1/\tau$ be tracked separately for the NIS diagnostic
+(\code{nis.q33}; see \code{claude-nis-6.13.26.tex}).
+
+\section{The disturbance labels: a composite map with intrinsic noise}
+\label{sec:disturb}
+
+For a disturbance class $d$ (label $k=d+1$) the transition composes VSEM with the
+\emph{stochastic} disturbance operator $g_d$ (\code{disturbance.p}):
+\begin{equation}
+\label{eq:disttrans}
+p(x_t\mid z_t{=}d,x_{t-1})=\text{law of }\ g_d\!\big(f_v(x_{t-1})\big),
+\end{equation}
+and the disturbance labels carry no VSEM process error (the $Q$ term is undisturbed-only).
+The same three-step recipe applies. The predictive is
+$\int \! p(x_t\mid z_t{=}d,x_{t-1})\,p(x_{t-1}\mid\tau)\,dx_{t-1}$, we moment-match it
+(Lemma~\ref{lem:mproj}), and we decompose via total variance --- but now the ``conditional
+noise'' is the randomness of $g_d$ itself, not an additive $Q$. Writing $y=f_v(x_{t-1})$
+and using $\E[g_d(y)\mid y]=\mu_d(y)$, $\Cov[g_d(y)\mid y]=\Sigma_d(y)$,
+\begin{align}
+\mu_{t,d+1}&=\E_{y}\big[\mu_d(y)\big],\label{eq:distmean}\\
+\Sigma_{t,d+1}&=\underbrace{\Cov_{y}\!\big(\mu_d(y)\big)}_{\text{state uncertainty}}
+              +\underbrace{\E_{y}\!\big[\Sigma_d(y)\big]}_{\text{intrinsic disturbance noise}} .
+\label{eq:distcov}
+\end{align}
+In the ensemble implementation the outer expectations over $y$ are again Monte-Carloed:
+members assigned to class $d$ are pushed through VSEM and then through $g_d$, and the
+sample mean/covariance of the results estimate \eqref{eq:distmean}--\eqref{eq:distcov}
+jointly (the sampled $g_d$ draw supplies the within-$y$ noise automatically). The label
+assignment is done by a multinomial split of the ensemble --- a Monte-Carlo device for
+``apply different maps to different draws''; the label \emph{weights} come from the
+disturbance prior, not the split counts. When a class receives too few members to form a
+covariance the code falls back to fixed prior disturbance moments.
+(The companion \code{claude-sigma-points-7.15.26.tex} replaces the outer Monte Carlo by a
+deterministic $7$-point quadrature and evaluates $\mu_d,\Sigma_d$ in closed form, so
+\eqref{eq:distmean}--\eqref{eq:distcov} become exact given the propagated points; both
+schemes estimate the \emph{same} integrals.)
+
+\section{Same integral, different quadrature; and the mixture context}
+\label{sec:context}
+
+\paragraph{Ensemble vs.\ sigma points.} Everything above hinges on estimating two
+pushforward integrals, $\E_{x_0}[f_v(x_0)]$ and $\Cov_{x_0}(f_v(x_0))$. The ensemble uses
+$J$ random draws (Monte-Carlo quadrature, $\bigO(J^{-1/2})$ error); the unscented
+transform uses $2n+1=7$ deterministic sigma points (Gaussian quadrature, exact for affine
+$f_v$ and second-order accurate otherwise). They are two quadrature rules for the
+identical integrals \eqref{eq:mean}--\eqref{eq:cov}; the moment-matching logic of
+\S\ref{sec:mm}--\S\ref{sec:decomp} is unchanged.
+
+\paragraph{Where it sits in the filter.} Each moment-matched Gaussian
+$\Norm(\mu_{t,k},\Sigma_{t,k})$ is one component of the forecast mixture over labels $k$
+(weights $\beta_k$) and precision nodes $\tau_g$ (weights $W_g$). Each component is (i)
+Kalman-updated against the observation $y_t$ (\eqref{eq:transition}'s Gaussian form makes
+this exact), yielding the analysis and the likelihood that reweights labels and $\tau$;
+and (ii) after the update the per-label components are moment-matched again (the $\Pi_K$
+/ $\Pi_D$ collapses) so the mixture does not grow without bound. Moment matching is thus
+applied twice per step --- once to close the nonlinear forecast integral derived here, and
+once to keep the mixture order fixed --- and both are the same KL projection of
+Lemma~\ref{lem:mproj}.
+
+\appendix
+\section{Law of total variance}
+\label{app:ltv}
+
+For random vectors with the conditional decomposition $x_1=f_v(x_0)+w$, $\E[w\mid x_0]=0$,
+$\Cov[w\mid x_0]=Q$,
+\begin{align*}
+\Cov(x_1)
+&=\E\big[(x_1-\E x_1)(x_1-\E x_1)^\top\big]\\
+&=\E\big[\Cov(x_1\mid x_0)\big]+\Cov\big(\E[x_1\mid x_0]\big)
+  \qquad\text{(add and subtract }\E[x_1\mid x_0]\text{)}\\
+&=\E_{x_0}[Q]+\Cov_{x_0}\!\big(f_v(x_0)\big)=Q+\Cov_{x_0}\!\big(f_v(x_0)\big),
+\end{align*}
+where the cross term vanishes because
+$\E\big[(x_1-\E[x_1\mid x_0])(\E[x_1\mid x_0]-\E x_1)^\top\big]
+=\E\big[\E[x_1-\E[x_1\mid x_0]\mid x_0](\cdots)^\top\big]=0$. This is \eqref{eq:cov}.
+
+\begin{thebibliography}{9}
+
+\bibitem{minka2001}
+T.~P. Minka.
+\newblock \emph{A family of algorithms for approximate Bayesian inference}.
+\newblock PhD thesis, MIT, 2001. (Assumed-density filtering / M-projection.)
+
+\bibitem{sarkka2013}
+S.~S\"arkk\"a.
+\newblock \emph{Bayesian Filtering and Smoothing}.
+\newblock Cambridge University Press, 2013.
+\newblock \href{https://doi.org/10.1017/CBO9781139344203}{doi:10.1017/CBO9781139344203}.
+
+\bibitem{evensen2003}
+G.~Evensen.
+\newblock The ensemble Kalman filter: theoretical formulation and practical
+implementation.
+\newblock \emph{Ocean Dynamics}, 53:343--367, 2003.
+\newblock \href{https://doi.org/10.1007/s10236-003-0036-9}{doi:10.1007/s10236-003-0036-9}.
+
+\bibitem{casella1996}
+G.~Casella and C.~P. Robert.
+\newblock Rao--Blackwellisation of sampling schemes.
+\newblock \emph{Biometrika}, 83(1):81--94, 1996.
+\newblock \href{https://doi.org/10.1093/biomet/83.1.81}{doi:10.1093/biomet/83.1.81}.
+
+\end{thebibliography}
+
+\end{document}

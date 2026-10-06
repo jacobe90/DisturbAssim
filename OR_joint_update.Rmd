@@ -145,11 +145,7 @@ dist.prior.probs <- sapply(dist.forecastparams, function(x) {
 })
 
 ## Diagonal process-error covariance (per-pool SDs) and prior process-precision
-## gamma params (a, b) = (shape, rate). Both site-independent.
 Q = diag(c(Ql,Qsoil,Qw)^2)
-a <- 1/0.1172475
-b <- 1
-gamInit <- c(a, b)
 
 ## Default heteroskedastic Rparams for GEDI (slope, intercept).
 Rparams.GEDI.het <- c(0.01331, 0.09761)
@@ -279,306 +275,327 @@ solve_digamma_log <- function(c, tol = 1e-12, maxiter = 100, a.max = 1e4) {
 
 
 ```{r}
-##' @param tauParams - the initial process precision parameters
-##' @param THETA parameter matrix
-##' @param dist  disturbance list: p.dist, mu0[3], V0[3,3], alloc soil
+##' Approximate joint disturbance update (working-doc 6.30.26 algorithm).
+##' Quadrature over the process precision tau: G Gauss-Laguerre nodes tau_g are chosen to
+##' integrate against the Gamma(a,b) prior tau^{a-1} e^{-b tau}. Conditional on each tau_g
+##' we run a Gaussian-sum filter with D components (undisturbed + dist$n disturbance
+##' classes), each backed by an ensemble; the per-node log-evidence L_t(tau_g) is
+##' accumulated and combined across nodes via log-sum-exp to weight the tau grid.
+##'
+##' @param gamInit c(a, b) Gamma prior (shape, rate) for tau
+##' @param Y NT x 3 observations (wood/AGB pool in column 3; NA => forecast-only step)
+##' @param Rparams c(slope, intercept): observation error R = y*slope + intercept
+##' @param Q process-error covariance; Q[1,1],Q[2,2] used for foliage/soil, Q[3,3] set to 1/tau_g
+##' @param PAR daily PAR driver (length NT*365)
+##' @param Xic J x 3 initial-condition ensemble (ICprior); seeds every node's ensemble at t=1
+##' @param THETA VSEM parameter vector/matrix (cols 9:11 overwritten with the IC ensemble)
+##' @param dist disturbance list: p (D x NT prior), n (# classes), vals (per-class mu0/V0), alloc.soil
+##' @param G number of Gauss-Laguerre precision nodes
+ORJointUpdate <- function(gamInit, Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200) {
 
-ORJointUpdate <- function(gamInit,Y,Rparams,Q,PAR,Xic,THETA,dist) {
-  # initialize variables
-  NT <- length(PAR)/365
-  Nf = Na = array(Xic, dim = c(nrow(Xic), ncol(Xic), dist$n + 1))
-  ne = nrow(Xic)
-  muF <- array(NA, dim = c(dist$n + 1, 3, dist$n + 1)) 
-  CF <- array(NA, dim = c(dist$n + 1, 3, 3, dist$n + 1))
-  pF <- array(NA, dim = c(dist$n + 1, 3, 3, dist$n + 1))
-  muA <- array(NA, dim = c(dist$n + 1, 3, dist$n + 1))
-  CA <- array(NA, dim = c(dist$n + 1, 3, 3, dist$n + 1))
-  likA <- array(NA, dim = c(dist$n + 1, dist$n + 1))
-  gamA <- array(NA, dim = c(dist$n + 1, 2, dist$n+1))
-  muFinal <- array(NA, dim=c(dist$n+1, 3))
-  CFinal <- array(NA, dim=c(dist$n+1, 3, 3))
-  gamFinal <- array(c(rep(gamInit[1], dist$n+1), rep(gamInit[2], dist$n+1)), dim=c(dist$n+1, 2))
-  alphas <- array(NA, dim=c(dist$n+1, dist$n + 1))
-  omegaA <- array(NA, dim=c(dist$n+1, dist$n + 1))
-  omegaFinal <- c(0.5, rep(0.5 / dist$n, dist$n))
-  
-  
-  if(!is.matrix(THETA)) THETA = matrix(THETA,nrow=ne,ncol=length(THETA),byrow = TRUE)
-  
-  H <- matrix(c(0, 0, 1), 1, 3)
+  ## ---- dimensions ----
+  NT <- length(PAR) / 365
+  J  <- nrow(Xic)                       # ensemble size per (component, node); ICprior seeds it
+  D  <- dist$n + 1                      # 1 undisturbed + dist$n disturbance sub-classes
+  H  <- matrix(c(0, 0, 1), 1, 3)
+  if (!is.matrix(THETA)) THETA <- matrix(THETA, nrow = J, ncol = length(THETA), byrow = TRUE)
 
-  # per-timestep diagnostics for the observed wood/AGB pool (index 3)
+  ## ---- Gauss-Laguerre nodes/weights for tau ~ Gamma(a,b): weight tau^{a-1} e^{-b tau} ----
+  ## The weights already carry the Gamma kernel, so the tau-node posterior is
+  ## W_g proportional to omega_g * L_t(tau_g) (no extra tau^{a-1} e^{-b tau} factor).
+  a <- gamInit[1]; b <- gamInit[2]
+  gl   <- gauss_laguerre_rate(G, a - 1, b)
+  tau  <- gl$nodes
+  logw <- log(gl$weights)
+  logL <- rep(0, G)                     # log L_t(tau_g), accumulated evidence
+
+  ## ---- moment-match a weighted set of 3-D Gaussians to one Gaussian ----
+  mm <- function(ws, mus, Sigs) {
+    W <- sum(ws)
+    if (!is.finite(W) || W <= 0) return(NULL)
+    wn <- ws / W
+    mu <- rowSums(mapply(function(a, m) a * m, wn, mus))
+    C  <- matrix(0, 3, 3)
+    for (i in seq_along(wn)) C <- C + wn[i] * (Sigs[[i]] + tcrossprod(mus[[i]] - mu))
+    list(w = W, mu = mu, Sigma = C)
+  }
+
+  ## VSEM parameter template: cols 1:8 are shared model params, 9:11 the state ICs that
+  ## each sigma point overwrites. (THETA arrives as a matrix of identical rows.)
+  th0 <- if (is.matrix(THETA)) THETA[1, ] else THETA
+
+  ## ---- SIGMA-POINT (unscented) pushforward + disturbance split (PRECISION-INDEPENDENT) ----
+  ## The forecast only needs the mean/cov of the pushforward per label, so we replace the
+  ## J-member Monte-Carlo pushforward with the unscented transform: 2n+1 = 7 deterministic
+  ## sigma points (n = 3 state dims) that match the input Gaussian N(m, P), pushed through
+  ## VSEM ONCE and reused across ALL labels (undisturbed + each disturbance class). VSEM
+  ## therefore runs 7 times per component instead of J. See claude-sigma-points-7.15.26.tex.
+  ## Precision-independent: the wood-pool process error N(0, 1/tau_g) is added per node in
+  ## the g-loop, so cSig[[1]] here is the tau-free pushforward spread.
+  ut_pushforward <- function(m, P, tsel) {
+    n <- 3; alpha <- 1e-3; beta.ut <- 2; kappa <- 0
+    lam <- alpha^2 * (n + kappa) - n
+    Ps  <- (P + t(P)) / 2 + diag(1e-9, 3)                 # symmetrize + jitter
+    Lc  <- tryCatch(t(chol((n + lam) * Ps)),              # columns = sqrt((n+lam)P)
+                    error = function(e) {
+                      ev <- eigen((n + lam) * Ps, symmetric = TRUE)
+                      ev$vectors %*% diag(sqrt(pmax(ev$values, 0))) %*% t(ev$vectors)
+                    })
+    X  <- cbind(m, m + Lc, m - Lc)                        # 3 x 7 sigma points
+    wm <- c(lam / (n + lam), rep(1 / (2 * (n + lam)), 2 * n))
+    wc <- wm; wc[1] <- wc[1] + (1 - alpha^2 + beta.ut)
+
+    ## push the 7 points through VSEM ONCE (shared across every label)
+    Y <- matrix(NA, 3, 2 * n + 1)
+    for (i in 1:(2 * n + 1)) {
+      th <- th0; th[9:11] <- pmax(X[, i], 1e-6)           # positivity guard on ICs
+      Y[, i] <- VSEM(th, PAR = PAR[tsel])[365, 2:4]
+    }
+    Y <- pmax(Y, 1e-6)
+
+    cmu <- vector("list", D); cSig <- vector("list", D)
+    ## undisturbed: UT moment reconstruction WITHOUT process noise (Qg added per node)
+    m1 <- as.numeric(Y %*% wm)
+    P1 <- matrix(0, 3, 3)
+    for (i in 1:(2 * n + 1)) { dd <- Y[, i] - m1; P1 <- P1 + wc[i] * tcrossprod(dd) }
+    cmu[[1]] <- m1; cSig[[1]] <- P1
+
+    ## disturbance classes: reuse the SAME propagated Y. The disturbance operator is affine
+    ## in its Gaussian draw, so its conditional moments mu_d(y), Sig_d(y) are closed-form;
+    ## the class forecast moments follow by the law of total variance (between-point spread
+    ## of mu_d + weighted-mean within-point noise Sig_d). No sampling of disturbance.p.
+    for (d in 1:dist$n) {
+      mu0 <- dist$vals[[d]]$mu0; V0 <- dist$vals[[d]]$V0; s <- dist$alloc.soil
+      MU <- matrix(NA, 3, 2 * n + 1); within <- matrix(0, 3, 3)
+      for (i in 1:(2 * n + 1)) {
+        yi <- Y[, i]
+        MU[, i] <- c(mu0[1] * yi[1],                                        # eq (mu_d): retain
+                     yi[2] + s * ((1 - mu0[1]) * yi[1] + (1 - mu0[2]) * yi[3]),  # residual -> soil
+                     mu0[2] * yi[3])
+        d1 <- yi[1]^2 * V0[1, 1]; d2 <- yi[3]^2 * V0[2, 2]                  # eq (Sig_d) = A D0 A^T
+        Sd <- matrix(c( d1,       -s * d1,           0,
+                       -s * d1,    s^2 * (d1 + d2),  -s * d2,
+                        0,         -s * d2,           d2), 3, 3, byrow = TRUE)
+        within <- within + wm[i] * Sd
+      }
+      md <- as.numeric(MU %*% wm)
+      between <- matrix(0, 3, 3)
+      for (i in 1:(2 * n + 1)) { e <- MU[, i] - md; between <- between + wc[i] * tcrossprod(e) }
+      cmu[[d + 1]] <- md; cSig[[d + 1]] <- between + within
+    }
+    list(mu = cmu, Sig = cSig)
+  }
+
+  ## ---- state carried across time (PRECISION-MARGINAL): D Gaussian components (label k) ----
+  ## Rao-Blackwellization: rather than G copies of the state (one per tau node), carry a
+  ## single tau-marginal mixture of D components. With the sigma-point forecast there is no
+  ## ensemble: each component is carried as its Gaussian moments (bar.mu, bar.Sig), from
+  ## which the 7 sigma points are regenerated each step. Each step re-expands over the G
+  ## nodes by adding the node-specific process error Qg analytically; the tau posterior W_g
+  ## is tracked separately (logL). Xic seeds the t=1 component's mean and covariance.
+  bar.w   <- numeric(D)                  # tau-marginal component (label) weights, sum = 1
+  bar.mu  <- matrix(0, D, 3)             # component means (input Gaussian for the pushforward)
+  bar.Sig <- array(0, dim = c(D, 3, 3))  # component covariances
+  bar.w[1]    <- 1                       # t=1: single undisturbed component
+  bar.mu[1, ] <- colMeans(as.matrix(Xic))
+  bar.Sig[1, , ] <- var(as.matrix(Xic))
+
+  ## diagnostics (same fields as before so downstream analysis keeps working)
   hist <- list(y=rep(NA,NT), overall.analysis=rep(NA,NT),
                analysis.dist=rep(NA,NT), analysis.undist=rep(NA,NT),
                forecast.dist=rep(NA,NT), forecast.undist=rep(NA,NT),
                ci.mean=rep(NA,NT), ci.lower=rep(NA,NT), ci.upper=rep(NA,NT),
-               probD=rep(NA,NT),                 # posterior prob. of disturbance
-               ci5=matrix(NA,NT,5),              # 5 wood-pool quantiles (2.5/25/50/75/97.5)
-               nis=rep(NA,NT),                   # normalized innovation squared (wood pool)
-               nis.cf=rep(NA,NT),                # S decomposition: forecast ensemble spread
-               nis.q33=rep(NA,NT),               #                  process variance
-               nis.R=rep(NA,NT),                 #                  observation error
-               nis.innov=rep(NA,NT))             #                  innovation (y - forecast)
+               probD=rep(NA,NT), ci5=matrix(NA,NT,5), nis=rep(NA,NT),
+               nis.cf=rep(NA,NT), nis.q33=rep(NA,NT), nis.R=rep(NA,NT), nis.innov=rep(NA,NT))
 
   for (t in 1:NT) {
     print(paste0("timestep: ", t))
-    y <- Y[t, 3]
-    omega.prev <- omegaFinal   # weights before this step's collapse (for forecast means)
+    y    <- Y[t, 3]
+    tsel <- (t - 1) * 365 + 1:365
+    Kin  <- if (t == 1) 1 else D          # # input components per node
+    ## component weights beta_k = 1{k=1}(1-p_t) + 1{k>=2} p_t * pi_k, with p_t the total
+    ## disturbance probability (from dist$p) and pi_k the uniform disturbance-forecast
+    ## mixing 1/dist$n (matching the ensemble split c(0.5, rep(0.5/dist$n, dist$n))).
+    p_t  <- 1 - dist$p[1, t]                           # total disturbance probability
+    beta <- c(dist$p[1, t], rep(p_t / dist$n, dist$n)) # undist + uniform type-mixing (length D)
+    R    <- if (is.na(y)) NA_real_ else y * Rparams[1] + Rparams[2]
 
-    # No observation this timestep: forecast-only step. Run VSEM forward and add
-    # process error to ALL ensemble members of every component, carry the forecast
-    # ensemble forward, and skip the Kalman update / disturbance mixture / collapse.
-    if (is.na(y)) {
-      tsel <- (t-1)*365 + 1:365
-      for (i in 1:(dist$n+1)) {
-        Q[3,3] <- 1 / (gamFinal[i,1] / gamFinal[i,2])   # per-component process error
-        if (!is.finite(Q[3,3]) || Q[3,3] <= 0) Q[3,3] <- 1e-6
-        THETA[,9:11] <- Na[,,i]
-        for (j in 1:ne) Nf[j,,i] <- VSEM(THETA[j,], PAR = PAR[tsel])[365, 2:4]
-        for (j in 1:ne) Nf[j,,i] <- mvtnorm::rmvnorm(1, Nf[j,,i], Q)
-        Na[,,i] <- Nf[,,i]                              # carry forecast forward
-      }
-      # record forecast-only diagnostics (no obs => analysis == forecast)
-      fmean <- sapply(1:(dist$n+1), function(i) mean(Nf[,3,i]))
-      fsd   <- sapply(1:(dist$n+1), function(i) sd(Nf[,3,i]))
-      om <- omegaFinal; di <- 2:(dist$n+1); swd <- sum(om[di])
-      hist$y[t]                <- y
-      hist$forecast.undist[t]  <- fmean[1]
-      hist$forecast.dist[t]    <- if (swd > 0) sum(om[di]*fmean[di])/swd else NA
-      hist$overall.analysis[t] <- sum(om*fmean)
-      hist$analysis.undist[t]  <- fmean[1]
-      hist$analysis.dist[t]    <- hist$forecast.dist[t]
-      gs <- which.max(om)
-      hist$ci.mean[t]  <- fmean[gs]
-      hist$ci.lower[t] <- fmean[gs] - 1.96*fsd[gs]
-      hist$ci.upper[t] <- fmean[gs] + 1.96*fsd[gs]
-      hist$probD[t]    <- swd
-      hist$ci5[t, ]    <- normal_quantile(c(.025,.25,.5,.75,.975), fmean[gs], fsd[gs]^2)
-      next
-    }
+    ## ---- precision-INDEPENDENT sigma-point pushforward: 7 VSEM runs per input component c ----
+    ## Rao-Blackwellization: the G precision nodes reuse these shared moments (adding only
+    ## their node-specific Qg), so VSEM runs 7*Kin times per step instead of 7*Kin*G.
+    push <- vector("list", Kin)
+    for (c in 1:Kin) if (bar.w[c] > 0) push[[c]] <- ut_pushforward(bar.mu[c, ], bar.Sig[c, , ], tsel)
 
-    R <- Y[t, 3] * Rparams[1] + Rparams[2]
+    fc.w    <- matrix(0, D, G)            # forecast mixture (for NIS) per (k,g)
+    fc.mu   <- array(NA, dim = c(D, 3, G))
+    fc.Sig  <- array(NA, dim = c(D, 3, 3, G))
+    logZ    <- rep(0, G)
 
-    prob.dist <- sum(dist$p[2:(dist$n + 1), t])
-    prob.undist <- dist$p[1, t]
-    
-    for (i in 1:(dist$n+1)) {
-      ## Seed VSEM ICs (foliage / soil / wood pools) with the previous timestep's
-      ## analysis state for each ensemble member.
-      THETA[,9:11]  <- Na[,,i]
-      
-      ## Deterministic forecast: run VSEM forward 365 days for each ensemble
-      ## member using that year's PAR driver, and grab end-of-year pools.
-      for(j in 1:ne){
-        tsel    = (t-1)*365 + 1:365
-        Nf[j,,i] = VSEM(THETA[j,], PAR = PAR[tsel])[365,2:4]
-      }
-      
-      # compute process error
-      Q[3, 3] <- 1 / (gamFinal[i, 1] / gamFinal[i, 2])
-      if (!is.finite(Q[3, 3]) || Q[3, 3] <= 0) Q[3, 3] <- 1e-6
+    ## raw (uncollapsed) Kalman-updated components, kept for the final Pi_D so it
+    ## aggregates all G*K*D components directly (not the per-node Pi_K collapse).
+    ## Per label k: within-node weights alpha^{c,k,g}=up.w/Z_g, means, covs, and node id g.
+    allk.alpha <- vector("list", D); allk.mu <- vector("list", D)
+    allk.Sig   <- vector("list", D); allk.node <- vector("list", D)
+    ## and the raw forecast (pre-Kalman) components, kept as the full D*K*G mixture so NIS
+    ## can collapse just the dominant label's components (not the per-node Pi_K collapse).
+    allf.w <- vector("list", D); allf.mu <- vector("list", D)
+    allf.Sig <- vector("list", D); allf.node <- vector("list", D); allf.q33 <- vector("list", D)
+    for (k in 1:D) { allk.alpha[[k]] <- numeric(); allk.mu[[k]] <- list()
+                     allk.Sig[[k]] <- list(); allk.node[[k]] <- integer()
+                     allf.w[[k]] <- numeric(); allf.mu[[k]] <- list()
+                     allf.Sig[[k]] <- list(); allf.node[[k]] <- integer(); allf.q33[[k]] <- numeric() }
 
-      
-      # compute undisturbed sample mean / cov
-      d.ens.p <- c(0.5, rep(0.5 / dist$n, dist$n))
-      d.forecast <- rmultinom(ne, 1, d.ens.p)
-      d.class <- apply(d.forecast,2,which.max) - 1
-      sel.undisturbed <- which(d.class == 0)
-      
-      muF[1,,i] = colMeans(Nf[sel.undisturbed,,i])
-      CF[1,,,i] = var(Nf[sel.undisturbed,,i])
-      
-      
-      # add process error to undisturbed ensemble members
-      for(j in sel.undisturbed) {
-        Nf[j,,i] = mvtnorm::rmvnorm(1,Nf[j,,i],Q)
-      }
-      
-      # run disturbance model on disturbed ensemble members of each class
-      for (d in 1:(dist$n)) {
-        sel.dist = which(d.class == d)
-        # always apply the disturbance perturbation to this class's members (if any)
-        for(j in sel.dist){
-          Nf[j,,i] = disturbance.p(Nf[j,,i],
-                      mu0=dist$vals[[d]]$mu0,
-                      V0=dist$vals[[d]]$V0,
-                      alloc.soil=dist$alloc.soil)
+    for (g in 1:G) {
+      ## node-specific process error on the wood pool: Qg[3,3] = 1/tau_g (added analytically
+      ## to the shared, precision-independent pushforward covariance for the undisturbed label)
+      Qg <- Q; Qg[3, 3] <- 1 / tau[g]
+      if (!is.finite(Qg[3, 3]) || Qg[3, 3] <= 0) Qg[3, 3] <- 1e-6
+
+      ## per-label accumulators over input components c
+      up.w   <- vector("list", D); up.mu <- vector("list", D); up.Sig <- vector("list", D)
+      fc.acc.w <- vector("list", D); fc.acc.mu <- vector("list", D); fc.acc.Sig <- vector("list", D)
+      fc.acc.q33 <- vector("list", D)
+      for (k in 1:D) { up.w[[k]] <- numeric(); up.mu[[k]] <- list(); up.Sig[[k]] <- list()
+                       fc.acc.w[[k]] <- numeric(); fc.acc.mu[[k]] <- list(); fc.acc.Sig[[k]] <- list()
+                       fc.acc.q33[[k]] <- numeric() }
+
+      for (c in 1:Kin) {
+        if (bar.w[c] <= 0) next
+        fs <- push[[c]]                                      # shared VSEM pushforward (no tau)
+        for (k in 1:D) {
+          ## fold in the node-specific process error on the undisturbed label only; the
+          ## disturbance labels carry no process error (q33 = 0). fs$Sig[[1]] is the tau-free
+          ## ensemble spread, so Sig.fk = ensemble + Qg is the OVERALL forecast covariance.
+          Sig.fk <- fs$Sig[[k]]; q33.fk <- 0
+          if (k == 1) { Sig.fk <- Sig.fk + Qg; q33.fk <- Qg[3, 3] }
+          mu.fk  <- fs$mu[[k]]
+          w.fk <- bar.w[c] * beta[k]                         # forecast-mixture weight
+          ## forecast mixture (label k) accumulation for NIS
+          fc.acc.w[[k]]   <- c(fc.acc.w[[k]], w.fk)
+          fc.acc.mu[[k]]  <- c(fc.acc.mu[[k]], list(mu.fk))
+          fc.acc.Sig[[k]] <- c(fc.acc.Sig[[k]], list(Sig.fk))
+          fc.acc.q33[[k]] <- c(fc.acc.q33[[k]], q33.fk)      # process-error part of Sigma[3,3]
+          if (!is.na(y)) {                                   # observed: Kalman update
+            ku <- KalmanUpdate(mu.fk, Sig.fk, H, R, y)
+            up.w[[k]]   <- c(up.w[[k]], w.fk * as.numeric(ku$L_hat))
+            up.mu[[k]]  <- c(up.mu[[k]], list(as.numeric(ku$m_hat)))
+            up.Sig[[k]] <- c(up.Sig[[k]], list(ku$C_hat))
+          } else {                                           # no obs: carry forecast (lik = 1)
+            up.w[[k]]   <- c(up.w[[k]], w.fk)
+            up.mu[[k]]  <- c(up.mu[[k]], list(mu.fk))
+            up.Sig[[k]] <- c(up.Sig[[k]], list(Sig.fk))
+          }
         }
-        # ensemble moments only when this class has enough members (>2); else backup
-        if(length(sel.dist)>2) {
-          muF[d+1,,i]  = colMeans(Nf[sel.dist,,i])
-          CF[d+1,,,i] = var(Nf[sel.dist,,i])
-          pF[d+1,,,i] = try(solve(CF[d+1,,,i]))
+      }
+
+      ## Z_t(tau_g) = sum over all (c,k) updated weights; alpha normalizes within node
+      Zg <- sum(unlist(up.w))
+      logZ[g] <- if (is.na(y)) 0 else if (Zg > 0) log(Zg) else -Inf
+      norm <- if (Zg > 0) Zg else 1
+
+      for (k in 1:D) {
+        ## stash the raw (c) components of this (k,g) for the final Pi_D (all G*K*D)
+        if (length(up.w[[k]]) > 0) {
+          allk.alpha[[k]] <- c(allk.alpha[[k]], up.w[[k]] / norm)   # alpha^{c,k,g} = up.w / Z_g
+          allk.mu[[k]]    <- c(allk.mu[[k]], up.mu[[k]])
+          allk.Sig[[k]]   <- c(allk.Sig[[k]], up.Sig[[k]])
+          allk.node[[k]]  <- c(allk.node[[k]], rep(g, length(up.w[[k]])))
         }
-
-        if(length(sel.dist) <= 2 || "try-error" %in% class(pF[d+1,,,i]) || grepl("Error", pF[d+1, 1,1,i])) { # backup values if the ensemble stats fail
-          muF[d+1,,i] = c(dist$vals[[d]]$mu0[1], mean(Nf[,2,i]),  dist$vals[[d]]$mu0[2])
-          CF[d+1,,,i] = diag(c(dist$vals[[d]]$V0[1,1],0.25,dist$vals[[d]]$V0[2,2]))
-          pF[d+1,,,i] = solve(CF[d+1,,,i])
-          print(paste("iteration: ", d, "class: ", class(pF[d+1,1,1,i]), "value: ", pF[d+1,1,1,i]))
+        ## stash the raw (c) FORECAST components of this (k,g) for the full-mixture NIS.
+        ## Weight per component = bar.w[c,g]*beta_k (in fc.acc.w); node index kept for W_g.
+        if (length(fc.acc.w[[k]]) > 0) {
+          allf.w[[k]]    <- c(allf.w[[k]], fc.acc.w[[k]])
+          allf.mu[[k]]   <- c(allf.mu[[k]], fc.acc.mu[[k]])
+          allf.Sig[[k]]  <- c(allf.Sig[[k]], fc.acc.Sig[[k]])
+          allf.node[[k]] <- c(allf.node[[k]], rep(g, length(fc.acc.w[[k]])))
+          allf.q33[[k]]  <- c(allf.q33[[k]], fc.acc.q33[[k]])
         }
-        # pF <- array(as.numeric(pF), dim = dim(pF), dimnames = dimnames(pF))
+        ## forecast mixture collapse (for NIS diagnostics)
+        if (length(fc.acc.w[[k]]) > 0 && sum(fc.acc.w[[k]]) > 0) {
+          fcoll <- mm(fc.acc.w[[k]], fc.acc.mu[[k]], fc.acc.Sig[[k]])
+          fc.w[k, g]      <- fcoll$w
+          fc.mu[k, , g]   <- fcoll$mu
+          fc.Sig[k, , , g] <- fcoll$Sigma
+        }
       }
-      
-      # kalman update to compute means and covariances of normal components
-      kalmanParams <- KalmanUpdate(muF[1,,i], CF[1,,,i] + Q, H, R, y)
-      muA[1,,i] <- kalmanParams$m_hat
-      CA[1,,,i] <- kalmanParams$C_hat
-      likA[1,i] <- kalmanParams$L_hat
-      
-      for (j in 2:(dist$n+1)) {
-        kalmanParams <- KalmanUpdate(muF[j,,i], CF[j,,,i], H, R, y)
-        muA[j,,i] <- kalmanParams$m_hat
-        CA[j,,,i] <- kalmanParams$C_hat
-        likA[j,i] <- kalmanParams$L_hat
-      }
-      
-      # no update for gamma params of disturbed components
-      for (j in 2:(dist$n+1)) {
-        gamA[j,,i] <- gamFinal[i,]
-      }
-      
-      # Compute gamma params of undisturbed component via
-      # Gauss-Laguerre quadrature and Newton's method
-      gq <- gauss_laguerre_rate(40, gamFinal[i, 1] - 1, gamFinal[i, 2])
-      
-      f <- function(tau) {
-        Q_tau <- diag(c(Q[1,1], Q[2,2], 1/tau))
-        sd <- sqrt(R + H %*% (CF[1,,,i] + Q_tau) %*% t(H))
-        normalPart <- dnorm(y, mean = H %*% muF[1,,i], sd=sd)
-        gammaFactor <- (gamFinal[i, 2]**gamFinal[i, 1]) / gamma(gamFinal[i, 1])
-        return(gammaFactor * normalPart)
-      }
-      fexp <- function(tau) tau * f(tau)
-      flog <- function(tau) log(tau) * f(tau)
-      
-      f.integral <- integrate_gl(f, gq)
-      tau.exp <- integrate_gl(fexp, gq) / f.integral
-      tau.exp.log <- integrate_gl(flog, gq) / f.integral
-      
-      c.und <- tau.exp.log - log(tau.exp)
-      if (is.finite(c.und) && c.und < 0) {
-        gamA[1,1,i] <- solve_digamma_log(c.und)
-        gamA[1,2,i] <- gamA[1,1,i] / tau.exp
-      } else {
-        # Quadrature gave no usable precision update (Jensen gap below quadrature
-        # resolution); keep this component's prior Gamma params.
-        warning(sprintf("undisturbed Gamma update fell back to prior at t=%d, i=%d (c=%g)",
-                        t, i, c.und))
-        gamA[1,,i] <- gamFinal[i,]
-      }
-      
-      
-      # branch weights = this year's per-class prior probability x data likelihood
-      alphas[1, i] <- dist$p[1, t] * likA[1, i]              # undisturbed
-      for (j in 2:(dist$n + 1)) {
-        alphas[j, i] <- dist$p[j, t] * likA[j, i]            # each disturbance sub-class
-      }
+      ## NOTE: no per-node Pi_K collapse or per-node resample here. Under
+      ## Rao-Blackwellization the carried state is the single tau-marginal Pi_D mixture
+      ## (computed after the g-loop); one ensemble per label is resampled from it below.
+    } # end g
 
+    ## accumulate evidence and compute the tau-node posterior W_g via log-sum-exp
+    logL <- logL + logZ
+    logm <- logw + logL
+    mmax <- max(logm[is.finite(logm)])
+    W <- exp(logm - mmax); W[!is.finite(W)] <- 0; W <- W / sum(W)
+
+    ## final Pi_D: aggregate ALL raw G*K*D Kalman-updated components by label k, each
+    ## weighted by W_g * alpha^{c,k,g}. Uses the uncollapsed components (allk.*) so the
+    ## between-c spread within each (k,g) is retained in Sig.k (not lost to the Pi_K step).
+    eta <- rep(0, D); mu.k <- matrix(0, D, 3); Sig.k <- array(0, dim = c(D, 3, 3))
+    for (k in 1:D) {
+      if (length(allk.alpha[[k]]) == 0) next
+      ws  <- W[allk.node[[k]]] * allk.alpha[[k]]             # W_g * alpha^{c,k,g}
+      sel <- which(ws > 0)
+      if (length(sel) == 0) next
+      coll <- mm(ws[sel], allk.mu[[k]][sel], allk.Sig[[k]][sel])
+      eta[k] <- coll$w; mu.k[k, ] <- coll$mu; Sig.k[k, , ] <- coll$Sigma
     }
+    eta <- eta / sum(eta)
 
-    # compute component weights from this year's prior x likelihood only, so the
-    # weights do not compound across years (no dependence on last year's posterior).
-    component.nc <- sum(alphas)
-    omegaA <- alphas / component.nc
-    
-    # collapse components via moment matching
-    for (g in 1:(dist$n+1)) {
-      sw <- sum(omegaA[g, ])
-      if (!is.finite(sw) || sw <= 0) {   # component weight collapsed: keep prior, weight 0
-        omegaFinal[g] <- 0
-        next
-      }
-      wn <- omegaA[g, ] / sw            # normalized within-component (branch) weights
+    ## ---- carry the tau-MARGINAL Pi_D mixture forward as the next step's D components ----
+    ## Rao-Blackwellization: the carried state is a single node-independent D-component
+    ## Gaussian mixture (not G copies). With the sigma-point forecast the moments ARE the
+    ## state -- no ensemble to resample; the 7 sigma points are regenerated from (bar.mu,
+    ## bar.Sig) next step. Without this the mixture would collapse to the t=1 component.
+    bar.w   <- eta
+    bar.mu  <- mu.k
+    bar.Sig <- Sig.k
 
-      m.g <- 0
-      for (i in 1:(dist$n + 1)) {
-        m.g <- m.g + wn[i] * muA[g,,i]
-      }
-
-      C.g <- 0
-      for (i in 1:(dist$n + 1)) {
-        C.g <- C.g + wn[i] * (CA[g,,,i] + (muA[g,,i] - m.g) %*% t(muA[g,,i] - m.g))
-      }
-
-      tau.exp <- 0
-      tau.logexp <- 0
-      for (i in 1:(dist$n + 1)) {
-        tau.exp <- tau.exp + wn[i] * (gamA[g,1,i] / gamA[g, 2, i])
-        tau.logexp <- tau.logexp + wn[i] * (digamma(gamA[g, 1, i]) - log(gamA[g, 2, i]))
-      }
-      
-      c.g <- tau.logexp - log(tau.exp)
-      if (is.finite(c.g) && c.g < 0) {
-        a.g <- solve_digamma_log(c.g)
-        b.g <- a.g / tau.exp
-      } else {
-        warning(sprintf("collapse Gamma update fell back to prior at t=%d, g=%d (c=%g)", t, g, c.g))
-        a.g <- gamFinal[g,1]
-        b.g <- gamFinal[g,2]
-      }
-
-      muFinal[g,] <- m.g
-      CFinal[g,,] <- C.g
-      gamFinal[g,1] <- a.g
-      gamFinal[g,2] <- b.g
-      omegaFinal[g] <- sw
-      
-    }
-    
-    # update analysis ensemble: reseed each component's IC ensemble from its collapsed
-    # analysis Gaussian N(muFinal[g,], CFinal[g,,]). Symmetrize and add a little noise to
-    # the covariance (additive inflation) so the draw stays positive-definite and the
-    # ensemble spread cannot collapse. Sample via SVD for robustness to near-singular cov.
-    infl <- 0.02                                   # relative noise added per pool
-    for (g in 1:(dist$n+1)) {
-      Cg <- (CFinal[g,,] + t(CFinal[g,,])) / 2     # symmetrize
-      Cg <- Cg + diag((infl * muFinal[g,])^2 + 1e-8, 3)   # add noise for stability
-      Na[,,g] <- mvtnorm::rmvnorm(ne, mean = muFinal[g,], sigma = Cg, method = "svd")
-    }
-    Na <- pmax(Na, 1e-6)                           # keep carbon pools positive
-
-    # record analysis/forecast diagnostics (wood pool = index 3).
-    # muFinal[g,]/CFinal[g,,] are the conditional mean/cov; weight by omegaFinal for mixtures.
-    # Exclude dead components (om == 0) whose stored muFinal is stale.
-    om <- omegaFinal; di <- 2:(dist$n+1)
-    live <- which(om > 0); lived <- di[om[di] > 0]; swd <- sum(om[lived])
+    ## ---- diagnostics (wood/AGB pool = index 3) ----
+    di <- 2:D; swd <- sum(eta[di]); gs <- which.max(eta)
     hist$y[t]                <- y
-    hist$overall.analysis[t] <- sum(om[live] * muFinal[live, 3])  # mixture mean
-    hist$analysis.undist[t]  <- if (om[1] > 0) muFinal[1,3] else NA
-    hist$analysis.dist[t]    <- if (swd > 0) sum(om[lived] * muFinal[lived,3]) / swd else NA
-    gs  <- which.max(om)
-    cm  <- muFinal[gs,3]
-    sdg <- sqrt(max(CFinal[gs,3,3], 0))
+    hist$overall.analysis[t] <- sum(eta * mu.k[, 3])
+    hist$analysis.undist[t]  <- if (eta[1] > 0) mu.k[1, 3] else NA
+    hist$analysis.dist[t]    <- if (swd > 0) sum(eta[di] * mu.k[di, 3]) / swd else NA
+    hist$probD[t]            <- swd
+    cm <- mu.k[gs, 3]; vv <- max(Sig.k[gs, 3, 3], 0)
     hist$ci.mean[t]  <- cm
-    hist$ci.lower[t] <- cm - 1.96*sdg
-    hist$ci.upper[t] <- cm + 1.96*sdg
-    hist$probD[t]    <- swd                                       # posterior prob. of disturbance
-    hist$ci5[t, ]    <- normal_quantile(c(.025,.25,.5,.75,.975), cm, max(CFinal[gs,3,3], 0))
-    hist$forecast.undist[t] <- sum(omega.prev * muF[1,3,])       # branch-weighted, undisturbed
-    fc.d <- 0; for (j in di) fc.d <- fc.d + sum(omega.prev * muF[j,3,])
-    hist$forecast.dist[t]   <- fc.d / dist$n                     # uniform over disturbed classes
+    hist$ci.lower[t] <- cm - 1.96 * sqrt(vv)
+    hist$ci.upper[t] <- cm + 1.96 * sqrt(vv)
+    hist$ci5[t, ]    <- normal_quantile(c(.025, .25, .5, .75, .975), cm, vv)
 
-    ## normalized innovation squared (wood pool): pick the single dominant forecast
-    ## component by POSTERIOR weight (omegaA, after likelihood) so a flagged-but-poorly-
-    ## fitting disturbance class is not forced when the data contradict it. Innovation
-    ## cov = H C^f H^T + R for that one component (undisturbed adds its Q[3,3]).
-    if (all(!is.finite(omegaA)) || max(omegaA, na.rm = TRUE) <= 0) {
-      hist$nis[t] <- NA
-    } else {
-      idx   <- which(omegaA == max(omegaA, na.rm = TRUE), arr.ind = TRUE)[1, ]
-      gstar <- idx[1]; istar <- idx[2]
-      q33 <- if (gstar == 1) { v <- 1/(gamFinal[istar,1]/gamFinal[istar,2]); if (!is.finite(v) || v <= 0) 1e-6 else v } else 0
-      S <- CF[gstar,3,3,istar] + q33 + R
-      hist$nis[t] <- if (is.finite(S) && S > 0) (y - muF[gstar,3,istar])^2 / S else NA
-      ## store the S decomposition so nis.cf + nis.q33 + nis.R == S exactly
-      hist$nis.cf[t]    <- CF[gstar,3,3,istar]
-      hist$nis.q33[t]   <- q33
-      hist$nis.R[t]     <- R
-      hist$nis.innov[t] <- y - muF[gstar,3,istar]
+    ## forecast-mixture means (node-posterior weighted) for reporting
+    fmean <- sapply(1:D, function(k) {
+      ws <- W * fc.w[k, ]; s <- which(ws > 0)
+      if (length(s) == 0) return(NA); sum(ws[s] * fc.mu[k, 3, s]) / sum(ws[s])
+    })
+    fw.k <- sapply(1:D, function(k) sum(W * fc.w[k, ]))
+    hist$forecast.undist[t] <- fmean[1]
+    hist$forecast.dist[t]   <- if (sum(fw.k[di]) > 0) sum(fw.k[di] * fmean[di], na.rm = TRUE) / sum(fw.k[di]) else NA
+
+    ## NIS against the dominant label gs: collapse ITS full set of raw forecast components
+    ## (all c and g, i.e. the label-gs slice of the D*K*G forecast mixture -- not the
+    ## per-node Pi_K collapse), so the between-c spread is retained in S. Each component is
+    ## weighted by W_g * (bar.w[c,g] * beta_gs), where allf.w already holds bar.w*beta_gs.
+    if (!is.na(y)) {
+      ws <- W[allf.node[[gs]]] * allf.w[[gs]]; s <- which(ws > 0)
+      if (length(s) > 0) {
+        fck <- mm(ws[s], allf.mu[[gs]][s], allf.Sig[[gs]][s])
+        S <- fck$Sigma[3, 3] + R
+        ## Decompose the collapsed forecast variance S - R = fck$Sigma[3,3] into the
+        ## process-error part (weighted mean of the components' q33 = Qg[3,3]) and the rest
+        ## (ensemble + between-component spread). Since Sigma[3,3] = ensemble + q33 for each
+        ## component, the weighted-mean q33 is the process share of the collapsed variance.
+        q33.bar <- sum(ws[s] * allf.q33[[gs]][s]) / sum(ws[s])
+        hist$nis[t]     <- if (is.finite(S) && S > 0) (y - fck$mu[3])^2 / S else NA
+        hist$nis.q33[t] <- q33.bar                                  # process-error part
+        hist$nis.cf[t]  <- fck$Sigma[3, 3] - q33.bar                # ensemble + between-comp spread
+        hist$nis.R[t]   <- R
+        hist$nis.innov[t] <- y - fck$mu[3]
+      }
     }
-
-  }
+  } # end t
 
   return(hist)
 }
@@ -595,7 +612,7 @@ run_joint_update_sites <- function(site.idx, Rparams = Rparams.GEDI.het,
                                    useDistProduct = TRUE,
                                    Rparams.source = c("GEDI", "LandTrendr"),
                                    Rparams.model  = c("het", "con"),
-                                   outdir = "experiments/jointUpdateFinal") {
+                                   outdir = "experiments/jointUpdateNewTest") {
   Rparams.source <- match.arg(Rparams.source)
   Rparams.model  <- match.arg(Rparams.model)
   if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
@@ -619,8 +636,8 @@ run_joint_update_sites <- function(site.idx, Rparams = Rparams.GEDI.het,
 
 ```{r}
 ## Run + save for the site(s) of interest.
-# run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.GEDI.het, useDistProduct = TRUE,
-#                        Rparams.source = "GEDI", Rparams.model = "het")
+run_joint_update_sites(site.idx = c(300, 301), Rparams = Rparams.GEDI.het, useDistProduct = FALSE,
+                       Rparams.source = "GEDI", Rparams.model = "het")
 # 
 # run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.GEDI.het, useDistProduct = FALSE,
 #                        Rparams.source = "GEDI", Rparams.model = "het")
@@ -637,11 +654,11 @@ run_joint_update_sites <- function(site.idx, Rparams = Rparams.GEDI.het,
 # run_joint_update_sites(site.idx = seq(504, ne, by=1), Rparams = Rparams.Landtrendr.fixed, useDistProduct = FALSE,
 #                        Rparams.source = "LandTrendr", Rparams.model = "con")
 
-run_joint_update_sites(site.idx = seq(359, ne, by=1), Rparams = Rparams.Landtrendr.het, useDistProduct = TRUE,
-                       Rparams.source = "LandTrendr", Rparams.model = "het")
+# run_joint_update_sites(site.idx = seq(359, ne, by=1), Rparams = Rparams.Landtrendr.het, useDistProduct = TRUE,
+#                        Rparams.source = "LandTrendr", Rparams.model = "het")
 
-run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.Landtrendr.het, useDistProduct = FALSE,
-                       Rparams.source = "LandTrendr", Rparams.model = "het")
+# run_joint_update_sites(site.idx = seq(1, ne, by=1), Rparams = Rparams.Landtrendr.het, useDistProduct = FALSE,
+#                        Rparams.source = "LandTrendr", Rparams.model = "het")
 ```
 
 
@@ -677,6 +694,49 @@ legend("topleft", bty="n", cex=0.8,
            "forecast undist","forecast dist","95% CI (top comp)"),
   col=c("blue","black","forestgreen","firebrick","forestgreen","firebrick","grey70"),
   pch=c(19,NA,NA,NA,NA,NA,15), lty=c(NA,1,1,1,2,2,NA), lwd=c(NA,2,2,2,1,1,NA))
+```
+
+
+```{r}
+## Test the new method on one sample site: overlay the analysis mean + 95% CI band
+## (dominant posterior component) with the yearly wood/AGB observation.
+testdir  <- "experiments/jointUpdateNewTest"
+testsite <- 300
+res <- readRDS(file.path(testdir, sprintf("site_%d_distprod_FALSE_GEDI_het.rds", testsite)))
+
+yr <- dtime[1] + seq_along(res$y) - 1                 # calendar year per timestep (obs end < NT)
+ok <- is.finite(res$ci.lower) & is.finite(res$ci.upper)
+## restrict the shared year axis to years that actually have an observation, so the
+## forecast-only tail doesn't stretch the axis and the CI band stays legible.
+obs  <- is.finite(res$y)
+xlim <- range(yr[obs])
+win  <- yr >= xlim[1] & yr <= xlim[2]                 # timesteps inside the observed window
+ylim <- range(c(res$y[win], res$ci.lower[win], res$ci.upper[win],
+                res$overall.analysis[win]), na.rm = TRUE)
+
+## two stacked panels sharing the year axis: state on top, P(disturbance) below
+op <- par(mfrow = c(2, 1), mar = c(0, 4.5, 3, 1), oma = c(4, 0, 0, 0))
+
+## top: analysis mean + 95% CI band + observation
+plot(yr, res$overall.analysis, type = "n", xlim = xlim, ylim = ylim, xaxt = "n", xlab = "",
+     ylab = "wood / AGB pool (kg C m-2)",
+     main = sprintf("New joint update - site %d", testsite))
+polygon(c(yr[ok], rev(yr[ok])), c(res$ci.lower[ok], rev(res$ci.upper[ok])),
+        col = adjustcolor("grey70", 0.4), border = NA)          # 95% CI band
+lines(yr, res$overall.analysis, col = "black", lwd = 2)         # analysis mean
+points(yr, res$y, pch = 19, col = "blue")                       # yearly observation
+legend("topright", bty = "n", cex = 0.85,
+       legend = c("observation", "analysis mean", "95% CI (dominant comp)"),
+       col = c("blue", "black", "grey70"),
+       pch = c(19, NA, 15), lty = c(NA, 1, NA), lwd = c(NA, 2, NA))
+
+## bottom: posterior probability of disturbance (hist$probD)
+par(mar = c(0, 4.5, 0, 1))
+plot(yr, res$probD, type = "h", lwd = 3, col = "firebrick", xlim = xlim, ylim = c(0, 1),
+     xlab = "", ylab = "P(disturbance)")
+points(yr, res$probD, pch = 19, cex = 0.6, col = "firebrick")
+mtext("year", side = 1, outer = TRUE, line = 2.5)
+par(op)
 ```
 
 

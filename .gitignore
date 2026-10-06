@@ -1,3 +1,7 @@
+# disturbance-specific
+experiments/*
+.DS_Store
+
 # 
 *.tif
 # mac stuff

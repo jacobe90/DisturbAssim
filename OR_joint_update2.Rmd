@@ -1,0 +1,611 @@
+---
+title: "OR_joint_update"
+output: html_document
+author: "Jacob Epstein"
+date: "5/30/26"
+---
+
+```{r}
+library(statmod)
+library(pracma)
+library(BayesianTools)       # VSEM forest model
+source("StatsAuxiliary.R")   # normal_quantile(p, mean, variance)
+source("disturbance.R")      # disturbance.p() forecast perturbation
+## Load disturbance rate, state&transition, disturbed biomass stats
+load("STprior.RData")
+load("extract.h03v04.RData")
+load("dis.postprocessed.RData")
+dtime <- 1985:2012
+colnames(dextract) <- paste0("t",dtime)
+dextract[is.na(dextract)] <- 0
+d.prior["UN"] = d.prior["UN"] + d.prior[6]                         ## change at runtime (removes <NA>)
+d.prior = d.prior[-6]
+
+## Load Calibration
+load("fit.RData")
+Qsoil = Qs
+```
+
+```{r}
+latlon = points@coords # lat / lon of each site in dextract 
+metFile = "daymet.RData"
+if(file.exists(metFile)){
+  load(metFile)
+} else {
+  dm = list()
+  for(i in 1:nrow(latlon)){
+    dm[[i]] = daymetr::download_daymet(site="h03v04",latlon[i,2],latlon[i,1],start=1985,end=2017,internal=TRUE,simplify=TRUE)
+  }
+  save(dm,file=metFile)
+}
+
+## extract Shortwave and convert to daily PAR
+SW2PAR = 0.45
+srad = subset(dm[[1]],measurement == "srad..W.m.2.")   
+metTime <- as.POSIXct(paste(srad$year,srad$yday,sep="-"),format="%Y-%j")
+rad <- matrix(NA,length(dm),length(metTime)) # [number of sites x number of measurements]
+print(dim(rad))
+for(i in seq_along(dm)){
+  srad = subset(dm[[i]],measurement == "srad..W.m.2.")   
+  rad[i,] = srad$value*1e-6*86400*SW2PAR  # -> MJ /m2 /day PAR (convert) # QUESTION -- should the changing day length, from the daymet day length values, be used (instead of a fixed 24-hr day length)?
+}
+plot(metTime,rad[1,],type='l')
+## plot(date,PAR,col=2) ## calibration data
+```
+
+```{r}
+dist <- list()
+dist_name <- c(
+  "0"  = "none",
+  "10" = "other",
+  "20" = "cut",
+  "30" = "road",
+  "40" = "fire",
+  "50" = "biotic"
+)
+
+dist.forecastparams <- list()
+
+count <- 1
+for (dclass in names(dist.priors)) {
+  dist.name <- as.character(dist_name[dclass])
+  nclust <- length(dist.priors[[dclass]]$means)
+  
+  for (i in 1:nclust) {
+    dist.forecastparams[[count]] <- list()
+    dist.forecastparams[[count]]$mu0 <- c(0.2, dist.priors[[dclass]]$means[i])
+    dist.forecastparams[[count]]$V0 <- diag(c(0.04, dist.priors[[dclass]]$vars[i]))
+    dist.forecastparams[[count]]$name <- paste0(dist.name, i)
+    count <- count + 1
+  }
+}
+```
+
+```{r}
+## BIOMASS
+B2C = 0.5 ##biomass to carbon ratio
+Yw <- bextract*B2C*1000*1e-4 ## convert Mg/ha (Mg per hectacre)  to  kg C [356 (num ensemble members) x 28 (num years observed)]
+Rw <- (84*B2C*1000*1e-4)^2 ## Observation Error: Kennedy et al 2018 Environ. Res. Lett. 13 025004; Fig 2 RMSE
+## units: Mg/ha -> kg/m2
+print(dim(Yw))
+## grab the distribution of AGB for the first time point from all pixels
+AGBprior <- Yw[,1]
+ne = length(AGBprior) ## number of ensemble members
+
+## spin up
+PARlong <- as.vector(t(rad)) # concatenate PAR time series for each site into one vector
+spin = VSEM(theta,PARlong) # Question: why run VSEM on the concatenated PAR? What is theta?
+thin = seq(nrow(spin)/2,nrow(spin),length=ne)
+spinIC = spin[thin,2:4] # select ne samples from the spin-up 
+#for(i in 2:4){
+#  hist(spin[thin,i],type='l')
+#}
+
+## disturbance recovery trajectory
+nNBG = 200 ## years
+NBG <- array(NA,c(ne,nNBG,3))
+for(i in 1:ne){
+  param = theta
+  param[9:11] <- spinIC[i,]*c(0.01,1,0.01) ## set leaf and wood to 1% (simulate disturbance)
+  raw = VSEM(param,PARlong[1:(nNBG*365.25)]) # simulate for nNBG years
+  NBG[i,,] = raw[round(seq(365,nNBG*365.25,length=nNBG)),2:4]  ## grab pools at the end of each year
+}
+  
+## for each AGBprior, grab the matching leaf and soil
+ICprior <- matrix(NA,ne,3)
+age = rep(NA,ne)
+for(i in 1:ne){
+  age[i] <- which.min((AGBprior[i]-NBG[i,,3])^2) # age = year in the disturbance recover trajectory where the simulated site has similar AGB to the AGB prior information
+  ICprior[i,] <- c(NBG[i,age[i],1:2],AGBprior[i]) # use AGBprior for the model ICs
+}
+hist(age)
+colnames(ICprior) <- c("Cv","Cs","CR") 
+pairs(ICprior)
+```
+
+```{r}
+
+## ---- Site-independent setup (computed once) --------------------------------
+## Number of disturbance sub-classes and number of assimilation years.
+n.dist = length(dist.forecastparams)
+NT = floor(ncol(rad)/365)
+
+## Background disturbance-type probability per forecast component, by matching
+## the component's name to one of "other"/"cut"/"fire"/"biotic".
+distname.toidx <- list("other"=2, "cut"=3, "fire"=4, "biotic"=5)
+dist.prior.probs <- sapply(dist.forecastparams, function(x) {
+  name <- x$name
+  for (d in names(distname.toidx)) {
+    if (grepl(d, name)) {
+      return(d.prior[distname.toidx[[d]]])
+    }
+  }
+})
+
+## Diagonal process-error covariance (per-pool SDs) and prior process-precision
+## gamma params (a, b) = (shape, rate). Both site-independent.
+Q = diag(c(Ql,Qsoil,Qw)^2)
+a <- 1/0.1172475
+b <- 1
+gamInit <- c(a, b)
+
+## Default heteroskedastic Rparams for GEDI (slope, intercept).
+Rparams.GEDI.het <- c(0.01331, 0.09761)
+Rparams.GEDI.fixed <- c(0.0000000, 0.8848249)
+Rparams.Landtrendr.het <- c(0.013310, 3.012645)
+Rparams.Landtrendr.fixed <- c(0.000, 3.79986)
+
+## ---- Per-site argument builder ---------------------------------------------
+## make_or_args(site, useDistProduct) assembles the site-specific inputs to
+## ORJointUpdate: the (n.dist+1) x NT prior probability matrix p.dist (row 1 =
+## undisturbed, rows 2.. = disturbance sub-classes), the bundled disturb.params,
+## the NT x 3 observation matrix Y (wood-pool obs in column 3), and the PAR
+## driver for that site. Relies on the site-independent globals above plus
+## d.prior, dist.priors, dist.forecastparams, dextract, Yw and rad.
+## tauPrior selects the prior on the process precision tau:
+##   "gamma"      : Gamma(shape = 0.1, rate = 2e-4), which spreads mass over every
+##                  decade of the grid (mean tau = 500)
+##   "loguniform" : p(tau) proportional to 1/tau (flat in log tau)
+make_or_args <- function(site, useDistProduct = TRUE, tauPrior = c("gamma", "loguniform")) {
+  tauPrior <- match.arg(tauPrior)
+  ## Initialize every year with the background prior (same column for all t).
+  p.dist <- array(NA, dim = c(n.dist + 1, NT))
+  for (t in 1:NT) {
+    p.dist[1:(n.dist+1), t] <- as.numeric(c(d.prior[1], unlist(dist.prior.probs)))
+  }
+
+  ## If using the disturbance product, override the prior in years where a
+  ## disturbance was detected at this site: replace that class's prior with the
+  ## user's-accuracy estimate (Kennedy et al. 2015 table 6). Then give each
+  ## component a share of the disturbance probability proportional to its weight,
+  ## and the disturbed values to sum to 1 if they sum to greater than 1, and else
+  ## set the undisturbed value to 1 - p(disturbed).
+  ## within-class mixture weights (mclust proportions; sum to 1 within each class)
+  weights <- unlist(sapply(dist.priors, function(x) x$weights))
+
+  if (useDistProduct) {
+    distidx.toname = list("10"="OTHER", "20"="CUT", "40"="FIRE", "50"="PEST")
+    users_accuracy = c(1-d.prior[1], .77, .92, .77, .78, .78) ## 0 = none, 10 = other, 20 = cut, 30 = road, 40 = fire, 50 = biotic
+
+    for (d in seq(names(dist.priors))) {
+      d.name <- names(dist.priors)[d]
+      has.dist <- which(dextract[site,] == d.name)
+      if (length(has.dist) > 0) {
+        is.dist <- which(names(dist.prior.probs) == distidx.toname[[d.name]]) + 1
+        p.dist[is.dist, has.dist] <- users_accuracy[dextract[site, has.dist]/10 + 1]
+      }
+    }
+  }
+
+  ## Build the per-year categorical prior for BOTH the product and no-product paths:
+  ## split each class's probability across its clusters via `weights` (so multi-cluster
+  ## classes are not over-counted), then set the undisturbed prior to the remaining mass
+  ## (= 1 - product accuracy in flagged years, = background otherwise). Applying this on
+  ## the no-product path too means an UNflagged year has the same prior with or without
+  ## the product -- the product only changes flagged years. Previously this lived inside
+  ## the useDistProduct branch, so the no-product path kept an un-split, over-counted
+  ## disturbance background that inflated probD relative to the product on unflagged sites.
+  for (j in 1:ncol(p.dist)) {
+    p.dist[2:(n.dist+1), j] <- p.dist[2:(n.dist+1), j] * weights   # split class prob across clusters
+    dist.mass <- sum(p.dist[2:(n.dist+1), j])
+    if (dist.mass > 1) {                                           # guard: cap total disturbed mass at 1
+      p.dist[2:(n.dist+1), j] <- p.dist[2:(n.dist+1), j] / dist.mass
+      dist.mass <- 1
+    }
+    p.dist[1, j] <- 1 - dist.mass                                  # undisturbed = remaining mass
+  }
+
+  ## Bundle the disturbance prior + per-class forecast params.
+  disturb.params <- list(
+    p = p.dist,
+    n = n.dist,
+    vals = dist.forecastparams,
+    alloc.soil = 0.05
+  )
+
+  ## NT x 3 observation matrix with the wood-pool obs in column 3.
+  Y <- matrix(NA, NT, 3)
+  Y[1:ncol(Yw), 3] <- Yw[site, ]
+  Y <- Y[!is.na(Y[,3]),,drop=FALSE] # drop rows with wood-pool=NA
+  
+  ## tau prior and grid
+  prior <- switch(tauPrior,
+    gamma      = list(type = "gamma", shape = 0.1, rate = 2e-4),
+    loguniform = list(type = "loguniform"))
+  grid <- list(tauMin = 0.1, tauMax = 10^4)
+  list(Y = Y, disturb.params = disturb.params, PAR = rad[site, ], site = site, prior = prior, grid = grid)
+}
+```
+
+```{r}
+# Helper functions for ORJointUpdate
+
+KalmanUpdate <- function(m, C, H, R, y) {
+  S <- H %*% C %*% t(H) + R
+  K <- C %*% t(H) %*% solve(S)
+  m_hat <- m + K %*% (y - H %*% m)
+  C_hat <- (diag(nrow(C)) - K %*% H) %*% C
+  L_hat <- dnorm(y, mean = H %*% m, sd = sqrt(S))
+  
+  return(list(m_hat=m_hat, C_hat=C_hat, L_hat=L_hat))
+}
+
+# Initial tau weights: grid point g gets the prior mass of its cell,
+#   int_{lo_g}^{hi_g} p(tau) dtau,  lo_g = tau_g - (tau_g - tau_{g-1})/2,  hi_g = tau_g + (tau_{g+1} - tau_g)/2,
+# i.e. the cell edges are the midpoints to the neighbouring grid points, so the cell
+# width follows the grid spacing. The edge cells stop at tau_1 and tau_G and the
+# weights are renormalised (the prior is truncated to the grid range).
+cell_prior_mass <- function(tauGrid, prior) {
+  G   <- length(tauGrid)
+  mid <- (tauGrid[-G] + tauGrid[-1]) / 2
+  lo  <- c(tauGrid[1], mid)
+  hi  <- c(mid, tauGrid[G])
+  cdf <- switch(prior$type,
+    gamma      = function(x) pgamma(x, shape = prior$shape, rate = prior$rate),
+    loguniform = function(x) log(x))
+  m <- cdf(hi) - cdf(lo)
+  m / sum(m)
+}
+
+# moment matching procedure to project down to mixture of two gaussians
+project <- function(w, l, mu, sig, D) {
+  w1 <- 0
+  for (j in 1:2) {
+    w1 <- w1 + w[j,1]
+  }
+  w2 <- 1 - w1
+  alpha <- w
+  for (j in 1:2) {
+    for (k in 0:D) {
+      if (k == 0) {
+        alpha[j,k+1] <- w[j,k+1] / w1
+      } else {
+        alpha[j,k+1] <- w[j,k+1] / w2
+      }
+    }
+  }
+  mu1 <- alpha[1,1] * mu[1,1,] + alpha[2,1] * mu[2,1,]
+  sig1 <- array(0, dim=c(3,3))
+  for (j in 1:2) {
+    sig1 <- sig1 + alpha[j,1] * (tcrossprod(mu[j,1,]) + sig[j,1,,])
+  }
+  sig1 <- sig1 - tcrossprod(mu1)
+  mu2 <- array(0, dim=c(3))
+  for (j in 1:2) {
+    for (k in 1:D) {
+      mu2 <- mu2 + alpha[j,k+1] * mu[j,k+1,]
+    }
+  }
+  sig2 <- array(0, dim=c(3,3))
+  for (j in 1:2) {
+    for (k in 1:D) {
+      sig2 <- sig2 + alpha[j,k+1] * (tcrossprod(mu[j,k+1,]) + sig[j,k+1,,])
+    }
+  }
+  sig2 <- sig2 - tcrossprod(mu2)
+  return(list(w1=w1,w2=w2,mu1=mu1,mu2=mu2,sig1=sig1,sig2=sig2))
+  
+}
+```
+
+```{r}
+##' Approximate joint disturbance update
+##'
+##' @param gamInit c(a, b) Gamma prior (shape, rate) for tau
+##' @param Y NT x 3 observations (wood/AGB pool in column 3; NA => forecast-only step)
+##' @param Rparams c(slope, intercept): observation error R = y*slope + intercept
+##' @param Q process-error covariance; Q[1,1],Q[2,2] used for foliage/soil, Q[3,3] set to 1/tau_g
+##' @param PAR daily PAR driver (length NT*365)
+##' @param Xic J x 3 initial-condition ensemble (ICprior)
+##' @param THETA VSEM parameter vector/matrix (cols 9:11 overwritten with the IC ensemble)
+##' @param dist disturbance list: p (D+1 x NT prior), n (# classes), vals (per-class mu0/V0), alloc.soil
+##' @param G number of precision values in the grid
+##' @param N ensemble size
+##' @param prior prior for tau: list(type = "gamma", shape, rate) or list(type = "loguniform")
+##' @param grid list(tauMin, tauMax) for the log-spaced tau grid
+##' @return list of length-NT vectors, each marginalised over the tau grid with the
+##'   tau posterior pi_t(g) and over the mixture components (j, k):
+##'   mean  = analysis mean of the wood pool
+##'   var   = analysis variance of the wood pool (law of total variance)
+##'   pDist = posterior probability of disturbance
+ORJointUpdate <- function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, prior, grid) {
+  NT <- dim(Y)[1]
+  D  <- dist$n                      # number of disturbance sub-classes
+  icMean <- colMeans(Xic)
+  icCov <- cov(Xic)
+  
+  # initialize grid
+  tauGrid <- exp(seq(log(grid$tauMin), log(grid$tauMax), length.out = G)) # log-spaced grid
+  # tauGrid <- seq(grid$tauMin, grid$tauMax, length.out = G)
+  
+  # initial tau weights: log prior mass of each grid cell (see cell_prior_mass)
+  qs <- log(cell_prior_mass(tauGrid, prior))
+  prevW <- array(0.5, dim=c(G, 2))
+  prevMu <- array(0, dim=c(G, 2, 3))
+  prevSig <- array(0, dim=c(G, 2, 3, 3))
+  for (i in 1:G) {
+    for (j in 1:2) {
+      prevMu[i,j,] <- icMean
+      prevSig[i,j,,] <- icCov
+    }
+  }
+  
+  hist <- list(
+    mean  = rep(NA_real_, NT),   # wood-pool analysis mean
+    var   = rep(NA_real_, NT),   # wood-pool analysis variance
+    pDist = rep(NA_real_, NT)    # P(disturbed)
+  )
+  
+  for (t in 1:NT) {
+    # sample from proposal distribution
+    propSamples <- array(0, dim=c(N, 3))
+    n <- 1L; tries <- 0L
+    while (n <= N) {
+      tries <- tries + 1L
+      i <- sample.int(G, 1L); j <- sample.int(2L, 1L)
+      x <- mvnfast::rmvn(1, prevMu[i,j,], prevSig[i,j,,])
+      if (all(x > 0)) { propSamples[n, ] <- x; n <- n + 1L }
+      if (tries > 100L * N) stop(sprintf("t=%d: proposal rejection rate too high", t))
+    }
+    
+    muF <- array(0, dim=c(G, 2, D+1, 3))
+    sigF <- array(0, dim=c(G, 2, D+1, 3, 3))
+    tsel = (t-1)*365 + 1:365
+    ## ---- once per timestep ----
+
+    # 1. VSEM is deterministic in THETA -> identical for every k
+    sim0 <- matrix(0, N, 3)
+    for (n in seq_len(N)) {
+      THETA[9:11] <- propSamples[n, ]
+      sim0[n, ]   <- VSEM(THETA, PAR = PAR[tsel])[365, 2:4]
+    }
+    
+    # 2. flatten (g,j) -> r, cache the Cholesky factors
+    P        <- 2L * G
+    compMu   <- matrix(0, P, 3)
+    compChol <- vector("list", P)
+    for (j in 1:2) for (g in 1:G) {
+      r <- (j - 1L) * G + g
+      compMu[r, ]   <- prevMu[g, j, ]
+      compChol[[r]] <- chol(prevSig[g, j, , ])
+    }
+    
+    # 3. one P x N density matrix, vectorized over samples
+    logDens <- matrix(0, P, N)
+    for (r in seq_len(P)) {
+      logDens[r, ] <- mvnfast::dmvn(propSamples, compMu[r, ], compChol[[r]],
+                                    log = TRUE, isChol = TRUE)
+    }
+    
+    # 4. proposal density and all weights, in log space
+    mx      <- apply(logDens, 2, max)
+    logProp <- mx + log(colSums(exp(sweep(logDens, 2, mx)))) - log(P)
+    logW    <- sweep(logDens, 2, logProp)
+    W       <- exp(logW - apply(logW, 1, max))
+    W       <- W / rowSums(W)          # P x N, rows sum to 1
+    cN      <- 1 - rowSums(W^2)        # P
+    
+    for (k in 0:D) {
+      sim <- sim0
+      if (k > 0) {
+        mu0 <- dist$vals[[k]]$mu0
+        V0  <- dist$vals[[k]]$V0
+        for (n in seq_len(N)) sim[n, ] <- disturbance.p(sim[n, ], mu0, V0, dist$alloc.soil)
+      }
+    
+      MU <- W %*% sim                              # P x 3, every mean in one matmul
+    
+      for (r in seq_len(P)) {
+        g  <- (r - 1L) %%  G + 1L
+        j  <- (r - 1L) %/% G + 1L
+        Sc <- sweep(sim, 2, MU[r, ])
+        S  <- crossprod(Sc, W[r, ] * Sc) / cN[r]
+        if (k == 0) {
+          S <- S + Q
+          S[3, 3] <- S[3, 3] - Q[3, 3] + 1 / tauGrid[g]
+        }
+        muF[g, j, k + 1, ]    <- MU[r, ]
+        sigF[g, j, k + 1, , ] <- S
+      }
+    }
+    
+    # compute analysis
+    lA <- array(0, dim=c(G, 2, D+1))
+    muA <- array(0, dim=c(G, 2, D+1, 3))
+    sigA <- array(0, dim=c(G, 2, D+1, 3, 3))
+    H  <- matrix(c(0, 0, 1), 1, 3)
+    R <- Y[t, 3] * Rparams[1] + Rparams[2] # heteroskedastic obs error
+    for (j in 1:2) {
+      for (k in 0:D) {
+        for (g in 1:G) {
+          out <- KalmanUpdate(muF[g,j,k+1,], sigF[g,j,k+1,,], H, R, Y[t, 3])
+          muA[g,j,k+1,] <- out$m_hat
+          sigA[g,j,k+1,,] <- out$C_hat
+          lA[g,j,k+1] <- out$L_hat
+        }
+      }
+    }
+    
+    # compute tau posterior on grid
+    beta <- array(0, dim=c(D+1))
+    for (k in 0:D) {
+      beta[k+1] = dist$p[k+1,t]
+    }
+    logz <- array(0, dim=c(G))
+    for (g in 1:G) {
+      zsum <- 0
+      for (j in 1:2) {
+        for (k in 0:D) {
+          zsum <- zsum + prevW[g,j] * beta[k+1] * lA[g,j,k+1]
+        }
+      }
+      logz[g] <- log(zsum)
+      qs[g] <- qs[g] + logz[g]
+    }
+    
+    # tau posterior on the grid, pi_t(g)
+    m <- max(qs)
+    ws <- exp(qs - m) / sum(exp(qs - m))
+    
+    # analysis weights
+    wA <- array(0, dim=c(G, 2, D+1))
+    for (g in 1:G) {
+      for (j in 1:2) {
+        for (k in 0:D) {
+          wA[g,j,k+1] <- prevW[g,j] * beta[k+1] * lA[g,j,k+1] / exp(logz[g])
+        }
+      }
+    }
+    
+    # recompute prev posterior vals (KL projection)
+    for (g in 1:G) {
+      out <- project(wA[g,,], lA[g,,], muA[g,,,], sigA[g,,,,], D)
+      prevW[g,1] <- out$w1
+      prevW[g,2] <- out$w2
+      prevMu[g,1,] <- out$mu1
+      prevMu[g,2,] <- out$mu2
+      prevSig[g,1,,] <- out$sig1
+      prevSig[g,2,,] <- out$sig2
+    }
+    
+    # store analysis values for this tstep, marginalised over the tau grid (weights
+    # pi_t(g) = ws) and the components (j, k) (weights wA[g, , ], which sum to 1 for each g)
+    pDist.g <- apply(wA[, , -1, drop = FALSE], 1, sum)                  # P_t(g)
+    mean.g  <- apply(wA * muA[, , , 3], 1, sum)                           # E[wood | g]
+    msq.g   <- apply(wA * (sigA[, , , 3, 3] + muA[, , , 3]^2), 1, sum)   # E[wood^2 | g]
+    hist$mean[t]  <- sum(ws * mean.g)
+    hist$var[t]   <- sum(ws * msq.g) - hist$mean[t]^2
+    hist$pDist[t] <- sum(ws * pDist.g)
+  }
+  
+  return(hist)
+}
+
+```
+
+```{r}
+## Generate ORJointUpdate inputs for each requested site, run the joint update,
+## and save each site's diagnostics to experiments/jointUpdate. Returns the
+## results invisibly (keyed by site) for convenience.
+## Rparams.source ("GEDI"/"LandTrendr") and Rparams.model ("het"/"con") describe the
+## observation-error parameters in use; together with tauPrior ("gamma"/"loguniform")
+## they are recorded in each output filename.
+run_joint_update_sites <- function(site.idx, Rparams = Rparams.GEDI.het,
+                                   useDistProduct = TRUE,
+                                   tauPrior = c("gamma", "loguniform"),
+                                   Rparams.source = c("GEDI", "LandTrendr"),
+                                   Rparams.model  = c("het", "con"),
+                                   outdir = "experiments/jointUpdateTestSep") {
+  Rparams.source <- match.arg(Rparams.source)
+  Rparams.model  <- match.arg(Rparams.model)
+  tauPrior       <- match.arg(tauPrior)
+  if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
+  results <- list()
+  for (site in site.idx) {
+    message("running joint update for site ", site)
+    # function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, prior)
+    args <- make_or_args(site, useDistProduct, tauPrior)
+    out <- ORJointUpdate(Y = args$Y, Rparams = Rparams,
+                         Q = Q, PAR = args$PAR, Xic = ICprior,
+                         THETA = theta[1:11], dist = args$disturb.params, prior=args$prior,
+                         grid = args$grid)
+    fname <- file.path(outdir,
+                       sprintf("site_%d_distprod_%s_%s_%s_tau%s.rds",
+                               site, useDistProduct, Rparams.source, Rparams.model, tauPrior))
+    saveRDS(out, fname)
+    results[[as.character(site)]] <- out
+  }
+  invisible(results)
+}
+```
+
+```{r}
+## Run + save for the site(s) of interest.
+## tauPrior = "gamma" or "loguniform" selects the prior on the process precision tau.
+run_joint_update_sites(site.idx = c(300), Rparams = Rparams.GEDI.het, useDistProduct = TRUE,
+                       tauPrior = "loguniform", Rparams.source = "GEDI", Rparams.model = "het")
+```
+
+## analysis
+
+```{r}
+## Load a saved ORJointUpdate run. The site index and run settings are parsed from
+## the file name (site_<idx>_distprod_<TF>_<source>_<model>_tau<prior>.rds), and the
+## matching wood-pool observations are taken from Yw (same NA handling as make_or_args).
+load_hist <- function(file) {
+  h     <- readRDS(file)
+  tag   <- sub("\\.rds$", "", basename(file))
+  site  <- as.integer(sub("^site_(\\d+)_.*$", "\\1", tag))
+  obs   <- Yw[site, ]
+  h$obs  <- obs[!is.na(obs)]
+  h$year <- dtime[seq_along(h$mean)]
+  h$site <- site
+  h$tag  <- tag
+  h
+}
+
+## shared look: one palette, light grid, no box
+.pal <- list(mean = "#2a78d6", band = "#2a78d6", obs = "#0b0b0b", dist = "#eb6834",
+             grid = "#e6e6e3", ink = "#52514e")
+.base_par <- function() par(mar = c(4.2, 4.8, 3.2, 1), las = 1, bty = "n",
+                            col.axis = .pal$ink, fg = .pal$ink, cex.axis = 0.9)
+
+## Wood-pool analysis: mean (line), 95% interval mean +/- 1.96 sd (band), observations (points)
+plot_analysis <- function(h, main = sprintf("Site %d: wood-pool analysis", h$site)) {
+  op <- .base_par(); on.exit(par(op))
+  x  <- h$year; sd <- sqrt(pmax(h$var, 0))
+  lo <- h$mean - 1.96 * sd; hi <- h$mean + 1.96 * sd
+  plot(NA, xlim = range(x), ylim = range(c(lo, hi, h$obs), na.rm = TRUE),
+       xlab = "year", ylab = expression("wood carbon (kg C m"^-2*")"), main = main)
+  abline(h = axTicks(2), col = .pal$grid)
+  polygon(c(x, rev(x)), c(lo, rev(hi)), col = adjustcolor(.pal$band, 0.2), border = NA)
+  lines(x, h$mean, col = .pal$mean, lwd = 2.5)
+  points(x[seq_along(h$obs)], h$obs, pch = 21, bg = .pal$obs, col = "white", cex = 1.1)
+  legend("topright", bty = "n", cex = 0.85, text.col = .pal$ink,
+         legend = c("analysis mean", "95% interval", "observation"),
+         col = c(.pal$mean, adjustcolor(.pal$band, 0.35), .pal$obs),
+         lwd = c(2.5, 10, NA), pch = c(NA, NA, 16))
+  invisible(h)
+}
+
+## Posterior probability of disturbance per year (bars), with the 0.5 line
+plot_pdist <- function(h, main = sprintf("Site %d: probability of disturbance", h$site)) {
+  op <- .base_par(); on.exit(par(op))
+  x <- h$year; p <- h$pDist
+  plot(NA, xlim = range(x) + c(-0.6, 0.6), ylim = c(0, 1), xlab = "year",
+       ylab = "P(disturbed)", main = main)
+  abline(h = seq(0, 1, 0.25), col = .pal$grid)
+  abline(h = 0.5, col = .pal$ink, lty = 2)
+  rect(x - 0.38, 0, x + 0.38, p, col = .pal$dist, border = NA)
+  big <- which(p >= 0.5)
+  if (length(big)) text(x[big], p[big], sprintf("%.2f", p[big]), pos = 3, cex = 0.75,
+                        col = .pal$ink, xpd = NA)
+  invisible(h)
+}
+```
+
+```{r, fig.width = 9, fig.height = 4.5}
+h <- load_hist("experiments/jointUpdateTestSep/site_300_distprod_TRUE_GEDI_het_taugamma.rds")
+plot_analysis(h)
+plot_pdist(h)
+```
