@@ -4,31 +4,43 @@ output: html_document
 author: "Jacob Epstein"
 ---
 
-Postprocessing + analyses for the joint-update runs saved by
-`run_joint_update_sites()` in `OR_joint_update.Rmd`. Each run is an `hist` list
-saved to `experiments/jointUpdate/site_<idx>_distprod_<TF>_<source>_<model>.rds`,
-containing per-timestep vectors `probD`, `overall.analysis`, and the 5-quantile
-wood-pool CI matrix `ci5`.
+Postprocessing + analyses for the joint-update runs saved by the experiment grid in
+`OR_joint_update2.Rmd`. Each run is the `hist` list returned by `ORJointUpdate`, saved
+to `<indir>/site_<idx>_distprod_<TF>_<source>_<model>_tau<prior>.rds`, with per-timestep
+
+* `year`, `obs`: calendar year of each DA timestep and the assimilated observation;
+* `mean`, `var`, `ci95`: wood-pool analysis mean, variance and 95% interval (2.5% / 97.5%
+  quantiles of the analysis mixture), marginalised over the tau posterior and the
+  mixture components;
+* `pDist`: posterior probability of disturbance;
+* `pit`: probability integral transform of each observation under its one-step-ahead
+  predictive (before that observation is assimilated, integrating over process error).
+
+The formulas are written up in `claude-working-docs/or_joint_update2_analysis_plots.pdf`.
 
 ## set up
 
 ```{r}
 B2C <- 0.5
 load("extract.h03v04.RData")                 # bextract, dextract, points
+## The products cover different years, so every lookup goes through calendar year:
+##   dextract (disturbance product): 1985:2012
+##   bextract (biomass / Yw):        1990:2017
+##   DA timesteps:                   stored per run in hist$year (1990:2017)
 dtime <- 1985:2012
+ctime <- 1990:2017
 colnames(dextract) <- paste0("t", dtime)
 dextract[is.na(dextract)] <- 0
 Yw <- bextract * B2C * 1000 * 1e-4            # nsite x nyears observed
+colnames(Yw) <- paste0("t", ctime)
 
-indir <- "experiments/jointUpdateFinal"
-t04 <- 20          # reference disturbance-assessment timestep (fixed reference year)
-tlo <- 28          # last-observation timestep
-qprobs <- c(0.025, 0.25, 0.5, 0.75, 0.975)
+indir   <- "experiments/testRun"
+yr.dist <- 2004               # disturbance-assessment year
 
-## turn an experiment label (e.g. "distprod_TRUE_GEDI_het") into a readable title
+## turn an experiment label (e.g. "distprod_TRUE_GEDI_het_taugamma") into a readable title
 ## (e.g. "Disturbance Product, Heteroskedastic R (GEDI magnitude)").
 pretty.exp <- function(e) {
-  p    <- strsplit(e, "_", fixed = TRUE)[[1]]   # distprod, TRUE/FALSE, source, het/con
+  p    <- strsplit(e, "_", fixed = TRUE)[[1]]   # distprod, TRUE/FALSE, source, het/con, tau<prior>
   prod <- if (length(p) >= 2 && p[2] == "TRUE") "Disturbance Product" else "No Disturbance Product"
   src  <- if (length(p) >= 3) p[3] else "?"
   rmod <- if (length(p) >= 4 && p[4] == "het") "Heteroskedastic R" else "Constant R"
@@ -40,514 +52,241 @@ pretty.exp <- function(e) {
 
 ```{r}
 ## Detect the joint-update run files and parse site index + experiment label
-## (experiment = distprod + Rparams source + model, e.g. "distprod_TRUE_GEDI_het").
+## (experiment = distprod + Rparams source + model + tau prior).
 runs  <- dir(indir, pattern = "^site_.*\\.rds$")
 parts <- strsplit(sub("\\.rds$", "", runs), "_", fixed = TRUE)
 sites <- sapply(parts, function(x) as.numeric(x[2]))
 exp   <- sapply(parts, function(x) paste(x[3:length(x)], collapse = "_"))
-exps  <- unique(exp)
+exps  <- sort(unique(exp))
 print(exps)
 
+nsite <- nrow(dextract)
 elist <- list()
 for (i in seq_along(exps)) {
-  esel  <- which(exp == exps[i])
-  nsite <- nrow(dextract)
-  distrate   <- rep(NA, nsite)                              # posterior prob. of disturbance
-  nisbar     <- rep(NA, nsite)                              # per-site average NIS over timesteps
-  cfbar      <- q33bar <- Rbar <- rep(NA, nsite)            # per-site mean S components
-  innov2bar  <- rep(NA, nsite)                              # per-site mean squared innovation
-  predist    <- distsize <- divergence <- matrix(NA, nsite, 6)  # mean + 5 quantiles
-  for (j in seq_along(esel)) {
-    k   <- sites[esel[j]]
-    ## skip stale runs whose site index exceeds the current dextract (e.g. runs made
-    ## with a 559-row extract while the loaded extract has fewer rows). Without this,
-    ## distrate[k] silently grows the vector past nsite, mismatching obs.* lengths.
-    if (is.na(k) || k < 1 || k > nsite) next
-    res <- readRDS(file.path(indir, runs[esel[j]]))
+  esel <- which(exp == exps[i])
+  pdist04 <- div <- pitT <- obsT <- rep(NA, nsite)
+  pit.all <- c()
+  for (j in esel) {
+    k <- sites[j]
+    if (is.na(k) || k < 1 || k > nsite) next     # skip runs from a different extract
+    res <- readRDS(file.path(indir, runs[j]))
+    if (is.null(res$year)) stop(runs[j], ": no $year axis -- stale run from before the 1990 alignment fix; rerun it")
+    if (is.null(res$ci95)) stop(runs[j], ": no $ci95 -- run from before the filter-divergence change; rerun it")
 
-    ## detection rate at the assessment year
-    distrate[k]      <- res$probD[t04]
+    ## detection: posterior P(disturbed) in 2004
+    pdist04[k] <- res$pDist[res$year == yr.dist]
 
-    ## average normalized innovation squared over observed timesteps
-    nisbar[k]        <- mean(res$nis, na.rm = TRUE)
+    ## filter divergence at the last observed timestep T:
+    ## (y_T - analysis mean) / (half the width of the 95% analysis interval)
+    tT      <- max(which(!is.na(res$obs)))
+    obsT[k] <- res$obs[tT]
+    div[k]  <- (res$obs[tT] - res$mean[tT]) / ((res$ci95[tT, "hi"] - res$ci95[tT, "lo"]) / 2)
 
-    ## per-site mean innovation-variance components (S = CF + q33 + R)
-    cfbar[k]         <- mean(res$nis.cf,  na.rm = TRUE)
-    q33bar[k]        <- mean(res$nis.q33, na.rm = TRUE)
-    Rbar[k]          <- mean(res$nis.R,   na.rm = TRUE)
-
-    ## mean squared innovation (numerator of NIS) over observed timesteps
-    innov2bar[k]     <- mean(res$nis.innov^2, na.rm = TRUE)
-
-    ## capture of the disturbance change (pre / during)
-    predist[k, 1]    <- res$overall.analysis[t04 - 1]; predist[k, 2:6]    <- res$ci5[t04 - 1, ]
-    distsize[k, 1]   <- res$overall.analysis[t04];     distsize[k, 2:6]   <- res$ci5[t04, ]
-
-    ## filter divergence at the last observation
-    divergence[k, 1] <- res$overall.analysis[tlo];     divergence[k, 2:6] <- res$ci5[tlo, ]
+    ## PIT of the last observation under its one-step-ahead predictive, and all PITs
+    pitT[k] <- res$pit[tT]
+    pit.all <- c(pit.all, res$pit[!is.na(res$pit)])
   }
-  elist[[exps[i]]] <- list(distrate = distrate, nisbar = nisbar,
-                           cfbar = cfbar, q33bar = q33bar, Rbar = Rbar,
-                           innov2bar = innov2bar,
-                           predist = predist,
-                           distsize = distsize, divergence = divergence)
+  elist[[exps[i]]] <- list(pdist04 = pdist04, div = div, pitT = pitT, obsT = obsT,
+                           pit.all = pit.all)
 }
 
-## grab matching observations
-obs.pre   <- Yw[, t04 - 1]            # observation before disturbance
-obs.dist  <- Yw[, t04]               # observation during disturbance
-obs.tlo   <- Yw[, tlo]               # observation at last timestep
-obs.class <- dextract[, "t2004"] / 10
-save(elist, obs.pre, obs.dist, obs.tlo, obs.class,
+## matching observations
+obs.pre   <- Yw[, paste0("t", yr.dist - 1)]   # 2003 AGB
+obs.dist  <- Yw[, paste0("t", yr.dist)]       # 2004 AGB
+distabs   <- obs.pre - obs.dist               # absolute AGB change 2003 -> 2004 (loss > 0)
+obs.class <- dextract[, paste0("t", yr.dist)] / 10   # 2004 disturbance-product label
+save(elist, obs.pre, obs.dist, obs.class, distabs,
      file = file.path(indir, "elist.RData"))
 ```
 
 ## analyses
 
+Summary PDF: one page per plot, every experiment drawn as its own panel with shared
+axes. Points are coloured by the 2004 disturbance-product label.
+
 ```{r}
-pdf(file.path(indir, "exps_diagnostics.pdf"))
-trim <- function(x, lo = 0.0001, hi = 0.9999) {
-  x[x < lo] <- lo
-  x[x > hi] <- hi
-  return(x)
-}
-betatrim <- function(y) {
-  n.obs <- sum(!is.na(y))
-  (y * (n.obs - 1) + 0.5) / n.obs
-}
-## betareg can fail (e.g. chol "leading minor not positive") on a degenerate experiment
-## where the detection probabilities are near-constant; don't let one bad fit abort the
-## whole chunk -- return NULL and let downstream code skip its curve.
+classnames  <- c("other", "cut", "road", "fire", "biotic")          # codes 10..50
+class.cols  <- c("grey60", "black", "red", "green3", "blue", "cyan")  # index = class + 1
+pt.col      <- class.cols[obs.class + 1]
+class.vals  <- sort(unique(obs.class[obs.class != 0]))
+legend.labels <- c("undisturbed", classnames[class.vals])
+legend.cols   <- c(class.cols[1], class.cols[class.vals + 1])
+
+nexp <- length(exps)
+grid <- c(2, ceiling(nexp / 2))
+has  <- lapply(elist, function(e) which(is.finite(e$div)))   # sites run per experiment
+all.sites <- sort(unique(unlist(has)))
+pct  <- function(x) sprintf("%.0f%%", 100 * mean(x, na.rm = TRUE))
+
+## beta regression of P(detect) on disturbance size, fitted only with enough sites
+betatrim <- function(y) { n <- sum(!is.na(y)); (y * (n - 1) + 0.5) / n }
 safe.betareg <- function(...) {
   tryCatch(betareg::betareg(...),
            error = function(e) { warning("betareg failed: ", conditionMessage(e)); NULL })
 }
+min.fit.sites <- 20
 stats <- list()
-
-classnames <- c("other", "cut", "road", "fire", "biotic")  # disturbance types
-class_vals <- sort(unique(obs.class))
-class_vals <- class_vals[class_vals != 0]                   # drop 0 (no disturbance)
-classes_in_data <- classnames[class_vals]
-
-## colour by disturbance class; offset by 1 so class 0 (undisturbed) isn't col 0,
-## which base R draws in the (invisible) background colour.
-class.cols <- c("grey70", "black", "red", "green3", "blue", "cyan", "magenta")  # index = class+1
-pt.col <- class.cols[obs.class + 1]
-
-## legend entries for the point colours: undisturbed (class 0) + the disturbance
-## classes actually present in the data.
-legend.labels <- c("undisturbed", classes_in_data)
-legend.cols   <- c(class.cols[1], class.cols[class_vals + 1])
-
-## 95% interval for the mean of n.obs per-step NIS values (chi-sq_N / N)
-n.obs  <- ncol(Yw)
-nis.ci <- qchisq(c(0.025, 0.975), df = n.obs) / n.obs
-
 for (i in seq_along(exps)) {
-  ## normalized innovation squared (per-site average; replaces filter divergence)
-  div = elist[[i]]$nisbar
-  div.reg    = lm(div ~ obs.tlo)
-  div.median = median(div, na.rm = TRUE)
-  div.cov    = sum(div > nis.ci[1] & div < nis.ci[2], na.rm = TRUE) / sum(!is.na(div))
-
-  plot(obs.tlo, div, col = pt.col, main = pretty.exp(exps[i]), cex.main = 0.9,
-       ylab = "mean NIS", ylim = range(c(0, div, nis.ci), na.rm = TRUE))
-  legend("topright", legend = legend.labels, col = legend.cols,
-         pch = 21, bty = "n", title = "disturbance type")
-  abline(h = nis.ci, lty = 2)            # 95% chi-sq_N / N interval
-  abline(div.reg, col = 2)
-
-  ## innovation-variance decomposition: stacked bars of mean S = CF + q33 + R per site,
-  ## ordered by total S, so it's clear which term dominates (q33 is the Qmult-deflatable one)
-  cf  <- elist[[i]]$cfbar; q33 <- elist[[i]]$q33bar; Rv <- elist[[i]]$Rbar
-  ok  <- which(is.finite(cf) & is.finite(q33) & is.finite(Rv))
-  if (length(ok) > 0) {
-    ord <- ok[order(cf[ok] + q33[ok] + Rv[ok])]
-    ord <- ord[seq(1, length(ord), by = 10)]   # every 10th site (1/10) for legible bars
-    barplot(rbind(cf[ord], q33[ord], Rv[ord]),
-            names.arg = ord, las = 2, cex.names = 0.6,
-            col = c("grey60", "orange", "steelblue"),
-            main = paste(exps[i], "- mean innovation variance S (1/10 of sites)"),
-            xlab = "site (ordered by total S)", ylab = "variance (kgC m-2)^2")
-    legend("topleft", bty = "n",
-           legend = c("CF (forecast spread)", "q33 (process error)", "R (obs error)"),
-           fill = c("grey60", "orange", "steelblue"))
+  p <- elist[[i]]$pdist04
+  fit <- NULL
+  if (sum(is.finite(p)) >= min.fit.sites) {
+    p2  <- betatrim(p)
+    fit <- safe.betareg(p2 ~ distabs, na.action = na.omit, link = "logit")
   }
-
-  ## Disturbance detection
-  distrate <- elist[[i]]$distrate
-
-  ## Disturbance skill
-  ord <- order(distrate)
-  dist.bar   = mean(distrate, na.rm = TRUE)
-  dist.class = tapply(distrate, obs.class, mean, na.rm = TRUE)
-
-  ## vs predisturbance biomass
-  distrate2 = betatrim(distrate)
-  pred.seq = data.frame(obs.pre = seq(0, max(obs.pre, na.rm = TRUE), length = 500),
-                        distprop = seq(-1, 1, length = 500))
-  dist.reg.pre  = lm(distrate ~ obs.pre)
-  dist.beta.pre = safe.betareg(distrate2 ~ obs.pre,
-                                   na.action = na.omit, link = "logit")
-
-  ## vs proportional disturbance size
-  distprop = 1 - elist[[i]]$distsize[, 1] / elist[[i]]$predist[, 1]  ## predicted
-  distprop = 1 - obs.dist / obs.pre                                  ## observed
-  dist.beta.prop = safe.betareg(distrate2 ~ distprop,
-                                    na.action = na.omit, link = "logit")
-
-  ## vs ABSOLUTE disturbance size
-  distabs = obs.pre - obs.dist
-  pred.seq$distabs = seq(min(distabs, na.rm = TRUE), max(distabs, na.rm = TRUE), length = 500)
-  dist.beta.abs = safe.betareg(distrate2 ~ distabs | distabs,
-                                   na.action = na.omit,
-                                   link = "logit",
-                                   link.phi = "log",
-                                   start = c(0, 5, 0.5, 0),
-                                   type = "BR")
-  ## The BR variable-dispersion fit can hit a singular information matrix
-  ## ("chol ... leading minor of order 1 is not positive") when probD is extremely
-  ## concentrated near 0 (e.g. the No-Disturbance-Product / GEDI / het experiment).
-  ## Fallback: add a little noise to the response to regularise the fit, then retry.
-  ## (Zero-mean jitter, so the mean curve is essentially unchanged; only kicks in when
-  ## the plain fit fails, leaving the other experiments' fits exact.)
-  if (is.null(dist.beta.abs)) {
-    set.seed(1)
-    distrate.jit  <- pmin(pmax(distrate + rnorm(length(distrate), 0, 0.01), 1e-4), 1 - 1e-4)
-    distrate2.jit <- betatrim(distrate.jit)
-    dist.beta.abs <- safe.betareg(distrate2.jit ~ distabs | distabs,
-                                   na.action = na.omit, link = "logit", link.phi = "log",
-                                   start = c(0, 5, 0.5, 0), type = "BR")
-    if (!is.null(dist.beta.abs))
-      message("dist.beta.abs: plain fit failed for ", exps[i], "; used noise-regularised fit.")
-  }
-  dist.qb.abs = glm(distrate2 ~ distabs,
-                    na.action = na.omit,
-                    family = quasibinomial("logit"))
-  dist.bin.abs = glm(round(distrate) ~ distabs,
-                     na.action = na.omit,
-                     family = binomial("logit"))
-  plot(distabs, distrate, col = pt.col, main = pretty.exp(exps[i]), cex.main = 0.9,
-       xlab = "absolute disturbance size", ylab = "P(disturbance)")
-  legend("topright", legend = legend.labels, col = legend.cols,
-         pch = 21, bty = "n", title = "disturbance type")
-  ## beta-regression fit: mean curve + phi-based (25-75%) precision band, plus the
-  ## quasibinomial / binomial response curves for comparison.
-  beta.band <- adjustcolor("green", 0.18)
-  if (!is.null(dist.beta.abs)) {
-    q25 <- predict(dist.beta.abs, newdata = pred.seq, type = "quantile", at = 0.25)
-    q75 <- predict(dist.beta.abs, newdata = pred.seq, type = "quantile", at = 0.75)
-    polygon(c(pred.seq$distabs, rev(pred.seq$distabs)), c(q25, rev(q75)),
-            col = beta.band, border = NA)
-    lines(pred.seq$distabs, predict(dist.beta.abs, newdata = pred.seq, type = "response"),
-          col = "green", lwd = 2)                                          # mean (mu)
-  }
-  lines(pred.seq$distabs, predict(dist.qb.abs,  newdata = pred.seq, type = "response"), col = "purple")
-  lines(pred.seq$distabs, predict(dist.bin.abs, newdata = pred.seq, type = "response"), col = "blue")
-  legend("bottomright", bty = "n", cex = 0.8, title = "fitted curves",
-         legend = c("beta mean (mu)", "beta 25-75% (phi band)", "quasibinomial", "binomial"),
-         col = c("green", beta.band, "purple", "blue"), lwd = c(2, 8, 1, 1), lty = c(1, 1, 1, 1))
-  #
-  # ## vs divergence
-  absdiv = abs(div)
-  dist.beta.absdiv = safe.betareg(distrate2 ~ absdiv,
-                                       na.action = na.omit, link = "logit")
-  dist.bin.absdiv = glm(round(distrate) ~ absdiv,
-                         na.action = na.omit,
-                         family = binomial("logit"))
-  pred.seq$absdiv = seq(0, max(absdiv, na.rm = TRUE), length = 500)
-  #
-  # dist.qb.combo = glm(distrate2 ~ obs.pre + distprop +
-  #                        distabs + absdiv + obs.class,
-  #                      na.action = na.omit,
-  #                      family = quasibinomial("logit"))
-  # dist.bin.combo = glm(round(distrate) ~ obs.pre + distprop +
-  #                         distabs + absdiv + as.factor(obs.class),
-  #                       na.action = na.omit,
-  #                       family = binomial("logit"))
-
-  stats[[i]] <- list(
-    div.reg = div.reg,
-    div.median = div.median,
-    div.cov = div.cov,
-    dist.bar = dist.bar,
-    dist.class = dist.class,
-    dist.pre =  dist.beta.pre,
-    dist.prop = dist.beta.prop,
-    dist.beta.abs =  dist.beta.abs,
-    dist.bin.abs  = dist.bin.abs,
-    dist.absdiv   = dist.beta.absdiv
-    #dist.combo = dist.bin.combo
-  )
+  stats[[exps[i]]] <- list(dist.beta.abs = fit)
 }
-dev.off()
-save(stats, file = file.path(indir, "stats.RData"))
-```
 
-## summary across experiments
-
-```{r}
-## One summary PDF, three pages (one per plot type). Each page lays out all
-## experiments side by side with CONSISTENT axes so they can be compared
-## directly; every panel is titled with its experiment name.
 pdf(file.path(indir, "exps_summary.pdf"), width = 14, height = 7)
+obsT.xlim <- range(unlist(lapply(elist, function(e) e$obsT)), na.rm = TRUE)
 
-distabs <- obs.pre - obs.dist            # absolute disturbance size (obs-derived, common to all exps)
-
-## panel grid: up to 8 experiments -> 2 x 4
-nexp <- length(exps)
-grid <- c(2, 4)
-
-## shared axis ranges across all experiments
-all.nis  <- unlist(lapply(elist, function(e) e$nisbar))
-nis.ylim <- range(c(0, all.nis, nis.ci), na.rm = TRUE)
-tlo.xlim <- range(obs.tlo, na.rm = TRUE)
-all.S    <- unlist(lapply(elist, function(e) e$cfbar + e$q33bar + e$Rbar))
-S.ylim   <- c(0, max(all.S, na.rm = TRUE))
-distabs.xlim <- range(distabs, na.rm = TRUE)
-
-## ---- Page 1: mean NIS vs final-year biomass ----
+## ---- Page 1: filter divergence per site ----
+## (y_T - analysis mean_T) / half-width of the 95% analysis interval; inside [-1, 1]
+## means the final observation falls inside the interval.
+div.ylim <- range(c(-1.5, 1.5, unlist(lapply(elist, function(e) e$div))), na.rm = TRUE)
 par(mfrow = grid, mar = c(4, 4, 3, 1), oma = c(0, 0, 2, 0))
 for (i in seq_along(exps)) {
-  div <- elist[[i]]$nisbar
-  plot(obs.tlo, div, col = pt.col, pch = 19, cex = 0.5,
-       xlim = tlo.xlim, ylim = nis.ylim, cex.main = 0.8,
-       xlab = "final-year biomass", ylab = "mean NIS", main = pretty.exp(exps[i]))
-  abline(h = nis.ci, lty = 2)            # 95% chi-sq_N / N interval
+  e <- elist[[i]]
+  plot(e$obsT, e$div, col = pt.col, pch = 19, xlim = obsT.xlim, ylim = div.ylim,
+       xlab = "final observed AGB (kgC m-2)", ylab = "filter divergence", cex.main = 0.8,
+       main = sprintf("%s\n%s of sites in [-1, 1]", pretty.exp(exps[i]), pct(abs(e$div) <= 1)))
+  rect(par("usr")[1], -1, par("usr")[2], 1, col = adjustcolor("grey", 0.25), border = NA)
+  abline(h = 0, lty = 2)
   if (i == 1)
     legend("topright", legend = legend.labels, col = legend.cols,
-           pch = 19, bty = "n", cex = 0.8, title = "disturbance type")
+           pch = 19, bty = "n", cex = 0.8, title = "2004 product label")
 }
-mtext("mean NIS vs final-year biomass (dashed = 95% CI of chi-sq/N)", outer = TRUE, cex = 1.2)
+mtext("filter divergence at the final observation (grey = [-1, 1])", outer = TRUE, cex = 1.2)
 
-## ---- Page 2: innovation-variance decomposition (1/10 of sites) ----
+## ---- Page 2: centred PIT of the final observation per site ----
+## 2u - 1 with u = P(y' <= y_T | y_{1:T-1}); uniform on [-1, 1] if the predictive is
+## calibrated, so 95% of sites should fall in [-0.95, 0.95].
 par(mfrow = grid, mar = c(4, 4, 3, 1), oma = c(0, 0, 2, 0))
 for (i in seq_along(exps)) {
-  cf <- elist[[i]]$cfbar; q33 <- elist[[i]]$q33bar; Rv <- elist[[i]]$Rbar
-  ok <- which(is.finite(cf) & is.finite(q33) & is.finite(Rv))
-  if (length(ok) == 0) { plot.new(); title(main = exps[i]); next }
-  ord <- ok[order(cf[ok] + q33[ok] + Rv[ok])]
-  ord <- tail(ord, 20)                          # top 20 sites by total S for legible bars
-  barplot(rbind(cf[ord], q33[ord], Rv[ord]),
-          names.arg = ord, las = 2, cex.names = 0.5, ylim = S.ylim,
-          col = c("grey60", "orange", "steelblue"),
-          xlab = "site (top 20 by total S)", ylab = "variance (kgC m-2)^2",
-          main = exps[i])
+  e <- elist[[i]]; cp <- 2 * e$pitT - 1
+  plot(e$obsT, cp, col = pt.col, pch = 19, xlim = obsT.xlim, ylim = c(-1, 1),
+       xlab = "final observed AGB (kgC m-2)", ylab = "centred PIT, 2u - 1", cex.main = 0.8,
+       main = sprintf("%s\n%s of sites in [-0.95, 0.95]", pretty.exp(exps[i]), pct(abs(cp) <= 0.95)))
+  rect(par("usr")[1], -0.95, par("usr")[2], 0.95, col = adjustcolor("grey", 0.25), border = NA)
+  abline(h = 0, lty = 2)
   if (i == 1)
-    legend("topleft", bty = "n", cex = 0.8,
-           legend = c("CF (forecast spread)", "q33 (process error)", "R (obs error)"),
-           fill = c("grey60", "orange", "steelblue"))
+    legend("topright", legend = legend.labels, col = legend.cols,
+           pch = 19, bty = "n", cex = 0.8, title = "2004 product label")
 }
-mtext("innovation variance S = CF + q33 + R (top 20 sites by total S)", outer = TRUE, cex = 1.2)
+mtext("one-step-ahead PIT of the final observation (grey = central 95%)", outer = TRUE, cex = 1.2)
 
-## ---- Page 3: innovation-variance decomposition (bottom 50 sites) ----
-## shared ylim based on the bottom-50 totals (the global S.ylim is driven by the
-## top sites and would render these tiny), so bars stay visible and comparable.
-bot.S <- unlist(lapply(elist, function(e) {
-  ok  <- which(is.finite(e$cfbar) & is.finite(e$q33bar) & is.finite(e$Rbar))
-  head(sort((e$cfbar + e$q33bar + e$Rbar)[ok]), 50)
-}))
-botS.ylim <- c(0, max(bot.S, na.rm = TRUE))
+## ---- Page 3: PIT histogram over all sites and years ----
+## flat at density 1 if calibrated; U-shape = predictive too narrow, hump = too wide,
+## slope = biased.
+pit.br <- seq(0, 1, by = 0.05)
+pit.ymax <- max(sapply(elist, function(e) max(hist(e$pit.all, breaks = pit.br, plot = FALSE)$density)))
 par(mfrow = grid, mar = c(4, 4, 3, 1), oma = c(0, 0, 2, 0))
 for (i in seq_along(exps)) {
-  cf <- elist[[i]]$cfbar; q33 <- elist[[i]]$q33bar; Rv <- elist[[i]]$Rbar
-  ok <- which(is.finite(cf) & is.finite(q33) & is.finite(Rv))
-  if (length(ok) == 0) { plot.new(); title(main = exps[i]); next }
-  ord <- ok[order(cf[ok] + q33[ok] + Rv[ok])]
-  ord <- head(ord, 50)                          # bottom 50 sites by total S
-  barplot(rbind(cf[ord], q33[ord], Rv[ord]),
-          names.arg = ord, las = 2, cex.names = 0.4, ylim = botS.ylim,
-          col = c("grey60", "orange", "steelblue"),
-          xlab = "site (bottom 50 by total S)", ylab = "variance (kgC m-2)^2",
-          main = exps[i])
-  if (i == 1)
-    legend("topleft", bty = "n", cex = 0.8,
-           legend = c("CF (forecast spread)", "q33 (process error)", "R (obs error)"),
-           fill = c("grey60", "orange", "steelblue"))
+  e <- elist[[i]]
+  hist(e$pit.all, breaks = pit.br, freq = FALSE, col = "grey80", border = "white",
+       ylim = c(0, pit.ymax), xlab = "PIT u", cex.main = 0.8,
+       main = sprintf("%s\n%d site-years", pretty.exp(exps[i]), length(e$pit.all)))
+  abline(h = 1, lty = 2)
 }
-mtext("innovation variance S = CF + q33 + R (bottom 50 sites by total S)", outer = TRUE, cex = 1.2)
+mtext("one-step-ahead PIT of every observation, all sites and years (dashed = uniform)",
+      outer = TRUE, cex = 1.2)
 
 ## ---- Page 4: disturbance detection vs absolute disturbance size ----
+distabs.xlim <- range(distabs[all.sites], na.rm = TRUE)
 par(mfrow = grid, mar = c(4, 4, 3, 1), oma = c(0, 0, 2, 0))
 for (i in seq_along(exps)) {
-  distrate <- elist[[i]]$distrate
-  plot(distabs, distrate, col = pt.col, pch = 19, cex = 0.5,
+  plot(distabs, elist[[i]]$pdist04, col = pt.col, pch = 19,
        xlim = distabs.xlim, ylim = c(0, 1), cex.main = 0.8,
-       xlab = "absolute disturbance size", ylab = "P(disturbance)",
+       xlab = "AGB loss 2003 -> 2004 (kgC m-2)", ylab = "P(disturbed) in 2004",
        main = pretty.exp(exps[i]))
-  ## fitted betareg mean curve + phi-based 95% precision band (stats[[i]]$dist.beta.abs)
+  abline(v = 0, col = "grey80")
   fit <- stats[[i]]$dist.beta.abs
-  band.col <- adjustcolor("blue", 0.18)
   if (!is.null(fit)) {
-    xx  <- seq(distabs.xlim[1], distabs.xlim[2], length = 200)
-    nd  <- data.frame(distabs = xx)
-    qlo <- predict(fit, newdata = nd, type = "quantile", at = 0.025)
-    qhi <- predict(fit, newdata = nd, type = "quantile", at = 0.975)
-    polygon(c(xx, rev(xx)), c(qlo, rev(qhi)), col = band.col, border = NA)
-    lines(xx, predict(fit, newdata = nd, type = "response"), col = "blue", lwd = 2)
+    xx <- seq(distabs.xlim[1], distabs.xlim[2], length = 200)
+    nd <- data.frame(distabs = xx)
+    polygon(c(xx, rev(xx)),
+            c(predict(fit, nd, type = "quantile", at = 0.025),
+              rev(predict(fit, nd, type = "quantile", at = 0.975))),
+            col = adjustcolor("blue", 0.18), border = NA)
+    lines(xx, predict(fit, nd, type = "response"), col = "blue", lwd = 2)
   }
-  if (i == 1) {
-    legend("topright", legend = legend.labels, col = legend.cols,
-           pch = 19, bty = "n", cex = 0.7, title = "disturbance type")
-    legend("right", bty = "n", cex = 0.7, title = "beta fit",
-           legend = c("mean P(detect)", "95% band (phi)"),
-           col = c("blue", band.col), lwd = c(2, 8))
-  }
-}
-mtext("disturbance detection vs absolute disturbance size", outer = TRUE, cex = 1.2)
-
-## ---- Page 5: mean squared innovation (top 20 sites), vs total S ----
-## NIS = mean(innov^2)/S. Bars = mean squared innovation (numerator); the points
-## overlay total S (= CF+q33+R, the denominator) for the same sites, so where bars
-## rise above the points NIS > 1 (the bias-not-variance signature, esp. LandTrendr).
-i2.ymax <- 0
-for (i in seq_along(exps)) {
-  e  <- elist[[i]]
-  Stot <- e$cfbar + e$q33bar + e$Rbar
-  ok <- which(is.finite(e$innov2bar) & is.finite(Stot))
-  if (length(ok) == 0) next
-  ord <- tail(ok[order(e$innov2bar[ok])], 20)
-  i2.ymax <- max(i2.ymax, e$innov2bar[ord], Stot[ord], na.rm = TRUE)
-}
-i2.ylim <- c(0, i2.ymax)
-par(mfrow = grid, mar = c(4, 4, 3, 1), oma = c(0, 0, 2, 0))
-for (i in seq_along(exps)) {
-  e  <- elist[[i]]
-  Stot <- e$cfbar + e$q33bar + e$Rbar
-  ok <- which(is.finite(e$innov2bar) & is.finite(Stot))
-  if (length(ok) == 0) { plot.new(); title(main = exps[i]); next }
-  ord <- tail(ok[order(e$innov2bar[ok])], 20)        # top 20 sites by mean innov^2
-  bp  <- barplot(e$innov2bar[ord], names.arg = ord, las = 2, cex.names = 0.5,
-                 ylim = i2.ylim, col = "tomato",
-                 xlab = "site (top 20 by mean innov^2)",
-                 ylab = "mean innovation^2 (kgC m-2)^2", main = exps[i])
-  points(bp, Stot[ord], pch = 19, cex = 0.7, col = "black")   # total S for comparison
   if (i == 1)
-    legend("topleft", bty = "n", cex = 0.8,
-           legend = c("mean innov^2 (NIS numerator)", "total S (NIS denominator)"),
-           pch = c(15, 19), col = c("tomato", "black"))
+    legend("topleft", legend = legend.labels, col = legend.cols,
+           pch = 19, bty = "n", cex = 0.8, title = "2004 product label")
 }
-mtext("mean squared innovation vs total S (top 20 sites by innov^2)", outer = TRUE, cex = 1.2)
+mtext(sprintf("disturbance detection vs absolute disturbance size%s",
+              if (any(!sapply(stats, function(s) is.null(s$dist.beta.abs))))
+                " (blue = beta regression mean + 95% band)" else ""),
+      outer = TRUE, cex = 1.2)
 
-## ---- Page 6: mean innovation variance per experiment (cross-experiment summary) ----
-## One horizontal stacked bar per experiment: the across-site mean of each S component
-## (CF + q33 + R). Bars labelled with the prettified experiment names; legend = parts of S.
-exp.cf  <- sapply(elist, function(e) mean(e$cfbar,  na.rm = TRUE))
-exp.q33 <- sapply(elist, function(e) mean(e$q33bar, na.rm = TRUE))
-exp.R   <- sapply(elist, function(e) mean(e$Rbar,   na.rm = TRUE))
-M <- rbind(CF = exp.cf, q33 = exp.q33, R = exp.R)            # 3 x nexp
-colnames(M) <- sapply(exps, pretty.exp)
-ord <- order(colSums(M))                                    # smallest total S at bottom
-par(mfrow = c(1, 1), mar = c(5, 22, 3, 2))                  # wide left margin for long names
-barplot(M[, ord, drop = FALSE], horiz = TRUE, las = 1, cex.names = 0.8,
-        col = c("grey60", "orange", "steelblue"),
-        xlab = "mean innovation variance S (kgC m-2)^2",
-        main = "Mean innovation variance by experiment")
-legend("bottomright", bty = "n",
-       legend = c("CF (forecast spread)", "q33 (process error)", "R (obs error)"),
-       fill = c("grey60", "orange", "steelblue"))
-
-## ---- Page 7: table of disturbance size at 50% probability of detection ----
-## From each experiment's betareg fit (stats[[i]]$dist.beta.abs) with a logit-link mean,
-## P(detection)=0.5 when the linear predictor = 0, i.e. distabs = -intercept / slope.
-x50 <- sapply(seq_along(exps), function(i) {
-  fit <- stats[[i]]$dist.beta.abs
+## ---- Page 5: summary table ----
+## logit-link mean: P = 0.5 where the linear predictor is 0, i.e. distabs = -intercept / slope
+x50 <- sapply(stats, function(s) {
+  fit <- s$dist.beta.abs
   if (is.null(fit)) return(NA_real_)
-  cf <- coef(fit, model = "mean")                 # c((Intercept), distabs)
+  cf <- coef(fit, model = "mean")
   if (length(cf) < 2 || !is.finite(cf[2]) || cf[2] == 0) return(NA_real_)
   as.numeric(-cf[1] / cf[2])
 })
-tab.lab <- sapply(exps, pretty.exp)
-tab.val <- ifelse(is.finite(x50), formatC(x50, format = "f", digits = 2), "NA")
-
+tab <- data.frame(
+  experiment = sapply(exps, pretty.exp),
+  div.in     = sapply(elist, function(e) pct(abs(e$div) <= 1)),
+  div.med    = sapply(elist, function(e) sprintf("%.2f", median(abs(e$div), na.rm = TRUE))),
+  pit.in     = sapply(elist, function(e) pct(abs(2 * e$pitT - 1) <= 0.95)),
+  pit.all.in = sapply(elist, function(e) pct(abs(2 * e$pit.all - 1) <= 0.95)),
+  x50        = ifelse(is.finite(x50), sprintf("%.2f", x50), "--"))
+heads <- c("Experiment", "|div| <= 1", "median |div|", "final PIT\nin 95%",
+           "all PITs\nin 95%", "loss at\nP = 0.5")
 par(mfrow = c(1, 1), mar = c(1, 1, 4, 1))
 plot.new()
-title("Disturbance size (kgC m-2) at 50% probability of detection")
-ny    <- length(exps)
-ystep <- min(0.085, 0.82 / (ny + 1))
-ytop  <- 0.90
-xcol1 <- 0.02                                          # experiment column (left-aligned)
-maxw  <- max(strwidth(tab.lab, cex = 0.85))            # widest experiment name
-xsep  <- min(0.80, xcol1 + maxw + 0.03)                # divider just right of the names
-xcol2 <- xsep + 0.03                                   # value column (left-aligned)
-x.l   <- 0.005; x.r <- 0.995
-ybord.top <- ytop + 0.6 * ystep
-ybord.bot <- ytop - (ny + 0.5) * ystep
-
-## header + rows
-text(xcol1, ytop, "Experiment",      adj = 0, font = 2, cex = 0.95)
-text(xcol2, ytop, "AGB loss at 50% probability of disturbance", adj = 0, font = 2, cex = 0.95)
-for (r in seq_len(ny)) {
-  yy <- ytop - r * ystep
-  text(xcol1, yy, tab.lab[r], adj = 0, cex = 0.85)
-  text(xcol2, yy, tab.val[r], adj = 0, cex = 0.85)
-}
-
-## grid lines: horizontals (top border, under header, each row boundary incl. bottom)
-hlines <- c(ybord.top, ytop - 0.5 * ystep, ytop - (seq_len(ny) + 0.5) * ystep)
-segments(x.l, hlines, x.r, hlines, col = "grey55")
-## verticals: left border, column divider, right border
-segments(c(x.l, xsep, x.r), ybord.bot, c(x.l, xsep, x.r), ybord.top, col = "grey55")
-
-par(mfrow = c(1, 1))
+title("Summary by experiment")
+xs <- c(0.01, 0.50, 0.61, 0.72, 0.83, 0.93)
+yy <- 0.86 - seq_len(nexp) * 0.08
+text(xs, 0.92, heads, adj = c(0, 0.5), font = 2, cex = 0.8)
+for (c in seq_along(xs)) text(xs[c], yy, tab[[c]], adj = 0, cex = 0.8)
+segments(0, c(0.97, 0.87), 1, c(0.97, 0.87), col = "grey55")
 dev.off()
+save(stats, tab, file = file.path(indir, "stats.RData"))
 ```
 
-## disturbance product: where does probD change, and why does it go down?
+## disturbance product: where does pDist change?
 
-The summary plots read `probD` at a FIXED assessment year `t04`, but for almost all
-sites that year is Unflagged by the product, so they miss the (large) boost that occurs
-at each site's actual flagged years. This cell compares with/without the product (a) at
-`t04` and (b) averaged over each site's own flagged years, reading the per-year `probD`
-straight from the run files.
+Compares the runs with and without the disturbance product (same R model and tau prior)
+(a) at the assessment year `yr.dist` (2004) and (b) averaged over each site's own flagged years.
 
 ```{r}
-## TRUE runs come from `indir`; the distprod=FALSE baseline (R = GEDI/het) is read
-## from a separate directory that holds the no-product runs.
-falsedir <- "experiments/jointUpdateDistProductDebugged"
-
 pdf(file.path(indir, "distprod_TRUE_vs_FALSE.pdf"), width = 10, height = 5)
-
-## source_model combos that have BOTH a TRUE (indir) and a FALSE (falsedir) run
 combos <- unique(sub("^distprod_(TRUE|FALSE)_", "", exps))
 for (cb in combos) {
-  tf <- dir(indir,    pattern = sprintf("_distprod_TRUE_%s\\.rds$",  cb))
-  ff <- dir(falsedir, pattern = sprintf("_distprod_FALSE_%s\\.rds$", cb))
-  sT <- as.numeric(sapply(strsplit(tf, "_"), `[`, 2))
-  sF <- as.numeric(sapply(strsplit(ff, "_"), `[`, 2))
-  both <- intersect(sT, sF)
+  eT <- paste0("distprod_TRUE_", cb); eF <- paste0("distprod_FALSE_", cb)
+  if (!all(c(eT, eF) %in% exps)) next
+  both <- intersect(sites[exp == eT], sites[exp == eF])
   if (length(both) == 0) next
 
   pT04 <- pF04 <- pTfl <- pFfl <- rep(NA, length(both))
-  flag04 <- logical(length(both))
+  flag04 <- dextract[both, paste0("t", yr.dist)] > 0
   for (m in seq_along(both)) {
     s  <- both[m]
-    rT <- readRDS(file.path(indir,    sprintf("site_%d_distprod_TRUE_%s.rds",  s, cb)))
-    rF <- readRDS(file.path(falsedir, sprintf("site_%d_distprod_FALSE_%s.rds", s, cb)))
-    fyrs <- which(dextract[s, ] > 0)               # this site's flagged years (dextract cols)
-    fyrs <- fyrs[fyrs <= length(rT$probD)]
-    pT04[m]   <- rT$probD[t04]; pF04[m] <- rF$probD[t04]
-    flag04[m] <- dextract[s, t04] > 0
+    rT <- readRDS(file.path(indir, sprintf("site_%d_%s.rds", s, eT)))
+    rF <- readRDS(file.path(indir, sprintf("site_%d_%s.rds", s, eF)))
+    fyrs <- dtime[dextract[s, ] > 0]                 # this site's flagged calendar years
+    fyrs <- which(rT$year %in% fyrs)                 # ... as DA timesteps
+    pT04[m] <- rT$pDist[rT$year == yr.dist]; pF04[m] <- rF$pDist[rF$year == yr.dist]
     if (length(fyrs) > 0) {
-      pTfl[m] <- mean(rT$probD[fyrs], na.rm = TRUE)
-      pFfl[m] <- mean(rF$probD[fyrs], na.rm = TRUE)
+      pTfl[m] <- mean(rT$pDist[fyrs], na.rm = TRUE)
+      pFfl[m] <- mean(rF$pDist[fyrs], na.rm = TRUE)
     }
   }
 
   par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
-  ## (1) at the fixed assessment year t04: points below the diagonal went DOWN.
-  down <- sum(pT04 < pF04 - 1e-6, na.rm = TRUE)
-  plot(pF04, pT04, col = ifelse(flag04, "red", "grey50"), pch = 19, cex = 0.6,
+  plot(pF04, pT04, col = ifelse(flag04, "red", "grey50"), pch = 19,
        xlim = c(0, 1), ylim = c(0, 1),
-       xlab = "probD without product", ylab = "probD with product",
-       main = sprintf("%s @ t04=%d  (%d sites down)", cb, t04, down))
+       xlab = "pDist without product", ylab = "pDist with product",
+       main = sprintf("%s @ %d", cb, yr.dist))
   abline(0, 1, lty = 2)
-  legend("topleft", legend = c("flagged @ t04", "not flagged @ t04"),
+  legend("topleft", legend = c("flagged in 2004", "not flagged in 2004"),
          col = c("red", "grey50"), pch = 19, bty = "n", cex = 0.8)
-  ## (2) averaged over each site's OWN flagged years: the boost the t04 view misses.
-  plot(pFfl, pTfl, col = "darkgreen", pch = 19, cex = 0.6,
-       xlim = c(0, 1), ylim = c(0, 1),
-       xlab = "mean probD without product", ylab = "mean probD with product",
+  plot(pFfl, pTfl, col = "darkgreen", pch = 19, xlim = c(0, 1), ylim = c(0, 1),
+       xlab = "mean pDist without product", ylab = "mean pDist with product",
        main = sprintf("%s, over flagged years", cb))
   abline(0, 1, lty = 2)
 }
@@ -556,80 +295,22 @@ dev.off()
 
 ## when were sites flagged as disturbed (by type and year)?
 
-One barplot per disturbance type: the number of sites flagged in each year. The
-assessment timestep `t04` is emphasized (red bar + red axis label) since `probD` is read
-there — this makes clear how few flags of each type actually fall on that year.
+One barplot per disturbance type: the number of sites flagged in each year, with the
+assessment year 2004 in red.
 
 ```{r}
 dist.codes <- c("10" = "other", "20" = "cut", "30" = "road", "40" = "fire", "50" = "biotic")
 codes.present <- names(dist.codes)[sapply(names(dist.codes),
-                   function(cc) any(dextract == as.numeric(cc)))]   # types that occur
+                   function(cc) any(dextract == as.numeric(cc)))]
 NTy <- ncol(dextract)
 
 par(mfrow = c(length(codes.present), 1), mar = c(3, 4, 2, 1), oma = c(2, 0, 2, 0))
 for (cc in codes.present) {
   cnt  <- colSums(dextract == as.numeric(cc))
-  bcol <- rep("steelblue", NTy); bcol[t04] <- "red"          # emphasize the assessment year
-  bp   <- barplot(cnt, col = bcol, border = NA, names.arg = dtime, las = 2,
-                  cex.names = 0.6, ylab = "# sites flagged",
-                  main = sprintf("%s (code %s) - %d flags total", dist.codes[cc], cc, sum(cnt)))
-  ## red label marking t04 on the x axis
-  axis(1, at = bp[t04], labels = sprintf("t04=%d (%d)", t04, dtime[t04]),
-       col.axis = "red", col.ticks = "red", tick = TRUE, line = 0.2, cex.axis = 0.7)
+  bcol <- rep("steelblue", NTy); bcol[dtime == yr.dist] <- "red"
+  barplot(cnt, col = bcol, border = NA, names.arg = dtime, las = 2,
+          cex.names = 0.6, ylab = "# sites flagged",
+          main = sprintf("%s (code %s) - %d flags total", dist.codes[cc], cc, sum(cnt)))
 }
-mtext("disturbance flags by type and year (red bar = assessment timestep t04)",
-      outer = TRUE, cex = 1.1)
-```
-
-## why probD drops for unflagged sites with the product (GEDI/het)
-
-For sites the disturbance product does NOT flag in 2004, using the product still
-*lowers* the year-15 probability of disturbance vs not using it. Reason: the prior the
-filter sees in an unflagged year is much less disturbance-leaning with the product. Two
-panels: (left) the cause — the unflagged-year prior P(disturbance); (right) the effect —
-probD vs disturbance magnitude for unflagged sites, with vs without the product.
-
-```{r}
-## unflagged-year prior P(disturbance): with vs without the product.
-## FALSE path leaves the per-cluster background un-split (each of a class's clusters
-## carries the full class prob -> over-counted) and undisturbed at raw d.prior[UN];
-## TRUE path weight-splits the clusters and renormalises undisturbed to 1 - dist.mass.
-local({
-  load("STprior.RData"); load("dis.postprocessed.RData")
-  d.prior["0"] <- d.prior["0"] + d.prior[6]; d.prior <- d.prior[-6]
-  dist_name <- c("0"="none","10"="other","20"="cut","30"="road","40"="fire","50"="biotic")
-  dfp <- character()
-  for (dc in names(dist.priors)) for (i in seq_along(dist.priors[[dc]]$means)) dfp <- c(dfp, paste0(dist_name[dc], i))
-  distname.toidx <- list("other"=2,"cut"=3,"fire"=4,"biotic"=5)
-  dpp <- sapply(dfp, function(nm) { for (d in names(distname.toidx)) if (grepl(d, nm)) return(as.numeric(d.prior[distname.toidx[[d]]])) })
-  w <- unlist(sapply(dist.priors, function(x) x$weights))
-  und.F <- as.numeric(d.prior[1]); dis.F <- sum(dpp);  pF <- dis.F / (dis.F + und.F)  # no product
-  dis.T <- sum(dpp * w);            pT <- dis.T                                         # product, unflagged
-
-  ## empirical probD at year 15 for unflagged sites (obs.class == 0), GEDI/het
-  oc <- obs.class
-  ff <- dir(indir, pattern = "_distprod_TRUE_GEDI_het.rds$")
-  sT <- as.numeric(sapply(strsplit(ff, "_"), `[`, 2)); unflag <- sT[oc[sT] == 0]
-  dT <- dF <- rep(NA, length(unflag))
-  for (i in seq_along(unflag)) {
-    s <- unflag[i]
-    dT[i] <- readRDS(file.path(indir, sprintf("site_%d_distprod_TRUE_GEDI_het.rds",  s)))$probD[t04]
-    fF <- file.path(indir, sprintf("site_%d_distprod_FALSE_GEDI_het.rds", s)); if (file.exists(fF)) dF[i] <- readRDS(fF)$probD[t04]
-  }
-  da <- (obs.pre - obs.dist)[unflag]
-
-  par(mfrow = c(1, 2), mar = c(4.5, 4.5, 3, 1))
-  bp <- barplot(c("No product\n(FALSE)" = pF, "Disturbance product\n(TRUE)" = pT),
-                col = c("grey60", "firebrick"), ylim = c(0, max(pF, pT) * 1.25),
-                ylab = "prior P(disturbance), unflagged year",
-                main = "Cause: prior is lower with the product")
-  text(bp, c(pF, pT) + max(pF, pT) * 0.06, sprintf("%.3f", c(pF, pT)))
-  plot(da, dF, col = "grey50", pch = 19, cex = 0.6, ylim = range(c(0, dF, dT), na.rm = TRUE),
-       xlab = "disturbance magnitude (kgC m-2)", ylab = "probD at year 15",
-       main = "Effect: unflagged probD shifts down")
-  points(da, dT, col = "firebrick", pch = 19, cex = 0.6)
-  segments(da, dF, da, dT, col = adjustcolor("black", 0.25))
-  legend("topright", legend = c("No product (FALSE)", "Disturbance product (TRUE)"),
-         col = c("grey50", "firebrick"), pch = 19, bty = "n")
-})
+mtext("disturbance flags by type and year (red bar = 2004)", outer = TRUE, cex = 1.1)
 ```
