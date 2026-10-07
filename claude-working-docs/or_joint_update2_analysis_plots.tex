@@ -4,18 +4,14 @@
 \usepackage{graphicx}
 \usepackage{booktabs}
 \usepackage{xcolor}
-\usepackage{listings}
 \usepackage{hyperref}
 
 \newcommand{\E}{\mathbb{E}}
-\newcommand{\Var}{\mathrm{Var}}
 \newcommand{\Norm}{\mathcal{N}}
-\newcommand{\NIS}{\mathrm{NIS}}
+\newcommand{\code}[1]{\texttt{#1}}
 
-\lstset{basicstyle=\ttfamily\small, breaklines=true, columns=fullflexible,
-        showstringspaces=false, language=R, commentstyle=\color{gray}}
-
-\title{Analysis plots for \texttt{ORJointUpdate} (\texttt{OR\_joint\_update2.Rmd})}
+\title{Analysis plots for the joint disturbance / process-error filter\\
+       (\code{ORJointUpdate} in \code{OR\_joint\_update2.Rmd})}
 \author{Claude}
 \date{October 7, 2026}
 
@@ -23,55 +19,197 @@
 \begin{document}
 \maketitle
 
-This note explains the three diagnostic plots produced by
-\texttt{OR\_joint\_update\_analysis.Rmd} for the joint disturbance/process-error filter in
-\texttt{OR\_joint\_update2.Rmd}, and gives the formulas for every quantity they show:
+This note explains the diagnostic plots that \code{OR\_joint\_update\_analysis.Rmd}
+makes from runs of \code{ORJointUpdate}, and gives the formula for every quantity they
+show:
 \begin{enumerate}
-  \item mean normalized innovation squared (NIS) per site;
-  \item disturbance detection vs.\ absolute disturbance size;
-  \item mean innovation variance split into forecast spread, process error and
-        observation error.
+  \item filter divergence at the final observation of each site, with an alternative
+        statistic (the predictive PIT) aimed at the same question;
+  \item the probability of detecting a disturbance in 2004 against the observed biomass
+        loss from 2003 to 2004.
 \end{enumerate}
-Section~\ref{sec:runs} describes the experiment grid and the 5-site test run in
-\texttt{experiments/testRun}, and shows its plots.
+Section~\ref{sec:model} defines the filter's notation and Section~\ref{sec:pred} the
+one-step-ahead predictive. Sections~\ref{sec:div} and~\ref{sec:det} define the plotted
+quantities. Section~\ref{sec:runs} describes the experiment grid and
+the 5-site test run in \code{experiments/testRun}, and shows its plots.
 
-%--------------------------------------------------------------------------------
-\section{The filter's forecast predictive}
+%================================================================================
+\section{The filter}
 \label{sec:model}
 
-The state is $x_t = (C_v, C_s, C_R)^\top$ (leaf, soil, wood). Only wood is observed,
-\[
-  y_t \mid x_t \sim \Norm(Hx_t, R_t), \qquad H = (0,0,1), \qquad R_t = m_R\,y_t + b_R,
-\]
-with $(m_R,b_R)$ = \texttt{Rparams} ($m_R=0$ for the constant-$R$ experiments).
+\subsection{Data, time axis and state}
 
-\paragraph{Process precision grid.} The wood process precision $\tau$ is unknown. The
-filter keeps a log-spaced grid $\tau_1<\dots<\tau_G$ ($G=200$) with posterior weights
-$\pi_t(g) = p(\tau_g \mid y_{1:t})$, starting from the prior cell masses $\pi_0(g)$ and
-updated by
-\[
-  \pi_t(g) \propto \pi_{t-1}(g)\, Z_t(g), \qquad
-  Z_t(g) = \sum_{j=1}^{2}\sum_{k=0}^{D} w_{t-1}(g,j)\,\beta_{k,t}\,
-           \Norm\!\big(y_t;\ \mu^F_{gjk},\ \Sigma^F_{gjk,33} + R_t\big).
-\]
-In code $\log\pi_t$ is \texttt{qs}, $Z_t(g)$ is \texttt{exp(logz[g])}.
+\begin{itemize}
+  \item \textbf{Sites and years.} $s$ indexes sites (pixels of tile h03v04). The filter runs
+  on annual timesteps $t = 1,\dots,T$, $T = 28$, where timestep $t$ is calendar year
+  $1989 + t$ (1990--2017; \code{atime}). The biomass product covers 1990--2017 and the
+  disturbance product covers 1985--2012. Both are looked up by calendar year, so the
+  product's flag for year $Y$ is applied at the timestep for year $Y$.
+  \item \textbf{State.} $x_t = (x_{t,1}, x_{t,2}, x_{t,3})^\top$ is the vector of three carbon
+  pools (kg\,C\,m$^{-2}$) of VSEM, the Very Simple Ecosystem Model in the R package
+  \code{BayesianTools}. The code treats them as leaf, soil and wood. The wood pool
+  $x_{t,3}$ is the one compared with above-ground biomass. One VSEM year of the state
+  $x$, driven by that site's daily photosynthetically active radiation (PAR, from
+  Daymet), is written $f_t(x)$.
+  \item \textbf{Observation.} $y_t$ is the Landsat-based above-ground biomass (AGB) of the
+  site in year $1989+t$. It is converted from Mg\,ha$^{-1}$ to kg\,C\,m$^{-2}$ by
+  $\times 0.5$ (biomass to carbon) $\times 0.1$. The observation model is
+  \[
+    y_t \mid x_t \sim \Norm(Hx_t,\ R_t), \qquad H = (0,0,1), \qquad R_t = m_R\,y_t + b_R ,
+  \]
+  where $R_t$ is the observation-error variance and $(m_R, b_R)$ is \code{Rparams}.
+  ``Heteroskedastic'' (\code{het}) runs have $m_R > 0$, so $R_t$ grows with biomass.
+  ``Constant'' (\code{con}) runs have $m_R = 0$.
+\end{itemize}
 
-\paragraph{Forecast components.} For each grid point $g$ the analysis is projected onto
-two Gaussians $j\in\{1,2\}$ with weights $w_{t-1}(g,j)$ (\texttt{prevW}). Pushing an
-importance-weighted VSEM ensemble through one year and applying disturbance label
-$k\in\{0,\dots,D\}$ ($k=0$ = undisturbed, $k\ge1$ = disturbance sub-class) gives the
-forecast moments $\mu^F_{gjk}$, $\Sigma^F_{gjk}$ (\texttt{muF}, \texttt{sigF}). Label $k$
-has prior $\beta_{k,t}$ = \texttt{dist\$p[k+1,t]}. Write
-\[
-  C_{gjk} = \text{weighted ensemble variance of the wood pool for } (g,j,k).
-\]
-Process error is added only to the undisturbed label, with wood variance $1/\tau_g$:
-\[
-  \Sigma^F_{gjk,33} = C_{gjk} + \mathbf{1}\{k=0\}\,\tau_g^{-1}.
-\]
+\subsection{Disturbance labels and their prior}
 
-\paragraph{Predictive of $y_t$ (integrating over process error).} Before $y_t$ is
-assimilated, the one-step-ahead predictive is the full mixture
+Each year the site carries one label $k \in \{0, 1, \dots, D\}$:
+\begin{itemize}
+  \item $k = 0$ means undisturbed.
+  \item $k \ge 1$ is a disturbance sub-class. Each disturbance type of the product
+  (other, cut, fire, biotic) is split into the clusters of a Gaussian mixture fitted to
+  that type's fraction of wood retained after disturbance. There are $4 + 6 + 3 + 3$
+  clusters, so $D = 16$.
+  \item Under label $k \ge 1$, the disturbance step $d_k$
+  (\code{disturbance.p}) multiplies leaf and wood by random retention fractions. These are
+  drawn from $\Norm\big((0.2, r_k),\ \mathrm{diag}(0.04, v_k)\big)$, where $r_k$ and $v_k$
+  are the cluster's mean and variance, truncated to $[0, 1]$. Of the carbon removed, 5\%
+  goes to the soil pool.
+\end{itemize}
+
+The prior probability of label $k$ in year $t$ is $\beta_{k,t}$ (\code{dist\$p[k+1, t]}).
+It is built as follows:
+\begin{itemize}
+  \item \textbf{Background.} Each type gets its background rate (\code{d.prior}). That rate
+  is split across the type's clusters in proportion to the cluster weights.
+  \item \textbf{With the disturbance product.} In a year the product flags with a type, that
+  type's probability is replaced by the product's \emph{user's accuracy} for the type
+  (Kennedy et al.\ 2015): the fraction of the product's flags of that type that are
+  correct (0.77 other, 0.92 cut, 0.78 fire, 0.78 biotic). It is then split the same way.
+  \item \textbf{Undisturbed.} $\beta_{0,t} = 1 - \sum_{k\ge1}\beta_{k,t}$.
+\end{itemize}
+
+\subsection{Process error and the precision grid}
+
+Process error is added in the undisturbed label only. Its covariance is
+\[
+  Q(\tau) = \mathrm{diag}\big(q_1^2,\ q_2^2,\ \tau^{-1}\big),
+\]
+where $q_1, q_2$ are fixed leaf and soil standard deviations from the calibration
+(\code{fit.RData}). $\tau$ is the unknown \emph{precision} (inverse variance) of the wood
+process error.
+
+The filter places $\tau$ on a grid $\tau_1 < \dots < \tau_G$ of $G = 200$ points,
+spaced evenly in $\log\tau$ from $0.1$ to $10^4$. The prior is Gamma(shape $0.1$,
+rate $2\times10^{-4}$). $\pi_0(g)$ is the prior mass of the grid cell around $\tau_g$,
+with cell edges at the midpoints between neighbouring grid points, renormalised over the
+grid. $\pi_t(g)$ denotes the posterior probability of $\tau_g$ given $y_{1:t}$, the
+observations up to year $t$.
+
+\subsection{Posterior representation}
+
+Conditional on $\tau_g$, the posterior of $x_t$ is a mixture of two Gaussians,
+$j \in \{1, 2\}$, with:
+\begin{itemize}
+  \item weights $w_t(g,j)$, where $w_t(g,1) + w_t(g,2) = 1$;
+  \item means $m_t(g,j)$ and covariances $P_t(g,j)$.
+\end{itemize}
+Component $j = 1$ collects the undisturbed label and $j = 2$ the disturbance labels (see
+the projection below). At $t = 0$ every component is $\Norm(\bar x_0, P_0)$ with weight
+$\tfrac12$, where $\bar x_0, P_0$ are the mean and covariance of an initial-condition
+ensemble. That ensemble pairs every site's 1990 AGB with leaf and soil pools from a VSEM
+regrowth run of matching wood biomass. It is therefore a cross-site distribution, not
+specific to the site being filtered.
+
+\subsection{Forecast step}
+
+\begin{enumerate}
+  \item \textbf{Proposal.} Draw $N = 100$ samples $\xi^{(1)},\dots,\xi^{(N)}$ from the
+  equal-weight mixture of all $2G$ components, rejecting samples with a non-positive pool.
+  The proposal density is
+  $q(\xi) = \frac{1}{2G}\sum_{g,j}\Norm\big(\xi;\ m_{t-1}(g,j), P_{t-1}(g,j)\big)$.
+  \item \textbf{Propagation.} Push each sample through one VSEM year: $f_t(\xi^{(n)})$. For
+  label $k \ge 1$, also apply the disturbance step, giving $d_k(f_t(\xi^{(n)}))$. For
+  $k = 0$ the result is left unchanged. Write $z^{(n)}_k$ for the result.
+  \item \textbf{Importance weights.} Component $(g,j)$ reweights the shared samples by
+  \[
+    W_{gj}(n) \propto \frac{\Norm\big(\xi^{(n)};\ m_{t-1}(g,j), P_{t-1}(g,j)\big)}{q(\xi^{(n)})},
+    \qquad \sum_n W_{gj}(n) = 1 .
+  \]
+  \item \textbf{Forecast moments.} The forecast moments of component $(g,j)$ under label
+  $k$ are
+  \[
+    \mu^F_{gjk} = \sum_n W_{gj}(n)\, z^{(n)}_k, \qquad
+    \Sigma^F_{gjk} = \frac{\sum_n W_{gj}(n)\,(z^{(n)}_k - \mu^F_{gjk})(z^{(n)}_k - \mu^F_{gjk})^\top}
+                         {1 - \sum_n W_{gj}(n)^2}
+                   + \mathbf{1}\{k = 0\}\, Q(\tau_g).
+  \]
+  The denominator is the usual bias correction for a weighted sample covariance. We write
+  \[
+    C_{gjk} = \big[\Sigma^F_{gjk} - \mathbf{1}\{k=0\}Q(\tau_g)\big]_{33}
+  \]
+  for the ensemble (sample) variance of the wood pool. The wood forecast variance is then
+  $\Sigma^F_{gjk,33} = C_{gjk} + \mathbf{1}\{k = 0\}\,\tau_g^{-1}$.
+  \item \textbf{Degenerate components.} If $1 - \sum_n W_{gj}(n)^2 < 10^{-8}$, component
+  $(g,j)$'s weights sit on essentially one sample, and its covariance cannot be estimated.
+  This happens to components that are far from every proposal sample. Such a component
+  is given zero likelihood in the analysis, so zero weight. Its moments are set to the
+  unweighted sample moments as a finite placeholder. The forecast weight removed is
+  stored per step as \code{hist\$wDrop}. In the test run it occurred once (site 212,
+  2005, with no product and GEDI heteroskedastic $R$). The weight removed there was
+  $10^{-119}$.
+\end{enumerate}
+
+\subsection{Analysis step}
+
+For every $(g,j,k)$, a Kalman update with observation $y_t$ gives the analysis moments
+and the component likelihood
+\[
+  \ell_{gjk} = \Norm\big(y_t;\ \mu^F_{gjk,3},\ \Sigma^F_{gjk,33} + R_t\big).
+\]
+The marginal likelihood of $y_t$ given $\tau_g$, the $\tau$ posterior, and the analysis
+weight of each $(j,k)$ given $\tau_g$ are
+\[
+  Z_t(g) = \sum_{j,k} w_{t-1}(g,j)\,\beta_{k,t}\,\ell_{gjk}, \qquad
+  \pi_t(g) \propto \pi_{t-1}(g)\,Z_t(g), \qquad
+  w^A_t(g,j,k) = \frac{w_{t-1}(g,j)\,\beta_{k,t}\,\ell_{gjk}}{Z_t(g)} .
+\]
+\textbf{Projection.} For each $g$, the $2(D+1)$ analysis components are moment-matched
+down to two Gaussians:
+\begin{itemize}
+  \item $j = 1$ from all components with $k = 0$, with weight
+        $w_t(g,1) = \sum_j w^A_t(g,j,0)$;
+  \item $j = 2$ from all components with $k \ge 1$, with weight $w_t(g,2) = 1 - w_t(g,1)$.
+\end{itemize}
+In a year without an observation, the analysis equals the forecast and $\ell_{gjk} = 1$.
+
+\paragraph{Analysis summaries.} The filter stores, for each year, summaries of the
+marginal posterior of the wood pool given $y_{1:t}$. That posterior is the Gaussian
+mixture
+\begin{equation}
+  p(x_{t,3} \mid y_{1:t}) = \sum_{g,j,k} \pi_t(g)\, w^A_t(g,j,k)\;
+     \Norm\big(x_{t,3};\ \mu^A_{gjk,3},\ \Sigma^A_{gjk,33}\big),
+  \label{eq:post}
+\end{equation}
+where $\mu^A_{gjk}$ and $\Sigma^A_{gjk}$ are the Kalman analysis mean and covariance of
+component $(g,j,k)$. The stored summaries are:
+\begin{itemize}
+  \item the analysis mean $\hat x_t = \E[x_{t,3} \mid y_{1:t}]$ (\code{hist\$mean});
+  \item the analysis variance (\code{hist\$var});
+  \item the 95\% analysis interval $[L_t, U_t]$ (\code{hist\$ci95}). $L_t$ and $U_t$ are
+  the 2.5\% and 97.5\% quantiles of the mixture~\eqref{eq:post}, found by root-finding
+  on its cumulative distribution function. Because the mixture can be skewed (for example
+  in years with a high disturbance prior), the interval need not be symmetric about
+  $\hat x_t$.
+\end{itemize}
+
+%================================================================================
+\section{The one-step-ahead predictive}
+\label{sec:pred}
+
+The second statistic in Plot~1 uses the distribution of $y_t$ given $y_{1:t-1}$, i.e.\
+\emph{before} $y_t$ is assimilated. Under the filter above, this predictive is the mixture
 \begin{equation}
   p(y_t \mid y_{1:t-1}) = \sum_{g=1}^{G}\sum_{j=1}^{2}\sum_{k=0}^{D}
     \omega_{gjk}\;\Norm\!\big(y_t;\ \mu^F_{gjk,3},\ \Sigma^F_{gjk,33} + R_t\big),
@@ -79,203 +217,241 @@ assimilated, the one-step-ahead predictive is the full mixture
   \omega_{gjk} = \pi_{t-1}(g)\, w_{t-1}(g,j)\, \beta_{k,t}.
   \label{eq:pred}
 \end{equation}
-The sum over $g$ uses the previous $\tau$ posterior $\pi_{t-1}$, so the process error is
-integrated out instead of being fixed at one value of $\tau$; the sum over $k$ uses the
-prior $\beta_{k,t}$, because the label for year $t$ is not known before $y_t$ is seen.
-The weights sum to one ($\sum_j w=1$, $\sum_k\beta=1$; the code renormalises anyway).
+\begin{itemize}
+  \item \textbf{Integration over process error.} The sum over $g$ uses $\pi_{t-1}$, the
+  posterior of the process precision from the previous step. So the predictive averages
+  over the process-error variance $1/\tau$ instead of fixing it.
+  \item \textbf{Disturbance labels.} The sum over $k$ uses the prior $\beta_{k,t}$, because
+  the year-$t$ label is not known before $y_t$ is seen.
+  \item \textbf{Weights.} The weights $\omega_{gjk}$ sum to one. Degenerate components get
+  $\omega = 0$, and the rest are renormalised.
+\end{itemize}
 
-The predictive mean and variance follow from the laws of total expectation and variance:
-\begin{align}
-  m_t &= \sum_{gjk}\omega_{gjk}\,\mu^F_{gjk,3}, \label{eq:m}\\
-  S_t &= \sum_{gjk}\omega_{gjk}\Big[\Sigma^F_{gjk,33} + \big(\mu^F_{gjk,3}-m_t\big)^2\Big] + R_t.
-  \label{eq:S}
-\end{align}
+%================================================================================
+\section{Plot 1: filter divergence and predictive PIT}
+\label{sec:div}
 
-%--------------------------------------------------------------------------------
-\section{Plot 1: mean normalized innovation squared}
+Both statistics ask whether the filter still tracks the data at the end of the series,
+and both scale the error by the filter's own uncertainty. Let $T_s$ be the last year with
+an observation at site $s$ (2017 for every site here).
 
-\paragraph{Formula.} The innovation and the NIS at observed step $t$ are
+\subsection{Filter divergence}
+
+\paragraph{Formula.} The final observation minus the final analysis mean, divided by half
+the width of the 95\% analysis interval:
 \[
-  \nu_t = y_t - m_t, \qquad \NIS_t = \frac{\nu_t^2}{S_t},
+  \delta_s = \frac{y_{T_s} - \hat x_{T_s}}{(U_{T_s} - L_{T_s})/2}.
 \]
-and the plotted value for site $s$ is the time average over its $N$ observed steps,
+If the interval is symmetric about $\hat x_{T_s}$, $\delta_s = \pm1$ exactly at its
+edges, and $|\delta_s| \le 1$ means the final observation falls inside it.
+
+\paragraph{How to read it.} A calibrated filter should give $|\delta_s| \le 1$ at most
+sites. A filter that has \emph{diverged} has a confident analysis that sits away from
+the data, giving $|\delta_s| > 1$. The sign shows the direction: $\delta_s > 0$ means the
+analysis is below the observation. Two caveats:
+\begin{itemize}
+  \item $\hat x_{T_s}$ has already assimilated $y_{T_s}$, so it is pulled toward the
+  observation. That pull shrinks $\delta_s$, so the statistic flags only strong
+  divergence.
+  \item $[L_t, U_t]$ is an interval for the latent wood pool. It does not include the
+  observation error $R_t$, which acts in the other direction.
+\end{itemize}
+So $[-1, 1]$ is a rule of thumb, not an exact coverage level.
+
+\paragraph{Panels.} Page~1 of \code{exps\_summary.pdf} plots $\delta_s$ against
+$y_{T_s}$, one point per site and one panel per experiment. The band $[-1, 1]$ is shaded,
+and the panel title gives the share of sites inside it.
+
+\subsection{Predictive PIT (alternative statistic)}
+
+\paragraph{Formula.} The \emph{probability integral transform} (PIT) of the observation
+$y_t$ is the predictive cumulative probability of the value actually observed:
 \[
-  \overline{\NIS}_s = \frac{1}{N}\sum_{t=1}^{N}\NIS_t .
+  u_t = \Pr\big(y'_t \le y_t \mid y_{1:t-1}\big)
+      = \sum_{gjk}\omega_{gjk}\;
+        \Phi\!\left(\frac{y_t - \mu^F_{gjk,3}}{\sqrt{\Sigma^F_{gjk,33} + R_t}}\right)
+  \qquad(\code{hist\$pit}),
 \]
-Stored per step in \texttt{hist\$innov} and \texttt{hist\$nis}.
+where $y'_t$ is a draw from the predictive~\eqref{eq:pred} and $\Phi$ is the standard
+normal cumulative distribution function. The plotted per-site value is the
+\emph{centred} PIT of the final observation, $c_s = 2u_{T_s} - 1 \in [-1, 1]$.
 
-\paragraph{What changed vs.\ \texttt{OR\_joint\_update.Rmd}.} The older filter computed
-NIS against one Gaussian: it kept only the label with the largest \emph{posterior} weight
-and collapsed that label's forecast across Gauss--Laguerre nodes. Here $m_t$ and $S_t$
-are the moments of the whole forecast predictive~\eqref{eq:pred}. The new version
-differs in three ways:
-(i) the integral over $\tau$ uses the grid with the \emph{previous} posterior
-$\pi_{t-1}$, so it does not use $y_t$; (ii) the disturbance labels are weighted by
-their \emph{prior} $\beta_{k,t}$, again without using $y_t$; (iii) the two projected
-components $j$ are included. As a result, $\NIS_t$ is a true one-step-ahead
-(out-of-sample) check.
+\paragraph{Why this alternative.} It has the same intent and the same $[-1, 1]$ range as
+$\delta_s$, but avoids its caveats:
+\begin{itemize}
+  \item \textbf{Out of sample:} $u_t$ uses the forecast made before $y_t$ is assimilated.
+  \item \textbf{Includes observation error:} the predictive adds $R_t$.
+  \item \textbf{Uses the whole distribution:} the full mixture predictive, including the
+  disturbance components and the integration over process error, not a symmetric
+  interval.
+\end{itemize}
+If observations really come from the predictive, $u_t$ is uniform on $[0, 1]$ whatever
+the predictive's shape. So $c_s$ is uniform on $[-1, 1]$, and exactly 95\% of sites
+should have $|c_s| \le 0.95$.
 
-\paragraph{How to read it.} Because $m_t$ and $S_t$ are the exact mean and variance of
-the predictive, a calibrated filter gives $\E[\NIS_t]=1$ \emph{whatever the shape} of
-the predictive. Values above 1 mean the forecast is overconfident or biased; values
-below 1 mean the predictive is too wide. The dashed line marks 1. The grey band is
+\paragraph{Panels.}
+\begin{itemize}
+  \item Page~2 plots $c_s$ against $y_{T_s}$, one point per site, with $[-0.95, 0.95]$
+  shaded.
+  \item Page~3 is the PIT histogram: all $u_t$, pooled over sites and years, as a density
+  on $[0, 1]$. A calibrated filter gives a flat histogram at height 1 (dashed). The
+  shapes read as:
+  \begin{itemize}
+    \item U-shape: the predictive is too narrow (overconfident);
+    \item central hump: it is too wide;
+    \item mass piled on one side: it is biased. Too many small $u_t$ means the forecast
+    is too high.
+  \end{itemize}
+  \item Page~5 summarises each experiment: the share of sites with $|\delta_s| \le 1$,
+  the median $|\delta_s|$, the share of sites with $|c_s| \le 0.95$, and the same share
+  over all site-years.
+\end{itemize}
+
+%================================================================================
+\section{Plot 2: probability of detection vs.\ absolute disturbance size}
+\label{sec:det}
+
+\paragraph{Detection.} Let $t_{04}$ be the timestep for 2004 ($t_{04} = 15$). The posterior
+probability that site $s$ was disturbed in 2004 is
 \[
-  \Big[\chi^2_{N,\,0.025}/N,\ \ \chi^2_{N,\,0.975}/N\Big],
-\]
-the 95\% range of $\overline{\NIS}$ when the predictive is Gaussian and the steps are
-independent. Here the predictive is a mixture: a scale mixture over $\tau$ plus the
-disturbance components. That makes $\NIS_t$ heavier-tailed than $\chi^2_1$. Typical
-values then sit below 1, with an occasional large value in a year the forecast did not
-expect. So treat the band as a guide, not an exact test.
-
-\paragraph{Panels.} Page~1 plots $\overline{\NIS}_s$ (log scale) against the final-year
-observed biomass, one panel per experiment. Page~2 puts all experiments on one axis.
-Points are coloured by the 2004 disturbance-product label. Page~6 shows the numerator
-and denominator separately: bars are $\frac1N\sum_t\nu_t^2$ and points are
-$\frac1N\sum_t S_t$ for each site.
-
-%--------------------------------------------------------------------------------
-\section{Plot 2: disturbance detection vs.\ absolute disturbance size}
-
-\paragraph{Detection.} The posterior probability that site $s$ was disturbed in 2004
-($t_{04}$ = timestep 20) is
-\[
-  P_s = \Pr(\text{disturbed in } t_{04}\mid y_{1:t_{04}})
+  P_s = \Pr(k_{t_{04}} \ge 1 \mid y_{1:t_{04}})
       = \sum_{g}\pi_{t_{04}}(g)\sum_{j}\sum_{k\ge1} w^A_{t_{04}}(g,j,k),
 \]
-\[
-  w^A_t(g,j,k) = \frac{w_{t-1}(g,j)\,\beta_{k,t}\,\Norm(y_t;\mu^F_{gjk,3},\Sigma^F_{gjk,33}+R_t)}{Z_t(g)},
-\]
-i.e.\ \texttt{hist\$pDist[t04]}. (This is the filtering probability, so it uses data up
-to 2004 only.)
+stored as \code{hist\$pDist} at \code{hist\$year == 2004}. It is a filtering probability:
+it uses the observations up to and including 2004.
 
-\paragraph{Size.} The x-axis is the absolute observed change in above-ground biomass
-between 2003 and 2004:
+\paragraph{Size.} The x-axis is the absolute (not proportional) change in observed AGB
+from 2003 to 2004:
 \[
-  \Delta_s = y_{s,2003} - y_{s,2004}\quad(\text{kg C m}^{-2}),
+  \Delta_s = y_{s,2003} - y_{s,2004} \quad (\text{kg C m}^{-2}),
 \]
 which is positive for a loss. The sign is kept so that gains are visible. Points are
-coloured by the disturbance-product label for 2004 (\texttt{dextract[, "t2004"]}: none,
-other, cut, fire, biotic).
+coloured by the product's 2004 label for the site: none, other, cut, fire or biotic.
 
-\paragraph{Fitted curve (full runs only).} When an experiment has at least 20 sites, the
-script fits a beta regression
+\paragraph{Fitted curve (20 or more sites only).} When an experiment has at least 20
+sites, the script fits a beta regression. This is a regression for responses in $(0,1)$
+that are beta-distributed with mean $\mu_s$ and precision $\phi$:
 \[
-  \tilde P_s \sim \mathrm{Beta}(\mu_s\phi,(1-\mu_s)\phi),\qquad
-  \operatorname{logit}\mu_s = a + b\,\Delta_s,\qquad
-  \tilde P_s = \frac{P_s(n-1)+0.5}{n},
+  \tilde P_s \sim \mathrm{Beta}\big(\mu_s\phi,\ (1-\mu_s)\phi\big), \qquad
+  \operatorname{logit}\mu_s = \log\frac{\mu_s}{1-\mu_s} = a + b\,\Delta_s .
 \]
-where $\tilde P$ is shrunk so that it stays inside $(0,1)$. The plot shows $\mu(\Delta)$
-with a 2.5--97.5\% beta quantile band. Page~7 tabulates the size detected with
-probability one half, $\Delta_{50} = -a/b$. With 5 sites no fit is made, and the page
-shows only the points.
+The response is shrunk into the open interval so the beta likelihood is finite:
+$\tilde P_s = \big(P_s(n-1) + 0.5\big)/n$, with $n$ the number of sites. The panel shows
+the fitted mean $\mu(\Delta)$ and the band between the fitted beta distribution's 2.5\%
+and 97.5\% quantiles. The summary table (page~5) lists $\Delta_{50} = -a/b$, the loss
+detected with probability one half. With 5 sites no curve is fitted.
 
-\paragraph{Reading it.} With the product, the prior $\beta_{k,2004}$ is raised to the
-product's user's accuracy in years the product flags. So a flagged site can have a high
-$P_s$ even when $\Delta_s$ is small. Without the product, $P_s$ depends only on how
-well $\Delta_s$ stands out against $S_t$.
+\paragraph{Reading it.} With the product, a flag raises that year's $\beta_{k,t}$ to the
+user's accuracy. So a flagged site can reach a high $P_s$ even with a small $\Delta_s$.
+Without the product, $P_s$ is high only when $\Delta_s$ is large compared with the spread
+of the undisturbed forecast.
 
-%--------------------------------------------------------------------------------
-\section{Plot 3: innovation variance decomposition}
+\paragraph{Panels.} Page~4 of \code{exps\_summary.pdf}, one panel per experiment.
 
-Equation~\eqref{eq:S} splits into three additive parts, $S_t = S^{fc}_t + S^{q}_t + S^{R}_t$:
-\begin{align*}
-  S^{q}_t  &= \sum_{g,j}\omega_{gj0}\,\tau_g^{-1}
-            = \beta_{0,t}\sum_{g}\pi_{t-1}(g)\,\tau_g^{-1}
-            = \beta_{0,t}\,\E_{\pi_{t-1}}\!\big[\tau^{-1}\big]
-            && \text{(process error)}\\
-  S^{fc}_t &= \underbrace{\textstyle\sum_{gjk}\omega_{gjk}\,C_{gjk}}_{\text{ensemble}}
-            + \underbrace{\textstyle\sum_{gjk}\omega_{gjk}\big(\mu^F_{gjk,3}-m_t\big)^2}_{\text{between components}}
-            && \text{(forecast spread)}\\
-  S^{R}_t  &= R_t = m_R\,y_t + b_R && \text{(observation error)}
-\end{align*}
-Stored per step as \texttt{hist\$S.fc}, \texttt{hist\$S.q}, \texttt{hist\$S.R}. In code,
-$S^{fc}_t$ is computed as $\sum\omega(\Sigma^F_{33}+(\mu^F_3-m_t)^2) - S^q_t$.
-
-Process error enters only through the undisturbed label. It is the posterior-mean
-process variance scaled by the prior probability of no disturbance. The
-between-component term in $S^{fc}$ contains the spread between disturbed and undisturbed
-forecasts, weighted by $\beta_{k,t}$. In years where the disturbance prior is large, for
-example product-flagged years, this term can be much larger than the others.
-
-\paragraph{Panels.} Each part is averaged over a site's observed steps,
-$\bar S^{\,\cdot}_s = \frac1N\sum_t S^{\,\cdot}_t$.
-Page~4 shows per-site stacked bars (all sites when there are at most 30, otherwise the
-30 largest). Page~5 shows, for each experiment, the across-site mean of each part (left)
-and each part's share of the total (right).
-
-%--------------------------------------------------------------------------------
+%================================================================================
 \section{Experiment grid and test run}
 \label{sec:runs}
 
-The \texttt{run-grid} chunk of \texttt{OR\_joint\_update2.Rmd} runs all $2\times2\times2=8$
-experiments:
+The \code{run-grid} chunk of \code{OR\_joint\_update2.Rmd} runs all $2\times2\times2 = 8$
+experiments on the sites in \code{grid.sites}:
 
 \begin{center}
 \begin{tabular}{ll}
 \toprule
 factor & levels\\
 \midrule
-$R$ magnitude & GEDI, LandTrendr\\
-$R$ model & heteroskedastic (\texttt{het}), constant (\texttt{con})\\
-disturbance product & TRUE, FALSE\\
+magnitude of $R_t$ & GEDI, LandTrendr\\
+form of $R_t$ & heteroskedastic (\code{het}), constant (\code{con})\\
+disturbance product & used (\code{TRUE}), not used (\code{FALSE})\\
 \bottomrule
 \end{tabular}
 
 \smallskip
-\texttt{Rparams} $(m_R,b_R)$: GEDI het $(0.0133, 0.0976)$, GEDI con $(0, 0.885)$,
+$(m_R, b_R)$: GEDI het $(0.0133, 0.0976)$, GEDI con $(0, 0.885)$,
 LandTrendr het $(0.0133, 3.013)$, LandTrendr con $(0, 3.800)$.
 \end{center}
 
-The $\tau$ prior is Gamma(0.1, $2\times10^{-4}$) (\texttt{grid.tauPrior = "gamma"}). The
-test run used one randomly chosen site (seed 2004) for each 2004 product label, giving
-5 sites (\texttt{grid.sites}). Runs are written to \texttt{experiments/testRun} as
-\begin{center}\footnotesize\path{site_<idx>_distprod_<TF>_<source>_<model>_tau<prior>.rds},\end{center}
-and \path{OR_joint_update_analysis.Rmd} (with \texttt{indir} set to
-\texttt{experiments/testRun}) writes \texttt{exps\_summary.pdf} there. For the full run,
-set \texttt{grid.sites} to all sites with \texttt{grid.sites <- seq\_len(nrow(dextract))}.
+All runs use the Gamma $\tau$ prior above (\code{grid.tauPrior = "gamma"}). The test run
+used one randomly chosen site (seed 2004) for each of the five 2004 product labels.
+Each (experiment, site) result is saved to \code{experiments/testRun} as
+\begin{center}\footnotesize\path{site_<idx>_distprod_<TF>_<source>_<model>_tau<prior>.rds}\end{center}
+and \path{OR_joint_update_analysis.Rmd} reads that folder (\code{indir}) and writes
+\code{exps\_summary.pdf} there. For a full run, set
+\code{grid.sites <- seq\_len(nrow(dextract))}.
 
-\subsection*{Test-run results (sites 11, 118, 212, 319, 402)}
+\subsection*{Test-run results}
 
-The five sites have 2004 labels none, other, cut, fire and biotic. The figures below are
-pages 1, 3, 4 and 5 of \texttt{experiments/testRun/exps\_summary.pdf}. With five sites
-these plots show what each panel looks like and give a first sanity check; they are not
-a calibration result.
+\begin{center}
+\begin{tabular}{rlrr}
+\toprule
+site & 2004 product label & $\Delta_s$ (kg C m$^{-2}$) & $y_{2017}$ (kg C m$^{-2}$)\\
+\midrule
+11  & none   & $-0.15$ & $8.25$\\
+118 & other  & $0.30$  & $2.55$\\
+212 & cut    & $17.85$ & $10.80$\\
+319 & fire   & $0.80$  & $2.60$\\
+402 & biotic & $0.10$  & $1.90$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+With five sites these plots only show what each panel looks like and give a first
+sanity check. They are not a calibration result.
 
 \begin{itemize}
-  \item \textbf{Mean NIS.} Four of the five sites are below 1 in every experiment
-  (0.15--0.8), so the predictive is too wide at those sites. The between-component spread
-  in $S^{fc}$ is a large part of the reason. Site 212 (cut) is at 1.9--3.8. Its pixel was
-  clear-cut in 1999 (19.4 $\to$ 1.6 kg C m$^{-2}$), which gives $\NIS\approx57$ in that
-  one year. The filter then labels the drop as a disturbance ($P=1$). Its forecasts also
-  lag the fast regrowth from 2007 to 2009 ($\NIS$ 5--15). Every site also has a large
-  innovation at $t=1$, because the initial-condition ensemble is the cross-site AGB
-  distribution.
-  \item \textbf{Detection.} The observed 2003$\to$2004 changes at these sites are small
-  ($-0.1$ to $0.45$ kg C m$^{-2}$). Without the product, $P_{2004}\le 0.05$ everywhere.
-  With the product, the four flagged sites reach 0.49--0.96 and the undisturbed site
-  stays at 0.01--0.03. So at these sites the product prior, not the data, drives
-  detection.
-  \item \textbf{Variance decomposition.} With GEDI-magnitude $R$, $S$ is mostly forecast
-  spread (65--88\%). With LandTrendr-magnitude $R$, observation error is about half of
-  $S$. Process error $S^q$ is the smallest part everywhere (2--11\%). It is smaller still
-  with the product, because a raised $\beta_{k,t}$ lowers the weight $\beta_{0,t}$ on the
-  only label that carries process error.
+  \item \textbf{Filter divergence.}
+  \begin{itemize}
+    \item Every site is inside $[-1, 1]$ in all eight experiments. The median
+    $|\delta_s|$ is $0.20$--$0.52$.
+    \item It is smallest with GEDI heteroskedastic $R$ ($0.20$ and $0.23$), whose small
+    $R_t$ lets the analysis follow the observation most closely.
+    \item The sign follows the site: the high-biomass sites 11 and 212 have
+    $\delta_s > 0$, and the three low-biomass sites have $\delta_s < 0$.
+  \end{itemize}
+  \item \textbf{Final-observation PIT.} Every $|c_s| \le 0.95$ as well
+  ($|c_s| = 0.20$--$0.84$).
+  \item \textbf{PIT histogram} (140 site-years per experiment). This is where the PIT
+  shows what the divergence does not.
+  \begin{itemize}
+    \item The histograms are not flat. Most mass lies between $0.2$ and $0.4$.
+    \item Without the product, $82$--$100\%$ of the observations at sites 11, 118, 319 and
+    402 fall below the forecast median (GEDI heteroskedastic $R$). So the one-step
+    forecast is biased high: VSEM grows these sites faster than observed, and the analysis
+    pulls the state back each year.
+    \item The share of $u_t$ in $[0.25, 0.75]$ is $0.65$--$0.78$ with LandTrendr-magnitude
+    $R$, against $0.5$ expected, so that predictive is also too wide. With GEDI
+    heteroskedastic $R$ it is $0.37$--$0.49$.
+    \item With the product, a second peak appears near $u = 0.8$. It comes from flagged
+    years with little observed loss: the product's flag puts predictive mass on low
+    biomass, so an unchanged observation lands in the upper tail (e.g.\ site 118 in 2004:
+    $u = 0.82$ with the product, $0.32$ without).
+  \end{itemize}
+  \item \textbf{Detection.}
+  \begin{itemize}
+    \item Site 212 has $P_s = 1.000$ in all eight experiments: its loss of $17.85$ is
+    detected from the biomass data alone.
+    \item The other sites lose at most $0.8$. Without the product they have
+    $P_s \le 0.061$.
+    \item With the product, the flagged sites reach $0.36$--$0.83$, and the unflagged
+    site 11 stays at $0.015$--$0.035$.
+  \end{itemize}
 \end{itemize}
 
 \begin{figure}[p]
   \centering
   \includegraphics[width=\textwidth,page=1]{exps_summary.pdf}
-  \caption{Mean NIS vs.\ final-year biomass, one panel per experiment (test run).}
-  \includegraphics[width=\textwidth,page=3]{exps_summary.pdf}
-  \caption{Detection probability in 2004 vs.\ AGB loss 2003$\to$2004 (test run).}
+  \caption{Filter divergence $\delta_s$ at the final observation, one point per site and
+           one panel per experiment (test run).}
+  \includegraphics[width=\textwidth,page=2]{exps_summary.pdf}
+  \caption{Centred PIT $c_s$ of the final observation, one point per site (test run).}
 \end{figure}
 \begin{figure}[p]
   \centering
+  \includegraphics[width=\textwidth,page=3]{exps_summary.pdf}
+  \caption{PIT histograms over all sites and years (test run).}
   \includegraphics[width=\textwidth,page=4]{exps_summary.pdf}
-  \caption{Per-site mean innovation variance split into $S^{fc}$, $S^q$, $S^R$ (test run).}
-  \includegraphics[width=\textwidth,page=5]{exps_summary.pdf}
-  \caption{Across-site mean innovation variance per experiment, absolute and share (test run).}
+  \caption{Posterior probability of disturbance in 2004 against the observed AGB loss
+           from 2003 to 2004 (test run).}
 \end{figure}
 
 \end{document}

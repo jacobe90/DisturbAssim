@@ -278,6 +278,16 @@ KalmanUpdate <- function(m, C, H, R, y) {
   return(list(m_hat=m_hat, C_hat=C_hat, L_hat=L_hat))
 }
 
+# Quantiles of a 1-d Gaussian mixture sum_i w_i N(mu_i, sd_i^2), by root-finding on its
+# CDF. Components with negligible weight are dropped first.
+mix_quantile <- function(p, w, mu, sd) {
+  keep <- w > 1e-12 * sum(w)
+  w <- w[keep] / sum(w[keep]); mu <- mu[keep]; sd <- sd[keep]
+  lo <- min(mu - 8 * sd); hi <- max(mu + 8 * sd)
+  sapply(p, function(pp) uniroot(function(x) sum(w * pnorm(x, mu, sd)) - pp,
+                                 c(lo, hi), tol = 1e-8)$root)
+}
+
 # Initial tau weights: grid point g gets the prior mass of its cell,
 #   int_{lo_g}^{hi_g} p(tau) dtau,  lo_g = tau_g - (tau_g - tau_{g-1})/2,  hi_g = tau_g + (tau_{g+1} - tau_g)/2,
 # i.e. the cell edges are the midpoints to the neighbouring grid points, so the cell
@@ -331,6 +341,10 @@ project <- function(w, l, mu, sig, D) {
     }
   }
   sig2 <- sig2 - tcrossprod(mu2)
+  # a group with zero total weight has undefined moments (0/0 above); give it the other
+  # group's moments so it stays finite -- its weight is 0, so it only enters the proposal
+  if (!(w1 > 0)) { mu1 <- mu2; sig1 <- sig2 }
+  if (!(w2 > 0)) { mu2 <- mu1; sig2 <- sig1 }
   return(list(w1=w1,w2=w2,mu1=mu1,mu2=mu2,sig1=sig1,sig2=sig2))
   
 }
@@ -356,14 +370,11 @@ project <- function(w, l, mu, sig, D) {
 ##'   mean  = analysis mean of the wood pool
 ##'   var   = analysis variance of the wood pool (law of total variance)
 ##'   pDist = posterior probability of disturbance
-##'   and the one-step-ahead innovation diagnostics, from the forecast predictive of y_t
-##'   marginalised over the tau posterior pi_{t-1}(g), the components j and the
-##'   disturbance prior beta_k (i.e. before y_t is assimilated):
-##'   innov = y_t - E[y_t | y_{1:t-1}]
-##'   nis   = innov^2 / S, with S = Var[y_t | y_{1:t-1}] = S.fc + S.q + S.R
-##'   S.fc  = forecast spread (ensemble variance + spread of the component means)
-##'   S.q   = process error, beta_0 * E_{pi_{t-1}}[1/tau]
-##'   S.R   = observation error R_t
+##'   ci95  = NT x 2 matrix, 2.5% / 97.5% quantiles of the wood-pool analysis mixture
+##'   pit   = probability integral transform of y_t under its one-step-ahead predictive
+##'           (marginalised over the tau posterior pi_{t-1}(g), the components j and the
+##'           disturbance prior beta_k, i.e. before y_t is assimilated); NA without obs
+##'   wDrop = forecast weight of components dropped for degenerate importance weights
 ORJointUpdate <- function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, prior, grid) {
   NT <- dim(Y)[1]
   D  <- dist$n                      # number of disturbance sub-classes
@@ -389,12 +400,10 @@ ORJointUpdate <- function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, 
   hist <- list(
     mean  = rep(NA_real_, NT),   # wood-pool analysis mean
     var   = rep(NA_real_, NT),   # wood-pool analysis variance
+    ci95  = matrix(NA_real_, NT, 2, dimnames = list(NULL, c("lo", "hi"))),  # 95% interval
     pDist = rep(NA_real_, NT),   # P(disturbed)
-    innov = rep(NA_real_, NT),   # innovation y - predictive mean
-    nis   = rep(NA_real_, NT),   # normalized innovation squared innov^2 / S
-    S.fc  = rep(NA_real_, NT),   # S part: forecast spread
-    S.q   = rep(NA_real_, NT),   # S part: process error
-    S.R   = rep(NA_real_, NT)    # S part: observation error
+    pit   = rep(NA_real_, NT),   # P(y_t' <= y_t | y_{1:t-1}), one-step-ahead PIT
+    wDrop = rep(NA_real_, NT)    # forecast weight of degenerate (dropped) components
   )
   
   for (t in 1:NT) {
@@ -445,6 +454,17 @@ ORJointUpdate <- function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, 
     W       <- exp(logW - apply(logW, 1, max))
     W       <- W / rowSums(W)          # P x N, rows sum to 1
     cN      <- 1 - rowSums(W^2)        # P
+
+    # A component whose importance weights collapse onto ~1 sample (cN ~ 0) has no
+    # estimable forecast moments (S / cN -> Inf, then NaN likelihoods). This happens to
+    # components left far from every proposal sample, e.g. the undisturbed component at
+    # high tau right after a clear-cut, whose weight is then negligible. Such components
+    # get the unweighted ensemble moments as a finite placeholder and zero likelihood
+    # below (so zero weight); hist$wDrop records the forecast weight removed this way.
+    degen <- cN < 1e-8
+    W[degen, ] <- 1 / N
+    cN[degen]  <- 1 - 1 / N
+    dropF <- matrix(degen, G, 2)       # r = (j - 1) * G + g  ->  [g, j]
     
     for (k in 0:D) {
       sim <- sim0
@@ -493,6 +513,7 @@ ORJointUpdate <- function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, 
         }
       }
     }
+    for (k in 0:D) lA[, , k + 1][dropF] <- 0   # degenerate forecast components (see above)
     
     # compute tau posterior on grid
     beta <- array(0, dim=c(D+1))
@@ -500,20 +521,17 @@ ORJointUpdate <- function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, 
       beta[k+1] = dist$p[k+1,t]
     }
 
-    # innovation diagnostics: moment-match the forecast predictive of y_t, a mixture over
-    # (g, j, k) with weights pi_{t-1}(g) * prevW[g,j] * beta_k, each component
-    # N(muF[g,j,k,3], sigF[g,j,k,3,3] + R). For k = 0, sigF[,,1,3,3] includes 1/tau_g.
-    piPrev <- exp(qs - max(qs)); piPrev <- piPrev / sum(piPrev)          # pi_{t-1}(g)
-    wF     <- outer(outer(piPrev, rep(1, 2)) * prevW, beta)               # G x 2 x (D+1)
-    wF     <- wF / sum(wF)
-    muY    <- sum(wF * muF[, , , 3])
-    S.q    <- sum(wF[, , 1] / tauGrid)                                    # beta_0 E[1/tau]
-    S.fc   <- sum(wF * (sigF[, , , 3, 3] + (muF[, , , 3] - muY)^2)) - S.q
-    hist$innov[t] <- Y[t, 3] - muY
-    hist$S.fc[t]  <- S.fc
-    hist$S.q[t]   <- S.q
-    hist$S.R[t]   <- R
-    hist$nis[t]   <- hist$innov[t]^2 / (S.fc + S.q + R)
+    # PIT of y_t under its one-step-ahead predictive, a mixture over (g, j, k) with
+    # weights pi_{t-1}(g) * prevW[g,j] * beta_k (degenerate components dropped) and
+    # components N(muF[g,j,k,3], sigF[g,j,k,3,3] + R); for k = 0, sigF[,,1,3,3] includes
+    # the process variance 1/tau_g. Left NA on forecast-only steps with no observation.
+    piPrev <- exp(qs - max(qs)); piPrev <- piPrev / sum(piPrev)            # pi_{t-1}(g)
+    hist$wDrop[t] <- sum(piPrev * rowSums(prevW * dropF))                  # dropped weight
+    if (!is.na(Y[t, 3])) {
+      wF <- outer(outer(piPrev, rep(1, 2)) * prevW, beta) * as.vector(!dropF)  # G x 2 x (D+1)
+      wF <- wF / sum(wF)
+      hist$pit[t] <- sum(wF * pnorm(Y[t, 3], muF[, , , 3], sqrt(sigF[, , , 3, 3] + R)))
+    }
     logz <- array(0, dim=c(G))
     for (g in 1:G) {
       zsum <- 0
@@ -525,6 +543,7 @@ ORJointUpdate <- function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, 
       logz[g] <- log(zsum)
       qs[g] <- qs[g] + logz[g]
     }
+    if (any(!is.finite(logz))) stop(sprintf("t=%d: zero or non-finite marginal likelihood at %d tau grid points", t, sum(!is.finite(logz))))
     
     # tau posterior on the grid, pi_t(g)
     m <- max(qs)
@@ -559,6 +578,7 @@ ORJointUpdate <- function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, 
     hist$mean[t]  <- sum(ws * mean.g)
     hist$var[t]   <- sum(ws * msq.g) - hist$mean[t]^2
     hist$pDist[t] <- sum(ws * pDist.g)
+    hist$ci95[t, ] <- mix_quantile(c(0.025, 0.975), ws * wA, muA[, , , 3], sqrt(sigA[, , , 3, 3]))
   }
   
   return(hist)
@@ -652,16 +672,19 @@ run_grid_row <- function(i) {
   fname <- file.path(grid.outdir, sprintf("site_%d_distprod_%s_%s_%s_tau%s.rds", e$site,
                                           e$useDistProduct, r$source, r$model, grid.tauPrior))
   if (file.exists(fname) && !grid.overwrite) return(fname)
-  run_joint_update_sites(e$site, Rparams = r$Rparams, useDistProduct = e$useDistProduct,
-                         tauPrior = grid.tauPrior, Rparams.source = r$source,
-                         Rparams.model = r$model, outdir = grid.outdir)
-  fname
+  ## catch errors per run: mclapply otherwise marks every run of the failing worker as failed
+  tryCatch({
+    run_joint_update_sites(e$site, Rparams = r$Rparams, useDistProduct = e$useDistProduct,
+                           tauPrior = grid.tauPrior, Rparams.source = r$source,
+                           Rparams.model = r$model, outdir = grid.outdir)
+    fname
+  }, error = function(err) structure(conditionMessage(err), class = "try-error"))
 }
 
 RNGkind("L'Ecuyer-CMRG"); set.seed(1)
 grid.out <- parallel::mclapply(seq_len(nrow(exp.grid)), run_grid_row, mc.cores = grid.cores)
 failed   <- which(sapply(grid.out, inherits, "try-error"))
-if (length(failed)) print(cbind(exp.grid[failed, ], error = unlist(grid.out[failed])))
+if (length(failed)) print(cbind(exp.grid[failed, ], error = sapply(grid.out[failed], as.character)))
 ```
 
 ## analysis
