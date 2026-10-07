@@ -15,7 +15,14 @@ source("disturbance.R")      # disturbance.p() forecast perturbation
 load("STprior.RData")
 load("extract.h03v04.RData")
 load("dis.postprocessed.RData")
+## The products cover different years (see StateTransition.Rmd), so every lookup
+## goes through calendar year rather than column index:
+##   dextract (disturbance product): 1985:2012
+##   bextract (biomass / Yw):        1990:2017
+##   DA timesteps:                   1990:2017 (timestep t <-> year atime[t])
 dtime <- 1985:2012
+ctime <- 1990:2017
+atime <- 1990:2017
 colnames(dextract) <- paste0("t",dtime)
 dextract[is.na(dextract)] <- 0
 d.prior["UN"] = d.prior["UN"] + d.prior[6]                         ## change at runtime (removes <NA>)
@@ -28,9 +35,17 @@ Qsoil = Qs
 
 ```{r}
 latlon = points@coords # lat / lon of each site in dextract 
-metFile = "daymet.RData"
+## Cached met must be for exactly these sites, in this order: rad[i,] is used as
+## site i's driver. (The older daymet.RData was for a different 559-point sample.)
+metFile = "daymet.h03v04.RData"
+met_matches_points <- function(dm) {
+  length(dm) == nrow(latlon) &&
+    all(abs(sapply(dm, function(d) d$longitude[1]) - latlon[,1]) < 1e-3) &&
+    all(abs(sapply(dm, function(d) d$latitude[1])  - latlon[,2]) < 1e-3)
+}
 if(file.exists(metFile)){
   load(metFile)
+  stopifnot(met_matches_points(dm))
 } else {
   dm = list()
   for(i in 1:nrow(latlon)){
@@ -50,6 +65,12 @@ for(i in seq_along(dm)){
   rad[i,] = srad$value*1e-6*86400*SW2PAR  # -> MJ /m2 /day PAR (convert) # QUESTION -- should the changing day length, from the daymet day length values, be used (instead of a fixed 24-hr day length)?
 }
 plot(metTime,rad[1,],type='l')
+
+## PAR restricted to the DA window (daymet has 365 days every year, so each DA
+## timestep is one contiguous 365-day block). The full 1985-2017 `rad` is still
+## used for spin-up below.
+radDA <- rad[, srad$year %in% atime, drop = FALSE]
+stopifnot(ncol(radDA) == 365 * length(atime))
 ## plot(date,PAR,col=2) ## calibration data
 ```
 
@@ -84,12 +105,13 @@ for (dclass in names(dist.priors)) {
 ```{r}
 ## BIOMASS
 B2C = 0.5 ##biomass to carbon ratio
-Yw <- bextract*B2C*1000*1e-4 ## convert Mg/ha (Mg per hectacre)  to  kg C [356 (num ensemble members) x 28 (num years observed)]
+Yw <- bextract*B2C*1000*1e-4 ## convert Mg/ha (Mg per hectacre)  to  kg C [nsite x 28 years, 1990:2017]
+colnames(Yw) <- paste0("t", ctime)
 Rw <- (84*B2C*1000*1e-4)^2 ## Observation Error: Kennedy et al 2018 Environ. Res. Lett. 13 025004; Fig 2 RMSE
 ## units: Mg/ha -> kg/m2
 print(dim(Yw))
-## grab the distribution of AGB for the first time point from all pixels
-AGBprior <- Yw[,1]
+## grab the distribution of AGB at the start of the DA window from all pixels
+AGBprior <- Yw[, paste0("t", atime[1])]
 ne = length(AGBprior) ## number of ensemble members
 
 ## spin up
@@ -128,7 +150,7 @@ pairs(ICprior)
 ## ---- Site-independent setup (computed once) --------------------------------
 ## Number of disturbance sub-classes and number of assimilation years.
 n.dist = length(dist.forecastparams)
-NT = floor(ncol(rad)/365)
+NT = length(atime)
 
 ## Background disturbance-type probability per forecast component, by matching
 ## the component's name to one of "other"/"cut"/"fire"/"biotic".
@@ -187,12 +209,15 @@ make_or_args <- function(site, useDistProduct = TRUE, tauPrior = c("gamma", "log
     distidx.toname = list("10"="OTHER", "20"="CUT", "40"="FIRE", "50"="PEST")
     users_accuracy = c(1-d.prior[1], .77, .92, .77, .78, .78) ## 0 = none, 10 = other, 20 = cut, 30 = road, 40 = fire, 50 = biotic
 
+    ## product years inside the DA window and their DA timesteps
+    dyrs <- intersect(dtime, atime)
+    dprod <- dextract[site, paste0("t", dyrs)]
     for (d in seq(names(dist.priors))) {
       d.name <- names(dist.priors)[d]
-      has.dist <- which(dextract[site,] == d.name)
+      has.dist <- which(dprod == d.name)                 # index into dyrs
       if (length(has.dist) > 0) {
         is.dist <- which(names(dist.prior.probs) == distidx.toname[[d.name]]) + 1
-        p.dist[is.dist, has.dist] <- users_accuracy[dextract[site, has.dist]/10 + 1]
+        p.dist[is.dist, match(dyrs[has.dist], atime)] <- users_accuracy[dprod[has.dist]/10 + 1]
       }
     }
   }
@@ -224,16 +249,19 @@ make_or_args <- function(site, useDistProduct = TRUE, tauPrior = c("gamma", "log
   )
 
   ## NT x 3 observation matrix with the wood-pool obs in column 3.
+  ## Rows stay aligned with DA timesteps; years without an observation stay NA
+  ## (forecast-only step in ORJointUpdate) rather than being dropped, which would
+  ## shift Y out of step with p.dist and PAR.
   Y <- matrix(NA, NT, 3)
-  Y[1:ncol(Yw), 3] <- Yw[site, ]
-  Y <- Y[!is.na(Y[,3]),,drop=FALSE] # drop rows with wood-pool=NA
-  
+  oyrs <- intersect(ctime, atime)
+  Y[match(oyrs, atime), 3] <- Yw[site, paste0("t", oyrs)]
+
   ## tau prior and grid
   prior <- switch(tauPrior,
     gamma      = list(type = "gamma", shape = 0.1, rate = 2e-4),
     loguniform = list(type = "loguniform"))
   grid <- list(tauMin = 0.1, tauMax = 10^4)
-  list(Y = Y, disturb.params = disturb.params, PAR = rad[site, ], site = site, prior = prior, grid = grid)
+  list(Y = Y, disturb.params = disturb.params, PAR = radDA[site, ], site = site, prior = prior, grid = grid)
 }
 ```
 
@@ -434,14 +462,21 @@ ORJointUpdate <- function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, 
     muA <- array(0, dim=c(G, 2, D+1, 3))
     sigA <- array(0, dim=c(G, 2, D+1, 3, 3))
     H  <- matrix(c(0, 0, 1), 1, 3)
-    R <- Y[t, 3] * Rparams[1] + Rparams[2] # heteroskedastic obs error
-    for (j in 1:2) {
-      for (k in 0:D) {
-        for (g in 1:G) {
-          out <- KalmanUpdate(muF[g,j,k+1,], sigF[g,j,k+1,,], H, R, Y[t, 3])
-          muA[g,j,k+1,] <- out$m_hat
-          sigA[g,j,k+1,,] <- out$C_hat
-          lA[g,j,k+1] <- out$L_hat
+    if (is.na(Y[t, 3])) {
+      # no observation: analysis = forecast, flat likelihood (weights move only by the prior p)
+      muA  <- muF
+      sigA <- sigF
+      lA[] <- 1
+    } else {
+      R <- Y[t, 3] * Rparams[1] + Rparams[2] # heteroskedastic obs error
+      for (j in 1:2) {
+        for (k in 0:D) {
+          for (g in 1:G) {
+            out <- KalmanUpdate(muF[g,j,k+1,], sigF[g,j,k+1,,], H, R, Y[t, 3])
+            muA[g,j,k+1,] <- out$m_hat
+            sigA[g,j,k+1,,] <- out$C_hat
+            lA[g,j,k+1] <- out$L_hat
+          }
         }
       }
     }
@@ -515,7 +550,7 @@ run_joint_update_sites <- function(site.idx, Rparams = Rparams.GEDI.het,
                                    tauPrior = c("gamma", "loguniform"),
                                    Rparams.source = c("GEDI", "LandTrendr"),
                                    Rparams.model  = c("het", "con"),
-                                   outdir = "experiments/jointUpdateTestSep") {
+                                   outdir = "experiments/jointUpdate1990") {
   Rparams.source <- match.arg(Rparams.source)
   Rparams.model  <- match.arg(Rparams.model)
   tauPrior       <- match.arg(tauPrior)
@@ -529,6 +564,8 @@ run_joint_update_sites <- function(site.idx, Rparams = Rparams.GEDI.het,
                          Q = Q, PAR = args$PAR, Xic = ICprior,
                          THETA = theta[1:11], dist = args$disturb.params, prior=args$prior,
                          grid = args$grid)
+    out$year <- atime                  # calendar year of each DA timestep
+    out$obs  <- args$Y[, 3]            # assimilated obs, aligned with out$year (NA = none)
     fname <- file.path(outdir,
                        sprintf("site_%d_distprod_%s_%s_%s_tau%s.rds",
                                site, useDistProduct, Rparams.source, Rparams.model, tauPrior))
@@ -550,15 +587,14 @@ run_joint_update_sites(site.idx = c(300), Rparams = Rparams.GEDI.het, useDistPro
 
 ```{r}
 ## Load a saved ORJointUpdate run. The site index and run settings are parsed from
-## the file name (site_<idx>_distprod_<TF>_<source>_<model>_tau<prior>.rds), and the
-## matching wood-pool observations are taken from Yw (same NA handling as make_or_args).
+## the file name (site_<idx>_distprod_<TF>_<source>_<model>_tau<prior>.rds). Runs
+## store their own year axis ($year) and aligned observations ($obs); runs made
+## before that (which put 1990 biomass at a 1985 timestep) are rejected.
 load_hist <- function(file) {
   h     <- readRDS(file)
   tag   <- sub("\\.rds$", "", basename(file))
   site  <- as.integer(sub("^site_(\\d+)_.*$", "\\1", tag))
-  obs   <- Yw[site, ]
-  h$obs  <- obs[!is.na(obs)]
-  h$year <- dtime[seq_along(h$mean)]
+  if (is.null(h$year)) stop(file, ": no $year axis -- stale run from before the 1990 alignment fix; rerun it")
   h$site <- site
   h$tag  <- tag
   h
@@ -580,7 +616,7 @@ plot_analysis <- function(h, main = sprintf("Site %d: wood-pool analysis", h$sit
   abline(h = axTicks(2), col = .pal$grid)
   polygon(c(x, rev(x)), c(lo, rev(hi)), col = adjustcolor(.pal$band, 0.2), border = NA)
   lines(x, h$mean, col = .pal$mean, lwd = 2.5)
-  points(x[seq_along(h$obs)], h$obs, pch = 21, bg = .pal$obs, col = "white", cex = 1.1)
+  points(x, h$obs, pch = 21, bg = .pal$obs, col = "white", cex = 1.1)
   legend("topright", bty = "n", cex = 0.85, text.col = .pal$ink,
          legend = c("analysis mean", "95% interval", "observation"),
          col = c(.pal$mean, adjustcolor(.pal$band, 0.35), .pal$obs),
@@ -605,7 +641,7 @@ plot_pdist <- function(h, main = sprintf("Site %d: probability of disturbance", 
 ```
 
 ```{r, fig.width = 9, fig.height = 4.5}
-h <- load_hist("experiments/jointUpdateTestSep/site_300_distprod_TRUE_GEDI_het_taugamma.rds")
+h <- load_hist("experiments/jointUpdate1990/site_300_distprod_TRUE_GEDI_het_tauloguniform.rds")
 plot_analysis(h)
 plot_pdist(h)
 ```
