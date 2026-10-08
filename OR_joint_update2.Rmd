@@ -427,6 +427,8 @@ project_grid <- function(w, mu, sig) {
 ##'           component there was degenerate (zero marginal likelihood)
 ##'   bias, biasResid, biasW = b_t applied at step t, and r_t, w_t (NA without obs)
 ##'   predMeanRaw = predictive mean of y_t without the bias shift
+##'   predMean0, predVar0, predProcVar0 = one-step-ahead predictive mean / variance (incl.
+##'           R) / process-variance part, conditioned on no disturbance (k = 0 only)
 ORJointUpdate <- function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, prior, grid,
                           bias = NULL) {
   if (!is.null(bias)) {
@@ -468,6 +470,10 @@ ORJointUpdate <- function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, 
     predVar     = rep(NA_real_, NT),   # Var[y_t | y_{1:t-1}], including R
     predProcVar = rep(NA_real_, NT),   # its process-error part: E over components of 1{k=0}/tau_g
     predR       = rep(NA_real_, NT),   # its observation-error part R_t
+    ## the same predictive conditioned on no disturbance (k = 0 components only):
+    predMean0   = rep(NA_real_, NT),   # E[y_t | y_{1:t-1}, z_t = 0]
+    predVar0    = rep(NA_real_, NT),   # Var[y_t | y_{1:t-1}, z_t = 0], including R
+    predProcVar0 = rep(NA_real_, NT),  # its process-error part E[1/tau_g | y_{1:t-1}, z_t = 0]
     procVar     = rep(NA_real_, NT),   # posterior mean process variance E[1/tau | y_{1:t}]
     predMeanRaw = rep(NA_real_, NT),   # E[y_t | y_{1:t-1}] without the bias shift
     bias        = rep(0, NT),          # b_t added to the k = 0 wood forecast mean at step t
@@ -612,6 +618,10 @@ ORJointUpdate <- function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, 
       hist$predVar[t]     <- sum(wF * (sigF[, , , 3, 3] + R + muF[, , , 3]^2)) - hist$predMean[t]^2
       hist$predProcVar[t] <- sum(wF[, , 1] / tauGrid)    # k = 0 components carry 1/tau_g
       hist$predR[t]       <- R
+      w0 <- wF[, , 1] / sum(wF[, , 1])                     # k = 0 weights, renormalised
+      hist$predMean0[t]    <- sum(w0 * muF[, , 1, 3])
+      hist$predVar0[t]     <- sum(w0 * (sigF[, , 1, 3, 3] + R + muF[, , 1, 3]^2)) - hist$predMean0[t]^2
+      hist$predProcVar0[t] <- sum(w0 / tauGrid)
     }
     wPrior <- outer(prevW, beta)                     # G x 2 x (D+1): prevW[g,j] * beta_k
     zsum   <- apply(wPrior * lA, 1, sum)             # marginal likelihood of y_t given tau_g
