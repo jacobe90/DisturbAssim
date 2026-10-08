@@ -723,8 +723,17 @@ workers; existing files are skipped unless `grid.overwrite = TRUE`, so an interr
 run can be restarted and picks up where it left off. Progress (% finished, failures,
 elapsed time, ETA) is printed every time a run completes.
 
+`grid.bias` turns on the online bias correction of the undisturbed wood forecast for
+every run (see the `bias` argument of `ORJointUpdate`); `NULL` runs without it. With it
+on, file names get a `_bias` suffix, so corrected and uncorrected runs don't overwrite
+each other.
+
 ```{r run-grid}
-grid.outdir    <- "experiments/fullRun"
+grid.outdir    <- "experiments/fullRunBias"
+## bias correction: discounted weighted mean b = S_t / N_t (denom = "N"), skipping the
+## first observed step (its forecast comes from the population IC prior, so its large
+## residual is IC mismatch, not VSEM bias). NULL = no bias correction.
+grid.bias      <- list(rho = 0.9, denom = "N", skip = 1)
 grid.tauPriors <- "gamma"
 grid.overwrite <- FALSE
 grid.cores     <- max(1, parallel::detectCores() - 2)
@@ -740,8 +749,9 @@ Rparams.grid <- list(
 exp.grid <- expand.grid(R = names(Rparams.grid), useDistProduct = c(TRUE, FALSE),
                         tauPrior = grid.tauPriors, site = grid.sites, stringsAsFactors = FALSE)
 exp.grid$file <- with(exp.grid, file.path(grid.outdir, sprintf(
-  "site_%d_distprod_%s_%s_%s_tau%s.rds", site, useDistProduct,
-  sapply(Rparams.grid[R], `[[`, "source"), sapply(Rparams.grid[R], `[[`, "model"), tauPrior)))
+  "site_%d_distprod_%s_%s_%s_tau%s%s.rds", site, useDistProduct,
+  sapply(Rparams.grid[R], `[[`, "source"), sapply(Rparams.grid[R], `[[`, "model"), tauPrior,
+  if (is.null(grid.bias)) "" else "_bias")))
 if (!dir.exists(grid.outdir)) dir.create(grid.outdir, recursive = TRUE)
 
 run_grid_row <- function(i) {
@@ -752,7 +762,7 @@ run_grid_row <- function(i) {
   tryCatch({
     run_joint_update_sites(e$site, Rparams = r$Rparams, useDistProduct = e$useDistProduct,
                            tauPrior = e$tauPrior, Rparams.source = r$source,
-                           Rparams.model = r$model, outdir = grid.outdir)
+                           Rparams.model = r$model, outdir = grid.outdir, bias = grid.bias)
     e$file
   }, error = function(err) structure(conditionMessage(err), class = "try-error"))
 }
@@ -782,8 +792,9 @@ report <- function() {
                   n.fail, length(running), fmt_secs(elapsed), fmt_secs(eta)))
 }
 
-message(sprintf("experiment grid: %d runs (%d sites x %d settings), %d already done, %d workers",
-                n.total, length(grid.sites), n.total / length(grid.sites), n.skip, grid.cores))
+message(sprintf("experiment grid: %d runs (%d sites x %d settings), %d already done, %d workers, bias correction %s",
+                n.total, length(grid.sites), n.total / length(grid.sites), n.skip, grid.cores,
+                if (is.null(grid.bias)) "off" else "on"))
 report()
 while (length(todo) || length(running)) {
   while (length(running) < grid.cores && length(todo)) {
