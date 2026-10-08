@@ -348,6 +348,36 @@ project <- function(w, l, mu, sig, D) {
   return(list(w1=w1,w2=w2,mu1=mu1,mu2=mu2,sig1=sig1,sig2=sig2))
   
 }
+
+# project() applied to every tau grid point g at once. w: G x 2 x (D+1) weights,
+# mu: G x 2 x (D+1) x 3, sig: G x 2 x (D+1) x 3 x 3. Group 1 is the undisturbed
+# components (k = 0), group 2 the disturbed ones (k >= 1). Returns w (G x 2),
+# mu (G x 2 x 3) and sig (G x 2 x 3 x 3), indexed [g, group, ...].
+project_grid <- function(w, mu, sig) {
+  G <- dim(w)[1]; C <- prod(dim(w)[-1])        # components c = j + 2k, j fastest
+  muC  <- array(mu,  c(G, C, 3))
+  sigC <- array(sig, c(G, C, 3, 3))
+  w1 <- w[, 1, 1] + w[, 2, 1]
+  w2 <- 1 - w1
+  grp <- list(seq_len(C) <= 2, seq_len(C) > 2)  # group 1: k = 0
+  wg  <- list(w1, w2)
+  out <- list(w = cbind(w1, w2, deparse.level = 0), mu = array(0, c(G, 2, 3)),
+              sig = array(0, c(G, 2, 3, 3)))
+  for (h in 1:2) {
+    A <- matrix(w, G, C) / wg[[h]]              # alpha: within-group weights
+    A[, !grp[[h]]] <- 0
+    for (a in 1:3) out$mu[, h, a] <- rowSums(A * muC[, , a])
+    for (a in 1:3) for (b in 1:3)
+      out$sig[, h, a, b] <- rowSums(A * (muC[, , a] * muC[, , b] + sigC[, , a, b])) -
+                            out$mu[, h, a] * out$mu[, h, b]
+  }
+  # a group with zero total weight has undefined moments (0/0 above); give it the other
+  # group's moments so it stays finite -- its weight is 0, so it only enters the proposal
+  z1 <- !(w1 > 0); z2 <- !(w2 > 0) & !z1
+  out$mu[z1, 1, ]    <- out$mu[z1, 2, ];    out$sig[z1, 1, , ] <- out$sig[z1, 2, , ]
+  out$mu[z2, 2, ]    <- out$mu[z2, 1, ];    out$sig[z2, 2, , ] <- out$sig[z2, 1, , ]
+  out
+}
 ```
 
 ```{r}
@@ -403,7 +433,13 @@ ORJointUpdate <- function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, 
     ci95  = matrix(NA_real_, NT, 2, dimnames = list(NULL, c("lo", "hi"))),  # 95% interval
     pDist = rep(NA_real_, NT),   # P(disturbed)
     pit   = rep(NA_real_, NT),   # P(y_t' <= y_t | y_{1:t-1}), one-step-ahead PIT
-    wDrop = rep(NA_real_, NT)    # forecast weight of degenerate (dropped) components
+    wDrop = rep(NA_real_, NT),   # forecast weight of degenerate (dropped) components
+    ## one-step-ahead predictive of y_t (NA on steps with no observation):
+    predMean    = rep(NA_real_, NT),   # E[y_t | y_{1:t-1}]
+    predVar     = rep(NA_real_, NT),   # Var[y_t | y_{1:t-1}], including R
+    predProcVar = rep(NA_real_, NT),   # its process-error part: E over components of 1{k=0}/tau_g
+    predR       = rep(NA_real_, NT),   # its observation-error part R_t
+    procVar     = rep(NA_real_, NT)    # posterior mean process variance E[1/tau | y_{1:t}]
   )
   
   for (t in 1:NT) {
@@ -466,35 +502,35 @@ ORJointUpdate <- function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, 
     cN[degen]  <- 1 - 1 / N
     dropF <- matrix(degen, G, 2)       # r = (j - 1) * G + g  ->  [g, j]
     
+    ia <- rep(1:3, 3); ib <- rep(1:3, each = 3)   # column (a, b) of a flattened 3 x 3
     for (k in 0:D) {
       sim <- sim0
       if (k > 0) {
-        mu0 <- dist$vals[[k]]$mu0
-        V0  <- dist$vals[[k]]$V0
-        for (n in seq_len(N)) sim[n, ] <- disturbance.p(sim[n, ], mu0, V0, dist$alloc.soil)
+        sim <- disturbance.p.rows(sim0, dist$vals[[k]]$mu0, dist$vals[[k]]$V0, dist$alloc.soil)
       }
-    
+
       MU <- W %*% sim                              # P x 3, every mean in one matmul
-    
-      for (r in seq_len(P)) {
-        g  <- (r - 1L) %%  G + 1L
-        j  <- (r - 1L) %/% G + 1L
-        Sc <- sweep(sim, 2, MU[r, ])
-        S  <- crossprod(Sc, W[r, ] * Sc) / cN[r]
-        if (k == 0) {
-          S <- S + Q
-          S[3, 3] <- S[3, 3] - Q[3, 3] + 1 / tauGrid[g]
-        }
-        muF[g, j, k + 1, ]    <- MU[r, ]
-        sigF[g, j, k + 1, , ] <- S
+
+      # every weighted covariance in one matmul (rows of W sum to 1):
+      #   S_r = (sum_n W[r,n] x_n x_n' - MU_r MU_r') / cN_r,
+      # with x centred on the ensemble mean first to limit cancellation
+      ctr <- colMeans(sim)
+      Xc  <- sweep(sim, 2, ctr)
+      MUc <- sweep(MU, 2, ctr)
+      S   <- (W %*% (Xc[, ia] * Xc[, ib]) - MUc[, ia] * MUc[, ib]) / cN   # P x 9
+      if (k == 0) {
+        S <- sweep(S, 2, as.vector(Q), "+")
+        S[, 9] <- S[, 9] - Q[3, 3] + 1 / rep(tauGrid, 2)    # S[3, 3]: process var 1/tau_g
       }
+      # r = (j - 1) * G + g runs g fastest, so P x 3 / P x 9 fill [g, j, , ] in order
+      muF[, , k + 1, ]    <- MU
+      sigF[, , k + 1, , ] <- S
     }
     
     # compute analysis
     lA <- array(0, dim=c(G, 2, D+1))
     muA <- array(0, dim=c(G, 2, D+1, 3))
     sigA <- array(0, dim=c(G, 2, D+1, 3, 3))
-    H  <- matrix(c(0, 0, 1), 1, 3)
     if (is.na(Y[t, 3])) {
       # no observation: analysis = forecast, flat likelihood (weights move only by the prior p)
       muA  <- muF
@@ -502,16 +538,13 @@ ORJointUpdate <- function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, 
       lA[] <- 1
     } else {
       R <- Y[t, 3] * Rparams[1] + Rparams[2] # heteroskedastic obs error
-      for (j in 1:2) {
-        for (k in 0:D) {
-          for (g in 1:G) {
-            out <- KalmanUpdate(muF[g,j,k+1,], sigF[g,j,k+1,,], H, R, Y[t, 3])
-            muA[g,j,k+1,] <- out$m_hat
-            sigA[g,j,k+1,,] <- out$C_hat
-            lA[g,j,k+1] <- out$L_hat
-          }
-        }
-      }
+      # KalmanUpdate for every (g, j, k) at once. H = (0, 0, 1) and R is scalar, so with
+      # s = C33 + R:  K = C[, 3] / s,  m_hat = m + K (y - m3),  C_hat = C - K C[3, ]
+      s    <- sigF[, , , 3, 3] + R                                  # G x 2 x (D+1)
+      K    <- sigF[, , , , 3] / as.vector(s)                         # G x 2 x (D+1) x 3
+      muA  <- muF + K * as.vector(Y[t, 3] - muF[, , , 3])
+      for (a in 1:3) for (b in 1:3) sigA[, , , a, b] <- sigF[, , , a, b] - K[, , , a] * sigF[, , , 3, b]
+      lA[] <- dnorm(Y[t, 3], mean = muF[, , , 3], sd = sqrt(s))
     }
     for (k in 0:D) lA[, , k + 1][dropF] <- 0   # degenerate forecast components (see above)
     
@@ -531,44 +564,30 @@ ORJointUpdate <- function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, 
       wF <- outer(outer(piPrev, rep(1, 2)) * prevW, beta) * as.vector(!dropF)  # G x 2 x (D+1)
       wF <- wF / sum(wF)
       hist$pit[t] <- sum(wF * pnorm(Y[t, 3], muF[, , , 3], sqrt(sigF[, , , 3, 3] + R)))
+      hist$predMean[t]    <- sum(wF * muF[, , , 3])
+      hist$predVar[t]     <- sum(wF * (sigF[, , , 3, 3] + R + muF[, , , 3]^2)) - hist$predMean[t]^2
+      hist$predProcVar[t] <- sum(wF[, , 1] / tauGrid)    # k = 0 components carry 1/tau_g
+      hist$predR[t]       <- R
     }
-    logz <- array(0, dim=c(G))
-    for (g in 1:G) {
-      zsum <- 0
-      for (j in 1:2) {
-        for (k in 0:D) {
-          zsum <- zsum + prevW[g,j] * beta[k+1] * lA[g,j,k+1]
-        }
-      }
-      logz[g] <- log(zsum)
-      qs[g] <- qs[g] + logz[g]
-    }
+    wPrior <- outer(prevW, beta)                     # G x 2 x (D+1): prevW[g,j] * beta_k
+    zsum   <- apply(wPrior * lA, 1, sum)             # marginal likelihood of y_t given tau_g
+    logz   <- log(zsum)
+    qs     <- qs + logz
     if (any(!is.finite(logz))) stop(sprintf("t=%d: zero or non-finite marginal likelihood at %d tau grid points", t, sum(!is.finite(logz))))
     
     # tau posterior on the grid, pi_t(g)
     m <- max(qs)
     ws <- exp(qs - m) / sum(exp(qs - m))
+    hist$procVar[t] <- sum(ws / tauGrid)
     
     # analysis weights
-    wA <- array(0, dim=c(G, 2, D+1))
-    for (g in 1:G) {
-      for (j in 1:2) {
-        for (k in 0:D) {
-          wA[g,j,k+1] <- prevW[g,j] * beta[k+1] * lA[g,j,k+1] / exp(logz[g])
-        }
-      }
-    }
+    wA <- wPrior * lA / zsum
     
-    # recompute prev posterior vals (KL projection)
-    for (g in 1:G) {
-      out <- project(wA[g,,], lA[g,,], muA[g,,,], sigA[g,,,,], D)
-      prevW[g,1] <- out$w1
-      prevW[g,2] <- out$w2
-      prevMu[g,1,] <- out$mu1
-      prevMu[g,2,] <- out$mu2
-      prevSig[g,1,,] <- out$sig1
-      prevSig[g,2,,] <- out$sig2
-    }
+    # recompute prev posterior vals (KL projection), for every tau grid point at once
+    out     <- project_grid(wA, muA, sigA)
+    prevW   <- out$w
+    prevMu  <- out$mu
+    prevSig <- out$sig
     
     # store analysis values for this tstep, marginalised over the tau grid (weights
     # pi_t(g) = ws) and the components (j, k) (weights wA[g, , ], which sum to 1 for each g)
@@ -605,7 +624,7 @@ run_joint_update_sites <- function(site.idx, Rparams = Rparams.GEDI.het,
   if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
   results <- list()
   for (site in site.idx) {
-    message("running joint update for site ", site)
+    message("running joint update for site ")
     # function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, prior)
     args <- make_or_args(site, useDistProduct, tauPrior)
     out <- ORJointUpdate(Y = args$Y, Rparams = Rparams,
@@ -634,27 +653,21 @@ run_joint_update_sites(site.idx = c(300), Rparams = Rparams.GEDI.het, useDistPro
 ## experiment grid
 
 Runs every combination of observation-error model (GEDI / LandTrendr magnitude x
-heteroskedastic / constant R) and disturbance product (with / without), i.e. 8
-experiments, over `grid.sites`. Each (experiment, site) run is saved to `grid.outdir`
-with the usual `site_<idx>_distprod_<TF>_<source>_<model>_tau<prior>.rds` name, which
+heteroskedastic / constant R), disturbance product (with / without) and tau prior
+(gamma / log-uniform), i.e. 16 experiments, over every site in `dextract`. Each
+(experiment, site) run is saved to `grid.outdir` with the usual
+`site_<idx>_distprod_<TF>_<source>_<model>_tau<prior>.rds` name, which
 `OR_joint_update_analysis.Rmd` parses. Runs are spread over `grid.cores` forked
-workers; existing files are skipped unless `grid.overwrite = TRUE`.
+workers; existing files are skipped unless `grid.overwrite = TRUE`, so an interrupted
+run can be restarted and picks up where it left off. Progress (% finished, failures,
+elapsed time, ETA) is printed every time a run completes.
 
 ```{r run-grid}
-grid.outdir    <- "experiments/testRun"
-grid.tauPrior  <- "gamma"
+grid.outdir    <- "experiments/fullRun"
+grid.tauPriors <- "gamma"
 grid.overwrite <- FALSE
 grid.cores     <- max(1, parallel::detectCores() - 2)
-
-## test sites: one random site per 2004 disturbance-product label
-## (0 = none, 10 = other, 20 = cut, 40 = fire, 50 = biotic) -> 5 sites
-set.seed(2004)
-lab04      <- dextract[, "t2004"]
-grid.sites <- sapply(sort(unique(lab04)), function(l) {
-  s <- which(lab04 == l)
-  s[sample.int(length(s), 1)]
-})
-## grid.sites <- seq_len(nrow(dextract))   # full run
+grid.sites     <- seq_len(nrow(dextract))   # all sites
 
 ## observation-error models: label -> (Rparams, source, model)
 Rparams.grid <- list(
@@ -664,27 +677,79 @@ Rparams.grid <- list(
   LandTrendr_con = list(Rparams = Rparams.Landtrendr.fixed, source = "LandTrendr", model = "con")
 )
 exp.grid <- expand.grid(R = names(Rparams.grid), useDistProduct = c(TRUE, FALSE),
-                        site = grid.sites, stringsAsFactors = FALSE)
+                        tauPrior = grid.tauPriors, site = grid.sites, stringsAsFactors = FALSE)
+exp.grid$file <- with(exp.grid, file.path(grid.outdir, sprintf(
+  "site_%d_distprod_%s_%s_%s_tau%s.rds", site, useDistProduct,
+  sapply(Rparams.grid[R], `[[`, "source"), sapply(Rparams.grid[R], `[[`, "model"), tauPrior)))
+if (!dir.exists(grid.outdir)) dir.create(grid.outdir, recursive = TRUE)
 
 run_grid_row <- function(i) {
   e <- exp.grid[i, ]
   r <- Rparams.grid[[e$R]]
-  fname <- file.path(grid.outdir, sprintf("site_%d_distprod_%s_%s_%s_tau%s.rds", e$site,
-                                          e$useDistProduct, r$source, r$model, grid.tauPrior))
-  if (file.exists(fname) && !grid.overwrite) return(fname)
-  ## catch errors per run: mclapply otherwise marks every run of the failing worker as failed
+  set.seed(i)   # per-run seed: results don't depend on which worker / in what order
+  ## catch errors per run so one failure doesn't take down the worker
   tryCatch({
     run_joint_update_sites(e$site, Rparams = r$Rparams, useDistProduct = e$useDistProduct,
-                           tauPrior = grid.tauPrior, Rparams.source = r$source,
+                           tauPrior = e$tauPrior, Rparams.source = r$source,
                            Rparams.model = r$model, outdir = grid.outdir)
-    fname
+    e$file
   }, error = function(err) structure(conditionMessage(err), class = "try-error"))
 }
 
-RNGkind("L'Ecuyer-CMRG"); set.seed(1)
-grid.out <- parallel::mclapply(seq_len(nrow(exp.grid)), run_grid_row, mc.cores = grid.cores)
-failed   <- which(sapply(grid.out, inherits, "try-error"))
-if (length(failed)) print(cbind(exp.grid[failed, ], error = sapply(grid.out[failed], as.character)))
+fmt_secs <- function(s) {
+  if (!is.finite(s)) return("--")
+  s <- round(s); sprintf("%dh%02dm%02ds", s %/% 3600, (s %% 3600) %/% 60, s %% 60)
+}
+
+## Worker pool: keep grid.cores forked runs going and collect them as they finish, so
+## the main process can report progress after every completed run.
+n.total  <- nrow(exp.grid)
+grid.out <- vector("list", n.total)
+todo     <- if (grid.overwrite) seq_len(n.total) else which(!file.exists(exp.grid$file))
+grid.out[setdiff(seq_len(n.total), todo)] <- exp.grid$file[setdiff(seq_len(n.total), todo)]
+n.skip   <- n.total - length(todo)
+n.done   <- n.skip; n.fail <- 0
+running  <- list()   # pid -> list(job, row)
+t0       <- Sys.time()
+
+report <- function() {
+  elapsed <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+  n.new   <- n.done - n.skip
+  eta     <- if (n.new > 0) elapsed / n.new * (n.total - n.done) else NA
+  message(sprintf("[%s] %d / %d runs finished (%.1f%%) | %d failed | %d running | elapsed %s | ETA %s",
+                  format(Sys.time(), "%H:%M:%S"), n.done, n.total, 100 * n.done / n.total,
+                  n.fail, length(running), fmt_secs(elapsed), fmt_secs(eta)))
+}
+
+message(sprintf("experiment grid: %d runs (%d sites x %d settings), %d already done, %d workers",
+                n.total, length(grid.sites), n.total / length(grid.sites), n.skip, grid.cores))
+report()
+while (length(todo) || length(running)) {
+  while (length(running) < grid.cores && length(todo)) {
+    i   <- todo[1]; todo <- todo[-1]
+    job <- parallel::mcparallel(run_grid_row(i), silent = TRUE)
+    running[[as.character(job$pid)]] <- list(job = job, row = i)
+  }
+  res <- parallel::mccollect(lapply(running, `[[`, "job"), wait = FALSE, timeout = 5)
+  for (pid in names(res)) {
+    i   <- running[[pid]]$row
+    out <- res[[pid]]
+    if (is.null(out)) out <- structure("worker died (no result returned)", class = "try-error")
+    grid.out[[i]] <- out
+    n.done <- n.done + 1
+    if (inherits(out, "try-error")) {
+      n.fail <- n.fail + 1
+      message(sprintf("  FAILED: site %d, %s, distprod %s, tau %s: %s", exp.grid$site[i],
+                      exp.grid$R[i], exp.grid$useDistProduct[i], exp.grid$tauPrior[i], out))
+    }
+    running[[pid]] <- NULL
+  }
+  if (length(res)) report()
+}
+
+failed <- which(sapply(grid.out, inherits, "try-error"))
+if (length(failed)) print(cbind(exp.grid[failed, c("R", "useDistProduct", "tauPrior", "site")],
+                                error = sapply(grid.out[failed], as.character)))
 ```
 
 ## analysis

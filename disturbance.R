@@ -40,6 +40,26 @@ disturbance.p <- function(x,                         ## x = Bleaf, Bsoil, Bstem
   return(x)
 }
 
+## disturbance.p applied to every row of X (n x 3: Bleaf, Bsoil, Bstem) in one call.
+## For diagonal V0 the draw covariance tcrossprod(old)*V0 is diagonal, so its square
+## root is old*sqrt(diag(V0)); the rnorm draws are consumed in the same order as n
+## sequential disturbance.p calls, giving the same result for the same RNG state.
+## Non-diagonal V0 falls back to the row-by-row loop.
+disturbance.p.rows <- function(X, mu0 = c(1,1), V0 = diag(c(0.15,0.25))^2, alloc.soil = 0.25){
+  if (any(V0[upper.tri(V0)] != 0)) {
+    for (n in seq_len(nrow(X))) X[n, ] <- disturbance.p(X[n, ], mu0, V0, alloc.soil)
+    return(X)
+  }
+  old.biomass <- X[, c(1,3), drop = FALSE]
+  z <- matrix(rnorm(2 * nrow(X)), ncol = 2, byrow = TRUE)
+  new.biomass <- old.biomass * rep(mu0, each = nrow(X)) + abs(old.biomass) * z * rep(sqrt(diag(V0)), each = nrow(X))
+  new.biomass <- pmin(tobit(new.biomass), old.biomass)   # 0 <= new.biomass <= old.biomass
+  residual <- rowSums(old.biomass - new.biomass)
+  X[, c(1,3)] <- new.biomass
+  X[, 2] <- X[, 2] + residual*alloc.soil
+  X
+}
+
 disturbance2 <- function(x,type){ ## x = Bleaf, Bsoil, Bstem
   old.biomass <- x[c(1,3)]  # select leaf/stem biomass
   Mu0 <- mu0[,type] * old.biomass                         ## mean for disturbed biomass (proportional to old biomass)

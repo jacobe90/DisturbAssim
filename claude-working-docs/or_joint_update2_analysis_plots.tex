@@ -291,8 +291,13 @@ should have $|c_s| \le 0.95$.
 
 \paragraph{Panels.}
 \begin{itemize}
-  \item Page~2 plots $c_s$ against $y_{T_s}$, one point per site, with $[-0.95, 0.95]$
-  shaded.
+  \item Page~2 pools the final-observation PIT over every run, i.e.\ every
+  (experiment, site) pair. The left panel is the histogram of $u_{T_s}$ over all runs,
+  with the share of runs with $|c_s| \le 0.95$ and the range expected from sampling noise
+  in the title. The right panel is the coverage-error curve of
+  Section~\ref{sec:coverage}, one line per experiment and a thick line for all runs.
+  (The test-run version of this page, Figure~\ref{fig:test1}, still plots $c_s$ against
+  $y_{T_s}$ per site.)
   \item Page~3 is the PIT histogram: all $u_t$, pooled over sites and years, as a density
   on $[0, 1]$. A calibrated filter gives a flat histogram at height 1 (dashed). The
   shapes read as:
@@ -304,7 +309,75 @@ should have $|c_s| \le 0.95$.
   \end{itemize}
   \item Page~5 summarises each experiment: the share of sites with $|\delta_s| \le 1$,
   the median $|\delta_s|$, the share of sites with $|c_s| \le 0.95$, and the same share
-  over all site-years.
+  over all site-years. The last row pools all experiments.
+\end{itemize}
+
+\subsection{Coverage error of the central predictive intervals}
+\label{sec:coverage}
+
+The share of runs with $|c_s| \le 0.95$ checks one interval, the central 95\%. The
+coverage-error curve (page~2, right) runs the same check at every level, and so tests
+the whole shape of the predictive, not only its tails.
+
+\paragraph{Formula.} Write $F$ for the cumulative distribution function of the
+predictive~\eqref{eq:pred}. For a nominal level $p \in (0, 1)$, the \emph{central
+$p$-interval} is the middle fraction $p$ of the predictive,
+$\big[F^{-1}\big(\tfrac{1-p}{2}\big),\ F^{-1}\big(\tfrac{1+p}{2}\big)\big]$. The
+observation falls inside it exactly when
+\[
+  \tfrac{1-p}{2} \le u \le \tfrac{1+p}{2}
+  \quad\Longleftrightarrow\quad |2u - 1| \le p
+  \quad\Longleftrightarrow\quad |c| \le p ,
+\]
+so no quantiles need to be computed: the PIT alone decides it. Over a set of $n$ runs
+with centred PITs $c_1, \dots, c_n$, the empirical coverage and the coverage error at
+level $p$ are
+\[
+  \hat\kappa(p) = \frac{1}{n}\sum_{r=1}^{n} \mathbf{1}\{|c_r| \le p\}, \qquad
+  e(p) = \hat\kappa(p) - p .
+\]
+The curve plots $e(p)$ at $p = 0.05, 0.10, \dots, 0.95$ and $0.99$. The 95\% check of
+page~5 is the single point $\hat\kappa(0.95)$.
+
+\paragraph{What a calibrated filter gives.} If $u$ is uniform on $[0,1]$, then
+$\Pr(|c| \le p) = p$ for every $p$, so $\hat\kappa(p) \approx p$ and $e(p) \approx 0$
+across the whole curve. A curve that stays inside the grey band at every level is
+consistent with a calibrated predictive.
+
+\paragraph{How to read the sign.}
+\begin{itemize}
+  \item $e(p) > 0$: the observation lands inside the central $p$-interval \emph{more}
+  often than the fraction $p$. The predictive is \textbf{too wide} at that level
+  (underconfident): its intervals are wider than the forecast errors require.
+  \item $e(p) < 0$: the observation lands inside \emph{less} often than $p$. The
+  predictive is \textbf{too narrow} (overconfident), or centred in the wrong place.
+  \item A curve of one sign at every level is a pure spread problem: negative throughout
+  for a predictive that is too narrow (a U-shaped PIT histogram), positive throughout for
+  one that is too wide (a hump at $u = 0.5$).
+  \item A curve that is negative at small $p$ and positive at larger $p$ means the PITs
+  pile up at a fixed distance from the centre. For example, if most $u$ lie near $0.3$
+  (so $|c| \approx 0.4$), the observation misses the narrow intervals with $p < 0.4$ but
+  falls inside every interval with $p > 0.4$. This is the signature of a \textbf{biased}
+  predictive that is also too wide, and it is what the full run shows (Figure~\ref{fig:coverage}).
+\end{itemize}
+Because $|c|$ throws away the sign of $c$, the curve cannot say \emph{which} way a bias
+goes: $u = 0.3$ and $u = 0.7$ count the same. The histogram on the left of the same page
+shows the direction (mass below $0.5$ means the forecast is too high).
+
+\paragraph{Grey bands.} Even a calibrated filter gives $e(p) \neq 0$ from sampling
+noise. If the $n$ runs are independent and calibrated, $n\hat\kappa(p) \sim
+\mathrm{Binomial}(n, p)$, and the band at level $p$ runs between the binomial 2.5\% and
+97.5\% quantiles divided by $n$, minus $p$. The light band uses $n$ for one experiment
+(the smallest experiment, one run per site); the darker band uses $n$ for all runs pooled.
+Two cautions:
+\begin{itemize}
+  \item The bands are pointwise. Over the 20 levels, a calibrated curve can step outside
+  at one or two of them by chance, so look for a systematic departure, not a single point.
+  \item The pooled band assumes the pooled runs are independent. They are not: the eight
+  experiments filter the same sites and observations, so their PITs are correlated, and
+  the true sampling spread of the pooled curve is wider than the dark band. The
+  per-experiment band does not have this problem, because each experiment has one run
+  per site.
 \end{itemize}
 
 %================================================================================
@@ -442,6 +515,7 @@ sanity check. They are not a calibration result.
   \includegraphics[width=\textwidth,page=1]{exps_summary.pdf}
   \caption{Filter divergence $\delta_s$ at the final observation, one point per site and
            one panel per experiment (test run).}
+  \label{fig:test1}
   \includegraphics[width=\textwidth,page=2]{exps_summary.pdf}
   \caption{Centred PIT $c_s$ of the final observation, one point per site (test run).}
 \end{figure}
@@ -452,6 +526,19 @@ sanity check. They are not a calibration result.
   \includegraphics[width=\textwidth,page=4]{exps_summary.pdf}
   \caption{Posterior probability of disturbance in 2004 against the observed AGB loss
            from 2003 to 2004 (test run).}
+\end{figure}
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=\textwidth,page=2]{exps_summary_fullRun.pdf}
+  \caption{Page~2 from the full run (538 sites $\times$ 8 experiments, 4{,}304 runs).
+           Left: histogram of the final-observation PIT over all runs. Right: coverage
+           error $e(p)$ of the central predictive intervals (Section~\ref{sec:coverage}),
+           one thin line per experiment and a thick line for all runs pooled. 96.5\% of
+           runs fall in the central 95\% (slightly above the 94.3--95.6\% expected), yet
+           the pooled curve is negative for $p \le 0.35$ (down to $-0.06$) and reaches
+           $+0.19$ at $p = 0.6$--$0.65$: the PITs bunch near $u \approx 0.3$, so the
+           forecast is biased high and too wide.}
+  \label{fig:coverage}
 \end{figure}
 
 \end{document}
