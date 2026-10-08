@@ -548,6 +548,10 @@ ORJointUpdate <- function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, 
       Xc  <- sweep(sim, 2, ctr)
       MUc <- sweep(MU, 2, ctr)
       S   <- (W %*% (Xc[, ia] * Xc[, ib]) - MUc[, ia] * MUc[, ib]) / cN   # P x 9
+      # the subtraction above can leave a variance slightly negative by round-off when
+      # every member maps to (almost) the same value, e.g. a disturbance taking a
+      # near-zero wood pool to ~0; clamp the diagonal at 0
+      S[, c(1, 5, 9)] <- pmax(S[, c(1, 5, 9)], 0)
       if (k == 0) {
         S <- sweep(S, 2, as.vector(Q), "+")
         S[, 9] <- S[, 9] - Q[3, 3] + 1 / rep(tauGrid, 2)    # S[3, 3]: process var 1/tau_g
@@ -655,7 +659,7 @@ ORJointUpdate <- function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, 
     hist$mean[t]  <- sum(ws * mean.g)
     hist$var[t]   <- sum(ws * msq.g) - hist$mean[t]^2
     hist$pDist[t] <- sum(ws * pDist.g)
-    hist$ci95[t, ] <- mix_quantile(c(0.025, 0.975), ws * wA, muA[, , , 3], sqrt(sigA[, , , 3, 3]))
+    hist$ci95[t, ] <- mix_quantile(c(0.025, 0.975), ws * wA, muA[, , , 3], sqrt(pmax(sigA[, , , 3, 3], 0)))
   }
   
   return(hist)
