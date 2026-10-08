@@ -721,7 +721,9 @@ heteroskedastic / constant R), disturbance product (with / without) and tau prio
 `OR_joint_update_analysis.Rmd` parses. Runs are spread over `grid.cores` forked
 workers; existing files are skipped unless `grid.overwrite = TRUE`, so an interrupted
 run can be restarted and picks up where it left off. Progress (% finished, failures,
-elapsed time, ETA) is printed every time a run completes.
+elapsed time, ETA) is printed every time a run completes. A worker still running after
+`grid.timeout` seconds is killed and its run retried once. Runs much faster under
+`Rscript` than inside RStudio, whose forked workers can deadlock (see `run_grid_row`).
 
 `grid.bias` turns on the online bias correction of the undisturbed wood forecast for
 every run (see the `bias` argument of `ORJointUpdate`); `NULL` runs without it. With it
@@ -737,6 +739,7 @@ grid.bias      <- list(rho = 0.9, denom = "N", skip = 1)
 grid.tauPriors <- "gamma"
 grid.overwrite <- FALSE
 grid.cores     <- max(1, parallel::detectCores() - 2)
+grid.timeout   <- 300   # seconds; a worker running longer is killed and its run retried once
 grid.sites     <- seq_len(nrow(dextract))   # all sites
 
 ## observation-error models: label -> (Rparams, source, model)
@@ -758,13 +761,16 @@ run_grid_row <- function(i) {
   e <- exp.grid[i, ]
   r <- Rparams.grid[[e$R]]
   set.seed(i)   # per-run seed: results don't depend on which worker / in what order
-  ## catch errors per run so one failure doesn't take down the worker
-  tryCatch({
+  ## catch errors per run so one failure doesn't take down the worker. Messages and
+  ## warnings are muffled here, inside the worker: otherwise they reach RStudio's global
+  ## condition handler, which in a forked child can block forever on a lock held by
+  ## another RStudio thread at fork time (the worker then never returns).
+  tryCatch(suppressWarnings(suppressMessages({
     run_joint_update_sites(e$site, Rparams = r$Rparams, useDistProduct = e$useDistProduct,
                            tauPrior = e$tauPrior, Rparams.source = r$source,
                            Rparams.model = r$model, outdir = grid.outdir, bias = grid.bias)
     e$file
-  }, error = function(err) structure(conditionMessage(err), class = "try-error"))
+  })), error = function(err) structure(conditionMessage(err), class = "try-error"))
 }
 
 fmt_secs <- function(s) {
@@ -780,7 +786,8 @@ todo     <- if (grid.overwrite) seq_len(n.total) else which(!file.exists(exp.gri
 grid.out[setdiff(seq_len(n.total), todo)] <- exp.grid$file[setdiff(seq_len(n.total), todo)]
 n.skip   <- n.total - length(todo)
 n.done   <- n.skip; n.fail <- 0
-running  <- list()   # pid -> list(job, row)
+running  <- list()   # pid -> list(job, row, start)
+retried  <- integer(0)
 t0       <- Sys.time()
 
 report <- function() {
@@ -800,8 +807,28 @@ while (length(todo) || length(running)) {
   while (length(running) < grid.cores && length(todo)) {
     i   <- todo[1]; todo <- todo[-1]
     job <- parallel::mcparallel(run_grid_row(i), silent = TRUE)
-    running[[as.character(job$pid)]] <- list(job = job, row = i)
+    running[[as.character(job$pid)]] <- list(job = job, row = i, start = Sys.time())
   }
+  ## watchdog: kill workers stuck past grid.timeout (a typical run takes seconds) and
+  ## retry each such run once; a second timeout is recorded as a failure
+  for (pid in names(running)) {
+    if (as.numeric(difftime(Sys.time(), running[[pid]]$start, units = "secs")) < grid.timeout) next
+    i <- running[[pid]]$row
+    tools::pskill(as.integer(pid), tools::SIGKILL)
+    parallel::mccollect(running[[pid]]$job, wait = TRUE)   # reap the killed child
+    running[[pid]] <- NULL
+    if (!(i %in% retried)) {
+      retried <- c(retried, i); todo <- c(i, todo)
+      message(sprintf("  TIMEOUT: site %d, %s, distprod %s -- killed after %gs, retrying",
+                      exp.grid$site[i], exp.grid$R[i], exp.grid$useDistProduct[i], grid.timeout))
+    } else {
+      grid.out[[i]] <- structure(sprintf("timed out twice (> %gs)", grid.timeout), class = "try-error")
+      n.done <- n.done + 1; n.fail <- n.fail + 1
+      message(sprintf("  FAILED: site %d, %s, distprod %s: timed out twice",
+                      exp.grid$site[i], exp.grid$R[i], exp.grid$useDistProduct[i]))
+    }
+  }
+  if (!length(running)) next
   res <- parallel::mccollect(lapply(running, `[[`, "job"), wait = FALSE, timeout = 5)
   for (pid in names(res)) {
     i   <- running[[pid]]$row
