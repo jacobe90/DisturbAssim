@@ -395,6 +395,24 @@ project_grid <- function(w, mu, sig) {
 ##' @param N ensemble size
 ##' @param prior prior for tau: list(type = "gamma", shape, rate) or list(type = "loguniform")
 ##' @param grid list(tauMin, tauMax) for the log-spaced tau grid
+##' @param bias NULL (no bias correction) or a list configuring an online additive
+##'   bias correction b_t of the undisturbed (k = 0) wood-pool forecast mean:
+##'     rho    discount factor in (0, 1] on past residuals (default 0.9)
+##'     denom  "N": b_{t+1} = S_t / N_t (weighted discounted mean, default);
+##'            "t": b_{t+1} = S_t / n_t, n_t = # obs used so far (shrinks b toward 0)
+##'     skip   number of initial observed steps not used for b (default 1). The first
+##'            forecast starts from the population-wide IC prior (ICprior), so its
+##'            residual measures IC mismatch, not VSEM bias.
+##'     burnin number of observed steps after `skip` that use w_t = 1 instead of
+##'            P(z_t = 0 | y_{1:t}) (guards against bias being absorbed as disturbance)
+##'     wMin   b is only updated on steps with P(z_t = 0 | y_{1:t}) >= wMin (after burn-in)
+##'   Each observed step, with posterior component weights
+##'     tw_{gjk} prop. to pi_{t-1}(g) prevW[g,j] beta_k N(y_t; muF_{gjk,3} + b_t 1{k=0}, sigF_{gjk,33} + R_t),
+##'   r_t = sum_{gj} tw_{gj0} (y_t - muF_{gj0,3}) / sum_{gj} tw_{gj0}   (residual vs the RAW forecast),
+##'   w_t = sum_{gj} tw_{gj0} = P(z_t = 0 | y_{1:t}),
+##'   S_t = rho S_{t-1} + w_t r_t,  N_t = rho N_{t-1} + w_t,  b_{t+1} = S_t / N_t.
+##'   b_t is added to muF[, , k = 0, 3] (only the undisturbed components) before the
+##'   analysis at step t; b_1 = 0. y_t only enters b from t + 1 onward.
 ##' @return list of length-NT vectors, each marginalised over the tau grid with the
 ##'   tau posterior pi_t(g) and over the mixture components (j, k):
 ##'   mean  = analysis mean of the wood pool
@@ -405,7 +423,15 @@ project_grid <- function(w, mu, sig) {
 ##'           (marginalised over the tau posterior pi_{t-1}(g), the components j and the
 ##'           disturbance prior beta_k, i.e. before y_t is assimilated); NA without obs
 ##'   wDrop = forecast weight of components dropped for degenerate importance weights
-ORJointUpdate <- function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, prior, grid) {
+##'   bias, biasResid, biasW = b_t applied at step t, and r_t, w_t (NA without obs)
+##'   predMeanRaw = predictive mean of y_t without the bias shift
+ORJointUpdate <- function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, prior, grid,
+                          bias = NULL) {
+  if (!is.null(bias)) {
+    bias <- modifyList(list(rho = 0.9, denom = "N", skip = 1, burnin = 0, wMin = 0), bias)
+    bias$denom <- match.arg(bias$denom, c("N", "t"))
+  }
+  bS <- 0; bN <- 0; bObs <- 0; bHat <- 0   # bias-correction state (S_t, N_t, # obs, b_{t+1})
   NT <- dim(Y)[1]
   D  <- dist$n                      # number of disturbance sub-classes
   icMean <- colMeans(Xic)
@@ -439,7 +465,11 @@ ORJointUpdate <- function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, 
     predVar     = rep(NA_real_, NT),   # Var[y_t | y_{1:t-1}], including R
     predProcVar = rep(NA_real_, NT),   # its process-error part: E over components of 1{k=0}/tau_g
     predR       = rep(NA_real_, NT),   # its observation-error part R_t
-    procVar     = rep(NA_real_, NT)    # posterior mean process variance E[1/tau | y_{1:t}]
+    procVar     = rep(NA_real_, NT),   # posterior mean process variance E[1/tau | y_{1:t}]
+    predMeanRaw = rep(NA_real_, NT),   # E[y_t | y_{1:t-1}] without the bias shift
+    bias        = rep(0, NT),          # b_t added to the k = 0 wood forecast mean at step t
+    biasResid   = rep(NA_real_, NT),   # r_t: P(z=0)-weighted residual vs the raw k = 0 forecast
+    biasW       = rep(NA_real_, NT)    # w_t = P(z_t = 0 | y_{1:t})
   )
   
   for (t in 1:NT) {
@@ -526,6 +556,12 @@ ORJointUpdate <- function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, 
       muF[, , k + 1, ]    <- MU
       sigF[, , k + 1, , ] <- S
     }
+
+    # bias correction: shift the undisturbed wood forecast mean by b_t (raw copy kept
+    # for the residual r_t, which is measured against the uncorrected forecast)
+    muF0raw <- muF[, , 1, 3]                       # G x 2
+    if (!is.null(bias)) muF[, , 1, 3] <- muF0raw + bHat
+    hist$bias[t] <- bHat
     
     # compute analysis
     lA <- array(0, dim=c(G, 2, D+1))
@@ -565,6 +601,7 @@ ORJointUpdate <- function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, 
       wF <- wF / sum(wF)
       hist$pit[t] <- sum(wF * pnorm(Y[t, 3], muF[, , , 3], sqrt(sigF[, , , 3, 3] + R)))
       hist$predMean[t]    <- sum(wF * muF[, , , 3])
+      hist$predMeanRaw[t] <- hist$predMean[t] - bHat * sum(wF[, , 1])
       hist$predVar[t]     <- sum(wF * (sigF[, , , 3, 3] + R + muF[, , , 3]^2)) - hist$predMean[t]^2
       hist$predProcVar[t] <- sum(wF[, , 1] / tauGrid)    # k = 0 components carry 1/tau_g
       hist$predR[t]       <- R
@@ -582,6 +619,27 @@ ORJointUpdate <- function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, 
     
     # analysis weights
     wA <- wPrior * lA / zsum
+
+    # bias update from y_t (applied from t + 1 on). Posterior weights of the undisturbed
+    # components, tw_{gj0} = pi_t(g) wA[g, j, 0], which equals
+    # pi_{t-1}(g) prevW[g,j] beta_0 N(y_t; muF + b, sigF + R) / normaliser.
+    if (!is.null(bias) && !is.na(Y[t, 3])) {
+      tw0 <- ws * wA[, , 1]                        # G x 2
+      wt  <- sum(tw0)                              # P(z_t = 0 | y_{1:t})
+      if (wt > 0) {
+        rt <- sum(tw0 * (Y[t, 3] - muF0raw)) / wt
+        bObs <- bObs + 1
+        burn <- bObs <= bias$skip + bias$burnin
+        if (burn) wt <- 1                          # burn-in: full weight
+        hist$biasResid[t] <- rt
+        hist$biasW[t]     <- wt
+        if (bObs > bias$skip && (burn || wt >= bias$wMin)) {
+          bS <- bias$rho * bS + wt * rt
+          bN <- bias$rho * bN + wt
+          bHat <- if (bias$denom == "N") bS / bN else bS / (bObs - bias$skip)
+        }
+      }
+    }
     
     # recompute prev posterior vals (KL projection), for every tau grid point at once
     out     <- project_grid(wA, muA, sigA)
@@ -617,7 +675,8 @@ run_joint_update_sites <- function(site.idx, Rparams = Rparams.GEDI.het,
                                    tauPrior = c("gamma", "loguniform"),
                                    Rparams.source = c("GEDI", "LandTrendr"),
                                    Rparams.model  = c("het", "con"),
-                                   outdir = "experiments/jointUpdate1990") {
+                                   outdir = "experiments/jointUpdate1990",
+                                   bias = NULL) {
   Rparams.source <- match.arg(Rparams.source)
   Rparams.model  <- match.arg(Rparams.model)
   tauPrior       <- match.arg(tauPrior)
@@ -630,12 +689,14 @@ run_joint_update_sites <- function(site.idx, Rparams = Rparams.GEDI.het,
     out <- ORJointUpdate(Y = args$Y, Rparams = Rparams,
                          Q = Q, PAR = args$PAR, Xic = ICprior,
                          THETA = theta[1:11], dist = args$disturb.params, prior=args$prior,
-                         grid = args$grid)
+                         grid = args$grid, bias = bias)
     out$year <- atime                  # calendar year of each DA timestep
     out$obs  <- args$Y[, 3]            # assimilated obs, aligned with out$year (NA = none)
     fname <- file.path(outdir,
                        sprintf("site_%d_distprod_%s_%s_%s_tau%s.rds",
                                site, useDistProduct, Rparams.source, Rparams.model, tauPrior))
+    if (!is.null(bias)) fname <- sub("\\.rds$", "_bias.rds", fname)
+    out$biasConfig <- bias
     saveRDS(out, fname)
     results[[as.character(site)]] <- out
   }
