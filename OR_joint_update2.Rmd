@@ -423,6 +423,8 @@ project_grid <- function(w, mu, sig) {
 ##'           (marginalised over the tau posterior pi_{t-1}(g), the components j and the
 ##'           disturbance prior beta_k, i.e. before y_t is assimilated); NA without obs
 ##'   wDrop = forecast weight of components dropped for degenerate importance weights
+##'   wDropTau = tau-posterior mass pi_{t-1}(g) of grid points dropped because every
+##'           component there was degenerate (zero marginal likelihood)
 ##'   bias, biasResid, biasW = b_t applied at step t, and r_t, w_t (NA without obs)
 ##'   predMeanRaw = predictive mean of y_t without the bias shift
 ORJointUpdate <- function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, prior, grid,
@@ -460,6 +462,7 @@ ORJointUpdate <- function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, 
     pDist = rep(NA_real_, NT),   # P(disturbed)
     pit   = rep(NA_real_, NT),   # P(y_t' <= y_t | y_{1:t-1}), one-step-ahead PIT
     wDrop = rep(NA_real_, NT),   # forecast weight of degenerate (dropped) components
+    wDropTau = rep(0, NT),       # tau-posterior mass of grid points with zero likelihood
     ## one-step-ahead predictive of y_t (NA on steps with no observation):
     predMean    = rep(NA_real_, NT),   # E[y_t | y_{1:t-1}]
     predVar     = rep(NA_real_, NT),   # Var[y_t | y_{1:t-1}], including R
@@ -613,8 +616,19 @@ ORJointUpdate <- function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, 
     wPrior <- outer(prevW, beta)                     # G x 2 x (D+1): prevW[g,j] * beta_k
     zsum   <- apply(wPrior * lA, 1, sum)             # marginal likelihood of y_t given tau_g
     logz   <- log(zsum)
+    # A grid point whose components are ALL degenerate has zero marginal likelihood. This
+    # happens at extreme tau that hold negligible posterior mass (e.g. tau ~ 0.1, process
+    # sd ~ 3 kg C m-2, when the mode is at tau ~ 500): drop it (pi_t(g) = 0 from here on)
+    # rather than stop. Stop only if the dropped mass is not negligible.
+    badG <- !is.finite(logz)
+    if (any(badG)) {
+      hist$wDropTau[t] <- sum(piPrev[badG])
+      if (all(badG) || hist$wDropTau[t] > 1e-6)
+        stop(sprintf("t=%d: zero or non-finite marginal likelihood at %d tau grid points (tau-posterior mass %.2g)",
+                     t, sum(badG), hist$wDropTau[t]))
+      logz[badG] <- -Inf
+    }
     qs     <- qs + logz
-    if (any(!is.finite(logz))) stop(sprintf("t=%d: zero or non-finite marginal likelihood at %d tau grid points", t, sum(!is.finite(logz))))
     
     # tau posterior on the grid, pi_t(g)
     m <- max(qs)
@@ -623,6 +637,9 @@ ORJointUpdate <- function(Y, Rparams, Q, PAR, Xic, THETA, dist, G = 200, N=100, 
     
     # analysis weights
     wA <- wPrior * lA / zsum
+    # dropped grid points (pi_t(g) = 0): prior weights as a finite placeholder, so their
+    # projected moments stay finite (they still enter the proposal, with zero weight)
+    if (any(badG)) wA[badG, , ] <- wPrior[badG, , ]
 
     # bias update from y_t (applied from t + 1 on). Posterior weights of the undisturbed
     # components, tw_{gj0} = pi_t(g) wA[g, j, 0], which equals
