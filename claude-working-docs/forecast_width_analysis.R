@@ -270,7 +270,10 @@ yr.tab <- do.call(rbind, lapply(Rm.np, function(R) do.call(rbind, lapply(c("raw"
   d <- PT[[R]][[k]]
   do.call(rbind, lapply(split(d, d$t), function(x) data.frame(
     R.mod = R, run = k, year = atime[x$t[1]], v = median(x$vPrev), cov50 = cov50(x$pit),
-    calErr = calerr(x$pit), Qshare = median(x$Q / x$V), Rshare = median(x$R / x$V))))
+    calErr = calerr(x$pit), Qshare = median(x$Q / x$V), Rshare = median(x$R / x$V),
+    vMean = mean(x$vPrev), vQ25 = quantile(x$vPrev, 0.25, names = FALSE), vQ75 = quantile(x$vPrev, 0.75, names = FALSE),
+    pitMean = mean(x$pit), pitMed = median(x$pit),
+    pitQ25 = quantile(x$pit, 0.25, names = FALSE), pitQ75 = quantile(x$pit, 0.75, names = FALSE))))
 }))))
 cat("\n== 6. PIT over time (no product, 538 sites): per period, median v_{t-1}, coverage error of the central 50% interval, calibration error ==\n")
 per.tab <- do.call(rbind, lapply(Rm.np, function(R) do.call(rbind, lapply(c("raw", "cor"), function(k) {
@@ -308,27 +311,52 @@ mtext("One-step-ahead PIT by period, no product, 538 sites:  bars = bias-correct
       outer = TRUE, line = 1, cex = 1.05, col = ink)
 dev.off()
 
-## figure (b): per-year coverage error of the central 50% interval, learned process
-## variance, and the process / R shares of the predictive variance
-cols4 <- c(GEDI_het = "#2a78d6", GEDI_con = "#1a4f99", LandTrendr_het = "#eb6834", LandTrendr_con = "#a8461f")
-png(file.path(out.dir, "fw_pit_time.png"), width = 16, height = 4.4, units = "in", res = 140)
-.par(mfrow = c(1, 4), mar = c(4.4, 4.6, 4.2, 0.8))
-pp <- list(list(v = "v", lab = "median learned process variance v[t-1]\n(log scale)", log = "y"),
-           list(v = "Qshare", lab = "median share of predictive variance\nfrom process error Q / V"),
-           list(v = "Rshare", lab = "median share of predictive variance\nfrom observation error R / V"),
-           list(v = "cov50", lab = "coverage error of central 50% interval\n(> 0 too wide; 0 calibrated)", ref = 0))
-for (p in pp) {
-  yl <- range(yr.tab[[p$v]], p$ref, na.rm = TRUE)
-  plot(NA, xlim = range(atime[-1]), ylim = yl, log = if (is.null(p$log)) "" else p$log,
-       xlab = "year", ylab = "", main = p$lab, cex.main = 1)
-  abline(h = axTicks(2), col = grid.col)
-  if (!is.null(p$ref)) abline(h = p$ref, lty = 2, col = ink)
-  for (R in Rm.np) for (k in c("raw", "cor")) {
-    x <- yr.tab[yr.tab$R.mod == R & yr.tab$run == k, ]
-    lines(x$year, x[[p$v]], col = cols4[R], lwd = if (k == "cor") 2.2 else 1.3, lty = if (k == "cor") 1 else 3)
+## figure (b): per year t (x axis), one row per observation-error model, bias-corrected
+## (blue) vs uncorrected (gray):
+##   left:   v_{t-1}, the process variance the forecast of y_t uses -- median and IQR
+##           over sites (line, band) and mean over sites (thin line)
+##   middle: PIT of y_t over sites -- median and IQR (line, band) and mean (thin line);
+##           calibrated: median 0.5, IQR 0.25-0.75
+##   right:  coverage error of the central 50% interval (> 0: too wide; 0: calibrated)
+cat("\n== 6b. per-year process variance and PIT (no product, 538 sites) ==\n")
+print(cbind(yr.tab[, 1:3], signif(yr.tab[, c("v", "vMean", "vQ25", "vQ75", "pitMean", "pitMed", "pitQ25", "pitQ75", "cov50")], 3)),
+      row.names = FALSE)
+write.csv(yr.tab, file.path(out.dir, "fw_pit_time.csv"), row.names = FALSE)
+png(file.path(out.dir, "fw_pit_time.png"), width = 14, height = 13, units = "in", res = 140)
+.par(mfrow = c(length(Rm.np), 3), mar = c(3.6, 4.6, 3.2, 0.8), oma = c(1.2, 2, 3.4, 0))
+vyl <- range(yr.tab[, c("vQ25", "vQ75", "vMean")])
+for (R in Rm.np) {
+  X <- list(raw = yr.tab[yr.tab$R.mod == R & yr.tab$run == "raw", ],
+            cor = yr.tab[yr.tab$R.mod == R & yr.tab$run == "cor", ])
+  sty <- list(raw = list(col = c.raw, lty = 2), cor = list(col = c.cor, lty = 1))
+  band_line <- function(x, lo, mid, hi, mn, k) {
+    polygon(c(x$year, rev(x$year)), c(x[[lo]], rev(x[[hi]])), col = adjustcolor(sty[[k]]$col, 0.18), border = NA)
+    lines(x$year, x[[mid]], col = sty[[k]]$col, lwd = 2.2, lty = sty[[k]]$lty)
+    lines(x$year, x[[mn]], col = sty[[k]]$col, lwd = 1, lty = 3)
   }
-  if (p$v == "v") legend("topright", bty = "n", cex = 0.78, text.col = ink,
-    legend = c(Rlab[Rm.np], "solid = bias-corrected", "dotted = uncorrected"),
-    col = c(cols4[Rm.np], ink, ink), lwd = c(rep(2, 4), 2.2, 1.3), lty = c(rep(1, 4), 1, 3))
+  ## process variance
+  plot(NA, xlim = range(atime[-1]), ylim = vyl, log = "y", xlab = "", ylab = "", cex.main = 1,
+       main = expression("process variance "*v[t-1]*"  (kg C m"^-2*")"^2))
+  abline(h = 10^(-3:0) * rep(c(1, 2, 5), each = 4), col = grid.col)
+  for (k in c("raw", "cor")) band_line(X[[k]], "vQ25", "v", "vQ75", "vMean", k)
+  mtext(Rlab[R], side = 2, line = 3.6, las = 0, col = ink, cex = 0.9)
+  if (R == Rm.np[1]) legend("topright", bty = "n", cex = 0.85, text.col = ink,
+    legend = c("bias-corrected: median, IQR", "uncorrected: median, IQR", "mean over sites"),
+    col = c(c.cor, c.raw, ink), lwd = c(2.2, 2.2, 1), lty = c(1, 2, 3))
+  ## PIT
+  plot(NA, xlim = range(atime[-1]), ylim = c(0, 1), xlab = "", ylab = "", cex.main = 1,
+       main = "PIT of the one-step-ahead forecast")
+  rect(min(atime) - 1, 0.25, max(atime) + 1, 0.75, col = adjustcolor(ink, 0.06), border = NA)
+  abline(h = c(0.25, 0.5, 0.75), col = ink, lty = c(3, 2, 3))
+  for (k in c("raw", "cor")) band_line(X[[k]], "pitQ25", "pitMed", "pitQ75", "pitMean", k)
+  if (R == Rm.np[1]) legend("bottomright", bty = "n", cex = 0.8, text.col = ink,
+    legend = c("calibrated median (0.5) and IQR (0.25-0.75)"), fill = adjustcolor(ink, 0.06), border = NA)
+  ## coverage error
+  plot(NA, xlim = range(atime[-1]), ylim = range(yr.tab$cov50, 0), xlab = "", ylab = "", cex.main = 1,
+       main = "coverage error of central 50% interval (> 0 too wide)")
+  abline(h = axTicks(2), col = grid.col); abline(h = 0, lty = 2, col = ink)
+  for (k in c("raw", "cor")) lines(X[[k]]$year, X[[k]]$cov50, col = sty[[k]]$col, lwd = 2.2, lty = sty[[k]]$lty)
 }
+mtext("year", side = 1, outer = TRUE, line = 0, col = ink)
+mtext("Process variance and PIT over time, no disturbance product, 538 sites", outer = TRUE, line = 1.2, cex = 1.15, col = ink)
 dev.off()
