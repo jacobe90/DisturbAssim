@@ -360,3 +360,83 @@ for (R in Rm.np) {
 mtext("year", side = 1, outer = TRUE, line = 0, col = ink)
 mtext("Process variance and PIT over time, no disturbance product, 538 sites", outer = TRUE, line = 1.2, cex = 1.15, col = ink)
 dev.off()
+
+## =================================================================================
+## 7. decomposition of the one-step-ahead predictive variance over time
+## =================================================================================
+## Needs the no-disturbance predictive (predVar0 / predProcVar0), which only the
+## 100-site subset reruns of section 2 store, so this uses that subset (no product).
+## Exact decomposition of the full predictive variance V_t of y_t (see
+## claude-forecast-predictive-10.9.26 for the derivation):
+##   V_t = R_t + beta0 Q0_t + beta0 P0_t + D_t
+##   R_t       observation-error variance                           (predR)
+##   beta0     P(z_t = 0 | y_{1:t-1}) = predProcVar / predProcVar0
+##   Q0_t      process variance of the no-disturbance predictive    (predProcVar0)
+##   P0_t      propagated state variance = predVar0 - R_t - Q0_t
+##   D_t       disturbance part = V_t - R_t - beta0 (predVar0 - R_t)
+dec <- do.call(rbind, lapply(which(!exp.grid$useDistProduct[jobs$row]), function(j) {
+  h <- readRDS(jobs$file[j]); e <- exp.grid[jobs$row[j], ]
+  b0 <- h$predProcVar / h$predProcVar0
+  data.frame(R.mod = e$R, run = if (jobs$bias[j]) "cor" else "raw", site = e$site, t = seq_len(NT),
+             V = h$predVar, R = h$predR, beta0 = b0, Q = b0 * h$predProcVar0,
+             P = b0 * (h$predVar0 - h$predR - h$predProcVar0),
+             D = h$predVar - h$predR - b0 * (h$predVar0 - h$predR))
+}))
+dec <- subset(dec, t >= 2 & is.finite(V))
+stopifnot(max(abs(with(dec, R + Q + P + D - V))) < 1e-8)       # the four parts add up to V
+comp <- c(R = "observation error R", Q = "process error", P = "propagated state", D = "disturbance")
+comp.col <- c(R = "#eb6834", Q = "#2a78d6", P = "#8fb6ea", D = "#8a8984")
+dec.yr <- do.call(rbind, lapply(split(dec, list(dec$R.mod, dec$run, dec$t), drop = TRUE), function(x) {
+  sh <- sapply(names(comp), function(k) median(x[[k]] / x$V))
+  data.frame(R.mod = x$R.mod[1], run = x$run[1], year = atime[x$t[1]], n = nrow(x),
+             V = mean(x$V), R = mean(x$R), Q = mean(x$Q), P = mean(x$P), D = mean(x$D),
+             medV = median(x$V), beta0 = mean(x$beta0),
+             shR = sh[["R"]], shQ = sh[["Q"]], shP = sh[["P"]], shD = sh[["D"]])
+}))
+dec.yr <- dec.yr[order(match(dec.yr$R.mod, Rm.np), dec.yr$run, dec.yr$year), ]
+write.csv(dec.yr, file.path(out.dir, "fw_var_decomp.csv"), row.names = FALSE)
+cat("\n== 7. predictive-variance decomposition (100-site subset, no product): mean component per year ==\n")
+print(cbind(dec.yr[dec.yr$year %in% c(1991, 1995, 2000, 2005, 2010, 2017), 1:3],
+            signif(dec.yr[dec.yr$year %in% c(1991, 1995, 2000, 2005, 2010, 2017), -(1:4)], 3)), row.names = FALSE)
+
+## figure (a): stacked mean components per year; rows = model, columns = uncorrected / corrected
+png(file.path(out.dir, "fw_var_decomp.png"), width = 12, height = 13, units = "in", res = 140)
+.par(mfrow = c(length(Rm.np), 2), mar = c(3.4, 4.6, 3.2, 0.8), oma = c(1.2, 2, 3.4, 0))
+for (R in Rm.np) {
+  ymax <- max(dec.yr$V[dec.yr$R.mod == R]) * 1.05
+  for (k in c("raw", "cor")) {
+    x <- dec.yr[dec.yr$R.mod == R & dec.yr$run == k, ]
+    plot(NA, xlim = range(x$year), ylim = c(0, ymax), xlab = "", ylab = "", cex.main = 1,
+         main = sprintf("%s, %s", Rlab[R], if (k == "cor") "bias-corrected" else "uncorrected"))
+    abline(h = axTicks(2), col = grid.col)
+    lo <- rep(0, nrow(x))
+    for (cm in names(comp)) {
+      hi <- lo + x[[cm]]
+      polygon(c(x$year, rev(x$year)), c(lo, rev(hi)), col = comp.col[cm], border = "white", lwd = 0.5)
+      lo <- hi
+    }
+    if (k == "raw") mtext(expression("mean variance  (kg C m"^-2*")"^2), side = 2, line = 3, las = 0, col = ink, cex = 0.75)
+    if (R == Rm.np[1] && k == "raw") legend("topright", bty = "n", cex = 0.85, text.col = ink,
+      legend = comp, fill = comp.col, border = NA)
+  }
+}
+mtext("year", side = 1, outer = TRUE, line = 0, col = ink)
+mtext("One-step-ahead predictive variance V = R + process + propagated state + disturbance (mean over 100 sites, no product)",
+      outer = TRUE, line = 1.2, cex = 1.1, col = ink)
+dev.off()
+
+## figure (b): median per-site share of V from each component
+png(file.path(out.dir, "fw_var_share.png"), width = 16, height = 4.4, units = "in", res = 140)
+.par(mfrow = c(1, length(Rm.np)), mar = c(4.2, 4.4, 3.4, 0.8))
+for (R in Rm.np) {
+  plot(NA, xlim = range(atime[-1]), ylim = c(0, 1), xlab = "year", ylab = if (R == Rm.np[1]) "median share of V over sites" else "",
+       main = Rlab[R], cex.main = 1)
+  abline(h = seq(0, 1, 0.2), col = grid.col)
+  for (k in c("raw", "cor")) { x <- dec.yr[dec.yr$R.mod == R & dec.yr$run == k, ]
+    for (cm in names(comp)) lines(x$year, x[[paste0("sh", cm)]], col = comp.col[cm], lwd = if (k == "cor") 2.2 else 1.3,
+                                  lty = if (k == "cor") 1 else 3) }
+  if (R == Rm.np[1]) legend("topleft", bty = "n", cex = 0.8, text.col = ink, ncol = 2,
+    legend = c(comp, "bias-corrected", "uncorrected"), col = c(comp.col, ink, ink),
+    lwd = c(rep(2.2, 4), 2.2, 1.3), lty = c(rep(1, 4), 1, 3))
+}
+dev.off()
