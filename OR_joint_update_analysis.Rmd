@@ -40,11 +40,12 @@ yr.dist <- 2004               # disturbance-assessment year
 ## turn an experiment label (e.g. "distprod_TRUE_GEDI_het_taugamma") into a readable title
 ## (e.g. "Disturbance Product, Heteroskedastic R (GEDI magnitude)").
 pretty.exp <- function(e) {
-  p    <- strsplit(e, "_", fixed = TRUE)[[1]]   # distprod, TRUE/FALSE, source, het/con, tau<prior>
+  p    <- strsplit(e, "_", fixed = TRUE)[[1]]   # distprod, TRUE/FALSE, source, het/con, tau<prior>[, bias]
   prod <- if (length(p) >= 2 && p[2] == "TRUE") "Disturbance Product" else "No Disturbance Product"
   src  <- if (length(p) >= 3) p[3] else "?"
   rmod <- if (length(p) >= 4 && p[4] == "het") "Heteroskedastic R" else "Constant R"
-  sprintf("%s, %s (%s magnitude)", prod, rmod, src)
+  bias <- if ("bias" %in% p) ", bias-corrected" else ""
+  sprintf("%s, %s (%s magnitude)%s", prod, rmod, src, bias)
 }
 ```
 
