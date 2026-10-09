@@ -237,3 +237,98 @@ cat(sprintf("\n== 5. tau grid: process variance range [%.0e, %.0e]; share of sit
             1 / 1e4, 1 / 0.1))
 cat(paste(sprintf("%s %.0f%%/%.0f%%", exps$label, sapply(PV, function(p) 100 * mean(p$raw[, NT] < 1e-3)),
                   sapply(PV, function(p) 100 * mean(p$cor[, NT] < 1e-3))), collapse = "; "), "(uncorrected/corrected)\n")
+
+## =================================================================================
+## 6. PIT over time: does it flatten as the learned process variance shrinks?
+## =================================================================================
+## Full grids, no disturbance product (no flagged years), all 538 sites. The forecast
+## of y_t uses the tau posterior after y_{t-1}, so year t is paired with v_{t-1}.
+## Per-year quantities, from each run's stored one-step-ahead predictive:
+##   PIT u_t (full predictive), Q_t = predProcVar (process part), R_t = predR,
+##   V_t = predVar (total, incl. the disturbance tail).
+pit_tab <- function(dir, R, bias) do.call(rbind, lapply(seq_len(NS), function(s) {
+  h <- readRDS(run_file(dir, s, R, FALSE, bias))
+  data.frame(site = s, t = seq_len(NT), pit = h$pit, vPrev = c(NA, head(h$procVar, -1)),
+             Q = h$predProcVar, R = h$predR, V = h$predVar)
+}))
+## coverage error of the central 50% interval (> 0: too wide) and mean |coverage
+## error| over the central p-intervals, p = 0.05, ..., 0.95 (0 = calibrated)
+cov50  <- function(u) { u <- u[is.finite(u)]; mean(abs(2 * u - 1) <= 0.5) - 0.5 }
+calerr <- function(u) { p <- seq(0.05, 0.95, 0.05); u <- u[is.finite(u)]
+  mean(abs(sapply(p, function(pp) mean(abs(2 * u - 1) <= pp)) - p)) }
+periods <- list("1991-95" = 1991:1995, "1996-2000" = 1996:2000, "2001-05" = 2001:2005,
+                "2006-11" = 2006:2011, "2012-17" = 2012:2017)
+Rm.np <- exps$R[!exps$useDistProduct]
+PT <- lapply(setNames(Rm.np, Rm.np), function(R) list(
+  raw = subset(pit_tab("fullRunNoBias", R, FALSE), t >= 2 & is.finite(pit)),
+  cor = subset(pit_tab("fullRunBias",   R, TRUE),  t >= 2 & is.finite(pit))))
+Rlab <- c(GEDI_het = "GEDI heteroskedastic R", GEDI_con = "GEDI constant R",
+          LandTrendr_het = "LandTrendr heteroskedastic R", LandTrendr_con = "LandTrendr constant R")
+
+## per-year summary
+yr.tab <- do.call(rbind, lapply(Rm.np, function(R) do.call(rbind, lapply(c("raw", "cor"), function(k) {
+  d <- PT[[R]][[k]]
+  do.call(rbind, lapply(split(d, d$t), function(x) data.frame(
+    R.mod = R, run = k, year = atime[x$t[1]], v = median(x$vPrev), cov50 = cov50(x$pit),
+    calErr = calerr(x$pit), Qshare = median(x$Q / x$V), Rshare = median(x$R / x$V))))
+}))))
+cat("\n== 6. PIT over time (no product, 538 sites): per period, median v_{t-1}, coverage error of the central 50% interval, calibration error ==\n")
+per.tab <- do.call(rbind, lapply(Rm.np, function(R) do.call(rbind, lapply(c("raw", "cor"), function(k) {
+  d <- PT[[R]][[k]]; yrs <- atime[d$t]
+  do.call(rbind, lapply(names(periods), function(p) { x <- d[yrs %in% periods[[p]], ]
+    data.frame(R.mod = R, run = k, period = p, v = median(x$vPrev), cov50 = cov50(x$pit), calErr = calerr(x$pit),
+               Qshare = median(x$Q / x$V), Rshare = median(x$R / x$V)) }))
+}))))
+print(cbind(per.tab[, 1:3], signif(per.tab[, -(1:3)], 3)), row.names = FALSE)
+cat("\nSpearman correlation over years of median v_{t-1} with cov50 (corrected / uncorrected):\n")
+for (R in Rm.np) { a <- yr.tab[yr.tab$R.mod == R & yr.tab$run == "cor", ]; b <- yr.tab[yr.tab$R.mod == R & yr.tab$run == "raw", ]
+  cat(sprintf("  %-28s %5.2f / %5.2f\n", Rlab[R], cor(a$v, a$cov50, method = "spearman"), cor(b$v, b$cov50, method = "spearman"))) }
+
+## figure (a): PIT histograms by period, rows = observation-error model
+br <- seq(0, 1, 0.05); nb <- length(br) - 1
+png(file.path(out.dir, "fw_pit_periods.png"), width = 15, height = 11, units = "in", res = 140)
+.par(mfrow = c(length(Rm.np), length(periods)), mar = c(3.2, 3.4, 3.4, 0.6), oma = c(1.5, 2, 3, 0))
+for (R in Rm.np) for (p in names(periods)) {
+  dens <- function(d) { u <- d$pit[atime[d$t] %in% periods[[p]]]; hist(u, br, plot = FALSE)$counts * nb / length(u) }
+  d1 <- dens(PT[[R]]$cor); d0 <- dens(PT[[R]]$raw)
+  n  <- sum(atime[PT[[R]]$cor$t] %in% periods[[p]])
+  band <- qbinom(c(0.025, 0.975), n, 1 / nb) * nb / n
+  k1 <- per.tab[per.tab$R.mod == R & per.tab$run == "cor" & per.tab$period == p, ]
+  k0 <- per.tab[per.tab$R.mod == R & per.tab$run == "raw" & per.tab$period == p, ]
+  plot(NA, xlim = c(0, 1), ylim = c(0, 4), xlab = "", ylab = "", cex.main = 0.95,
+       main = sprintf("%s\nmedian v: %.3f corr. / %.3f uncorr.", p, k1$v, k0$v))
+  rect(0, band[1], 1, band[2], col = grid.col, border = NA)
+  rect(br[-length(br)] + 0.004, 0, br[-1] - 0.004, pmin(d1, 4), col = c.cor, border = NA)
+  lines(rep(br, each = 2), c(0, rep(pmin(d0, 4), each = 2), 0), col = ink, lwd = 1.5)
+  abline(h = 1, lty = 2, col = ink)
+  if (p == names(periods)[1]) mtext(Rlab[R], side = 2, line = 2.6, las = 0, col = ink, cex = 0.85)
+}
+mtext("PIT u", side = 1, outer = TRUE, line = 0.2, col = ink)
+mtext("One-step-ahead PIT by period, no product, 538 sites:  bars = bias-corrected, outline = uncorrected   [dashed = uniform; gray = 95% range per bin]",
+      outer = TRUE, line = 1, cex = 1.05, col = ink)
+dev.off()
+
+## figure (b): per-year coverage error of the central 50% interval, learned process
+## variance, and the process / R shares of the predictive variance
+cols4 <- c(GEDI_het = "#2a78d6", GEDI_con = "#1a4f99", LandTrendr_het = "#eb6834", LandTrendr_con = "#a8461f")
+png(file.path(out.dir, "fw_pit_time.png"), width = 16, height = 4.4, units = "in", res = 140)
+.par(mfrow = c(1, 4), mar = c(4.4, 4.6, 4.2, 0.8))
+pp <- list(list(v = "v", lab = "median learned process variance v[t-1]\n(log scale)", log = "y"),
+           list(v = "Qshare", lab = "median share of predictive variance\nfrom process error Q / V"),
+           list(v = "Rshare", lab = "median share of predictive variance\nfrom observation error R / V"),
+           list(v = "cov50", lab = "coverage error of central 50% interval\n(> 0 too wide; 0 calibrated)", ref = 0))
+for (p in pp) {
+  yl <- range(yr.tab[[p$v]], p$ref, na.rm = TRUE)
+  plot(NA, xlim = range(atime[-1]), ylim = yl, log = if (is.null(p$log)) "" else p$log,
+       xlab = "year", ylab = "", main = p$lab, cex.main = 1)
+  abline(h = axTicks(2), col = grid.col)
+  if (!is.null(p$ref)) abline(h = p$ref, lty = 2, col = ink)
+  for (R in Rm.np) for (k in c("raw", "cor")) {
+    x <- yr.tab[yr.tab$R.mod == R & yr.tab$run == k, ]
+    lines(x$year, x[[p$v]], col = cols4[R], lwd = if (k == "cor") 2.2 else 1.3, lty = if (k == "cor") 1 else 3)
+  }
+  if (p$v == "v") legend("topright", bty = "n", cex = 0.78, text.col = ink,
+    legend = c(Rlab[Rm.np], "solid = bias-corrected", "dotted = uncorrected"),
+    col = c(cols4[Rm.np], ink, ink), lwd = c(rep(2, 4), 2.2, 1.3), lty = c(rep(1, 4), 1, 3))
+}
+dev.off()
