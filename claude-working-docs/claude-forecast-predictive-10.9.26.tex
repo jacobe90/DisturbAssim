@@ -232,6 +232,7 @@ where $\Phi$ is the standard normal CDF. The predictive mean and variance are
 \end{equation}
 
 \subsection{Splitting by disturbance class}
+\label{sec:split}
 
 Group the components by $k$. Class $k$ has total weight $\beta^k = \sum_{g,j}\omega_{gjk}$
 (equal to $\beta_{k,t}$ when no component is dropped), within-class weights
@@ -360,12 +361,102 @@ decomposition:
   one, which scales with the biomass present. The drop after 2004 follows the 2003--04 disturbances,
   which left many sites with less biomass to lose. For GEDI heteroskedastic $R$, where every
   other term is small, it is the largest share of $V_t$ (43--72\%).
-  \item \textbf{Why the disturbance part does not cause the hump.} $D_t$ is variance held by a
+  \item \textbf{Why the disturbance part does not cause the hump} (derived in Section~\ref{sec:pit-approx}). $D_t$ is variance held by a
   tail with only 4.6\% of the probability, several kg\,C\,m$^{-2}$ below the undisturbed
   forecast. For an undisturbed year, $u_t \approx (1 - \beta^0) + \beta^0\,
-  \Phi\big((y_t - m^0)/\sqrt{V^0}\big)$, so the tail only shifts the PIT up by at most 0.046 (the
-  which accounts for most of the gap between 0.5 and the 0.54 mean PIT of Section~\ref{sec:results}). How concentrated the PIT is depends on $V^0 = R_t + Q^0_t + P^0_t$
+  \Phi\big((y_t - m^0)/\sqrt{V^0}\big)$, so the tail only shifts the PIT up by at most 0.046 (which accounts for most of the gap between 0.5 and the 0.54 mean PIT of Section~\ref{sec:results}). How concentrated the PIT is depends on $V^0 = R_t + Q^0_t + P^0_t$
   relative to the actual errors. In that part, $R_t$ dominates once $Q^0_t$ is small.
+\end{itemize}
+
+\subsection{The PIT of an undisturbed year}
+\label{sec:pit-approx}
+
+This subsection derives the approximation used above,
+\begin{equation}
+  u_t \;\approx\; (1 - \beta^0) + \beta^0\,\Phi\!\big((y_t - m^0)/\sqrt{V^0}\big),
+  \label{eq:uapprox}
+\end{equation}
+starting from the exact PIT of the mixture predictive \eqref{eq:pred},
+\begin{equation}
+  u_t = \sum_{g,j,k}\omega_{gjk}\,\Phi\!\big((y_t - \mu_{gjk})/s_{gjk}\big),
+  \label{eq:uexact}
+\end{equation}
+for a year in which no disturbance happened.
+
+\paragraph{Step 1: group by disturbance class.}
+With $\omega_{gjk} = \beta^k\,\omega^k_{gj}$ (Section~\ref{sec:split}), \eqref{eq:uexact} becomes a
+weighted sum of the class CDFs evaluated at $y_t$:
+\begin{equation}
+  u_t = \sum_{k \ge 0}\beta^k\,F^k(y_t), \qquad
+  F^k(y) = \sum_{g,j}\omega^k_{gj}\,\Phi\!\big((y - \mu_{gjk})/s_{gjk}\big).
+  \label{eq:uclass}
+\end{equation}
+$F^k$ is the CDF of the predictive given $z_t = k$. So far this is exact.
+
+\paragraph{Step 2: the disturbed classes lie below the observation.}
+In an undisturbed year, $y_t$ is near the undisturbed forecast $m^0$. The disturbed component means
+$\mu_{gjk}$, $k \ge 1$, are several kg\,C\,m$^{-2}$ below it, because a disturbance removes
+a large fraction of the wood pool. So $(y_t - \mu_{gjk})/s_{gjk}$ is large and positive, and
+$F^k(y_t) \approx 1$ for every $k \ge 1$:
+\begin{equation}
+  \sum_{k \ge 1}\beta^k F^k(y_t) \;\approx\; \sum_{k \ge 1}\beta^k = 1 - \beta^0 .
+  \label{eq:step2}
+\end{equation}
+The size of the error is bounded whether or not the disturbed classes really are far below. Since
+$0 \le F^k \le 1$,
+\begin{equation}
+  \beta^0 F^0(y_t) \;\le\; u_t \;\le\; (1 - \beta^0) + \beta^0 F^0(y_t),
+  \label{eq:bounds}
+\end{equation}
+so replacing the disturbed part by $1 - \beta^0$ overstates $u_t$ by at most
+$1 - \beta^0$ (0.046 without the product). It is exact when all the disturbed mass lies below $y_t$.
+
+\paragraph{Step 3: approximate the undisturbed class by one Gaussian.}
+$F^0$ is the CDF of a Gaussian mixture over $(g, j)$, with mean $m^0$ and variance $V^0$
+(Section~\ref{sec:split}). Replacing it with the CDF of a single Gaussian with the same two moments,
+\begin{equation}
+  F^0(y_t) \;\approx\; \Phi\!\big((y_t - m^0)/\sqrt{V^0}\big),
+  \label{eq:step3}
+\end{equation}
+is accurate near the centre of the distribution, which is where an undisturbed observation usually lands. It is less
+accurate in the tails: a mixture over $\tau$ has heavier tails than one Gaussian with the same
+variance. It is exact when one component carries all the weight.
+
+\paragraph{Result.} Substituting \eqref{eq:step2} and \eqref{eq:step3} into
+\eqref{eq:uclass} gives \eqref{eq:uapprox}.
+
+\paragraph{Check.} On the bias-corrected 100-site subset (no product), over the 10\,323
+undisturbed site-years ($t \ge 3$, $P(z_t \ne 0 \mid y_{1:t}) < 0.5$, all four
+observation-error models), \eqref{eq:uapprox} computed from \code{predMean0},
+\code{predVar0} and $\beta^0$ agrees with the stored exact PIT \eqref{eq:uexact}
+(\code{hist\$pit}). The mean absolute difference is 0.0085, 95\% of differences are below 0.022, the
+largest is 0.077, and the correlation is 0.999. The approximation is on average 0.008 too
+high, as \eqref{eq:bounds} predicts when a little disturbed mass lies above $y_t$. The
+IQRs are 0.191 (approximation) and 0.198 (exact).
+
+\paragraph{What it implies.}
+\begin{itemize}
+  \item \textbf{The disturbance tail only shifts the PIT.} Write $z_t = (y_t - m^0)/\sqrt{V^0}$. The tail adds a constant
+  $1 - \beta^0$ and compresses $\Phi(z_t)$ into $[1 - \beta^0, 1]$. It cannot change the
+  \emph{shape} of the PIT histogram, only move it right by up to 0.046 and squeeze it by the factor
+  $\beta^0 = 0.954$. If the tail were removed, the mean PIT would fall by about
+  $(1 - \beta^0)(1 - \E[\Phi(z_t)]) \approx 0.02$ (0.54 to 0.52), and the IQR would grow by a
+  factor $1/\beta^0 \approx 1.05$.
+  \item \textbf{The hump is set by the undisturbed forecast.} The shape comes from $\Phi(z_t)$, which is uniform only if $z_t$ is standard normal,
+  i.e.\ if $V^0 = R_t + Q^0_t + P^0_t$ matches the actual squared errors. If $V^0$ is too
+  large, $z_t$ is concentrated near 0 and $\Phi(z_t)$ near 0.5. With the forecast-width note's
+  median $|z_t| = 0.39$ (against 0.674 for a standard normal), $\Phi(z_t)$ has quartiles of about 0.35
+  and 0.65, an IQR of about 0.30, close to the observed PIT IQR for GEDI
+  heteroskedastic $R$.
+  \item \textbf{Variance and PIT weight the tail differently.} $V_t$ counts squared distance and the PIT counts
+  probability. With undisturbed spread $\sqrt{V^0} \approx 0.6$ and a gap of about
+  5\,kg\,C\,m$^{-2}$ to the disturbed means, the tail adds roughly
+  $\beta^0(1 - \beta^0)\cdot 5^2 \approx 1.1$ to $V_t$, close to the $D_t$ in
+  Table~\ref{tab:decomp}. That is about three times $V^0$, but in the PIT it amounts to only the constant
+  0.046.
+  \item \textbf{Disturbance years are the exception.} If a disturbance did happen, $y_t$ falls inside or below the
+  disturbed classes. Then $F^k(y_t) < 1$, Step 2 fails, and $u_t$ can be near 0 (the spike
+  near 0 in 2001--05 in Figure~\ref{fig:periods}).
 \end{itemize}
 
 %================================================================================
@@ -375,7 +466,7 @@ decomposition:
 with \code{EXP\_DIR} set if the experiment folders are elsewhere. Section 6 of the script
 writes \code{fw\_pit\_time.png}, \code{fw\_pit\_periods.png} and \code{fw\_pit\_time.csv}.
 Section 7 writes \code{fw\_var\_decomp.png}, \code{fw\_var\_share.png} and
-\code{fw\_var\_decomp.csv}; it uses the 100-site subset reruns in
+\code{fw\_var\_decomp.csv}, and prints the check of Section~\ref{sec:pit-approx} (``7b''); it uses the 100-site subset reruns in
 \code{experiments/forecastWidth}, which section 2 creates if they are missing.
 
 \end{document}

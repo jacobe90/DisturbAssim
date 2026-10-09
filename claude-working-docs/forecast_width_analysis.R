@@ -440,3 +440,16 @@ for (R in Rm.np) {
     lwd = c(rep(2.2, 4), 2.2, 1.3), lty = c(rep(1, 4), 1, 3))
 }
 dev.off()
+
+## check of the undisturbed-year PIT approximation (claude-forecast-predictive, Sec. 3.5):
+##   u_t ~ (1 - beta0) + beta0 * Phi((y_t - m0) / sqrt(V0)), against the stored exact PIT,
+## bias-corrected subset, no product, undisturbed site-years (t >= 3, P(disturbed) < 0.5)
+ua <- do.call(rbind, lapply(which(!exp.grid$useDistProduct[jobs$row] & jobs$bias), function(j) {
+  h <- readRDS(jobs$file[j]); b0 <- h$predProcVar / h$predProcVar0
+  data.frame(t = seq_len(NT), u = h$pit, pD = h$pDist,
+             ua = (1 - b0) + b0 * pnorm((h$obs - h$predMean0) / sqrt(h$predVar0)))
+}))
+ua <- subset(ua, t >= 3 & is.finite(u) & pD < 0.5)
+d <- ua$u - ua$ua
+cat(sprintf("\n== 7b. undisturbed-year PIT approximation: n = %d, mean |u - u~| = %.4f, 95%% |.| = %.4f, max = %.3f, mean(u - u~) = %+.4f, cor = %.4f, IQR u = %.3f, IQR u~ = %.3f ==\n",
+            nrow(ua), mean(abs(d)), quantile(abs(d), 0.95), max(abs(d)), mean(d), cor(ua$u, ua$ua), IQR(ua$u), IQR(ua$ua)))
