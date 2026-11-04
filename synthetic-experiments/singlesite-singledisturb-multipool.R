@@ -159,7 +159,9 @@ run_enkf <- function(disturb) {
     K <- Pf %*% t(H) %*% solve(H%*%Pf%*%t(H) + R)
     mua <- muf + K%*%(Observed_states[t,] - muf)
     Pa <- (I-K %*% H)%*%Pf
-    X <- as.matrix(PEcAnAssimSequential::adj.ens(Pf = Pf,X = Xf,mu.f = muf,mu.a = mua,Pa = Pa))
+    ## the adjustment can push the small post-disturbance pools below 0, where VSEM
+    ## returns non-finite values, so clip at 0 as the multinomial analysis does
+    X <- tobit(as.matrix(PEcAnAssimSequential::adj.ens(Pf = Pf,X = Xf,mu.f = muf,mu.a = mua,Pa = Pa)))
     Xf.all[[t]] <- Xf
     Xa.all[[t]] <- X
   }
