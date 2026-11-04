@@ -106,7 +106,7 @@ THETA <- as.matrix(Theta_reference[parIdx,]) ## ensemble parameters [J, 11]
 
 Q = diag(c(0.1,0.1,0.1))  ## process error covariance
 R = diag(c(.25,10,1))     ## observation error covariance
-p.dist = 0.15
+p.dist = 0.05
 pool.names = c("Cleaf","Csoil","Cstem")
 
 ## ---- Pseudodata -------------------------------------------------------------------
@@ -318,7 +318,7 @@ project_grid <- function(w, mu, sig) {
 ##'   posterior on its axis, G_a x NT), nActive (grid points kept at each step), and
 ##'   mixF / mixA (per-t forecast / analysis mixtures: w, mu, sig) for sampling
 qs5 <- c(0.025,0.25,0.5,0.75,0.975)
-ORJointUpdateMP <- function(Y, R, PAR, met, THETA, Xic, dist, N = 1000, prior, grid, pruneLog = 30) {
+ORJointUpdateMP <- function(Y, R, PAR, met, THETA, Xic, dist, N = 100, prior, grid, pruneLog = 30) {
   NT <- nrow(Y)
   D  <- dist$n
   J  <- nrow(THETA)
@@ -498,11 +498,11 @@ or.dist <- list(
 or.grid <- list(tauMin = rep(0.1, 3), tauMax = rep(1e4, 3), G = rep(16, 3))
 or.fit <- ORJointUpdateMP(Y = Observed_states, R = R, PAR = PAR_driverdata, met = met,
                           THETA = THETA, Xic = Ensemble_initial.orig, dist = or.dist,
-                          N = 1000, prior = list(type = "loguniform"), grid = or.grid)
+                          N = 100, prior = list(type = "loguniform"), grid = or.grid)
 ## tau known (= 1/diag(Q)), the setting of the Rmd's multinomial filter
 or.known <- ORJointUpdateMP(Y = Observed_states, R = R, PAR = PAR_driverdata, met = met,
                             THETA = THETA, Xic = Ensemble_initial.orig, dist = or.dist,
-                            N = 1000, prior = list(type = "loguniform"),
+                            N = 100, prior = list(type = "loguniform"),
                             grid = list(tauMin = 1/diag(Q), tauMax = 1/diag(Q), G = rep(1, 3)))
 
 ## ---- Figures ------------------------------------------------------------------------
