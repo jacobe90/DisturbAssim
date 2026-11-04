@@ -1,0 +1,8 @@
+Seed sweep of synthetic-experiments/singlesite-singledisturb-multipool.R: 21 seeds (42, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20), prior p.dist = 0.050, true disturbance in year 10
+year 10: P(disturbed) median 1.000, min 0.888 (seed 15); tau known: median 1.000, min 0.992
+other years: 8 of 504 seed-years with P > 0.2, 0 with P > 0.5 (tau known: 5, 0)
+  before year 10: mean P 0.0000, P > 0.2 in 0 of 189
+  after  year 10: mean P 0.0184, P > 0.2 in 8 of 315
+  seeds with any year P > 0.2: 5 of 21; largest false alarm 0.421 (seed 42, year 13)
+  years with an observation clipped to 0: 36, of which P > 0.2: 8; unclipped years with P > 0.2: 0 of 468
+seed 42 (original): P(year 10) = 1.000, largest elsewhere 0.421 (year 13)

@@ -28,14 +28,17 @@
 ##     grid points whose posterior weight becomes negligible are dropped
 ##
 ## Run from the repository root:  Rscript synthetic-experiments/singlesite-singledisturb-multipool.R
-## Figures and results go to `outdir`.
+## Figures and results go to `outdir`. `seed` and `outdir` can be set before this file
+## is sourced (see singlesite-singledisturb-multipool-seeds.R); by default the run uses
+## seed 42.
 
 library(BayesianTools)
 library(mvnfast)
 
-outdir <- "experiments/synthetic/singlesite-singledisturb-multipool"
+if (!exists("seed", inherits = FALSE))   seed   <- 42
+if (!exists("outdir", inherits = FALSE)) outdir <- "experiments/synthetic/singlesite-singledisturb-multipool"
 if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
-set.seed(42)
+set.seed(seed)
 
 ## set values of state less than zero to be 0
 tobit <- function(x){
