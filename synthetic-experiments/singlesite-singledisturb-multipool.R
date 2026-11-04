@@ -601,49 +601,83 @@ tau_mi <- function(fit, tt, ax = 1:3) {
   ok  <- pj > 0
   sum(pj[ok] * log(pj[ok] / pm[ok]))
 }
-plot_tau_correlation <- function(fit, truth.sd, tt = length(fit$tauJoint)) {
-  pairs <- list(c(1, 2), c(1, 3), c(2, 3))
-  pcols <- c("#1b9e77", "#d95f02", "#7570b3")
-  op <- par(mfrow = c(2, 3), mar = c(4.2, 4.4, 2.8, 1), mgp = c(2.6, 0.8, 0)); on.exit(par(op))
-  cols <- hcl.colors(40, "Blues 3", rev = TRUE)
+tau_pairs  <- list(c(1, 2), c(1, 3), c(2, 3))
+pair_names <- sapply(tau_pairs, function(pr) paste(pool.names[pr], collapse = " - "))
+
+## page 1: joint posterior of each pair of taus in year tt (summed over the third tau),
+## on one shared colour scale, with a colour key
+plot_tau_joint <- function(fit, truth.sd, tt = length(fit$tauJoint)) {
   j <- fit$tauJoint[[tt]]
-  for (p in seq_along(pairs)) {
-    a <- pairs[[p]][1]; b <- pairs[[p]][2]
-    Ga <- length(fit$tauAxes[[a]]); Gb <- length(fit$tauAxes[[b]])
-    M  <- matrix(0, Ga, Gb)
+  M <- lapply(tau_pairs, function(pr) {
+    a <- pr[1]; b <- pr[2]; Ga <- length(fit$tauAxes[[a]]); Gb <- length(fit$tauAxes[[b]])
+    m <- matrix(0, Ga, Gb)
     agg <- tapply(j$w, list(factor(j$idx[, a], 1:Ga), factor(j$idx[, b], 1:Gb)), sum)
-    M[!is.na(agg)] <- agg[!is.na(agg)]
-    sa <- 1/sqrt(fit$tauAxes[[a]]); sb <- 1/sqrt(fit$tauAxes[[b]])   # descending in tau order
-    image(log10(rev(sa)), log10(rev(sb)), M[Ga:1, Gb:1], col = cols, axes = FALSE,
+    m[!is.na(agg)] <- agg[!is.na(agg)]
+    m[Ga:1, Gb:1]                                  # rows / cols in increasing process sd
+  })
+  zmax <- max(sapply(M, max))
+  cols <- hcl.colors(40, "Blues 3", rev = TRUE)
+  at   <- c(0.01, 0.03, 0.1, 0.3, 1, 3)
+  op <- par(mfrow = c(2, 2), mar = c(4.2, 4.6, 3, 1), mgp = c(2.7, 0.8, 0), oma = c(3.2, 0, 2, 0))
+  on.exit(par(op))
+  for (p in seq_along(tau_pairs)) {
+    a <- tau_pairs[[p]][1]; b <- tau_pairs[[p]][2]
+    image(log10(rev(1/sqrt(fit$tauAxes[[a]]))), log10(rev(1/sqrt(fit$tauAxes[[b]]))), M[[p]],
+          col = cols, zlim = c(0, zmax), axes = FALSE,
           xlab = sprintf("%s process sd", pool.names[a]), ylab = sprintf("%s process sd", pool.names[b]),
-          main = sprintf("%s vs %s, year %d: cor %.2f", pool.names[a], pool.names[b], tt, tau_cor(fit, tt, a, b)))
-    at <- c(0.01, 0.03, 0.1, 0.3, 1, 3)
+          main = sprintf("%s vs %s: cor %.2f", pool.names[a], pool.names[b], tau_cor(fit, tt, a, b)))
     axis(1, at = log10(at), labels = at); axis(2, at = log10(at), labels = at, las = 1); box()
     points(log10(truth.sd[a]), log10(truth.sd[b]), pch = 4, cex = 2, lwd = 2, col = "#e41a1c")
   }
-  yrs <- seq_along(fit$tauJoint)
-  cm  <- sapply(pairs, function(pr) sapply(yrs, function(t) tau_cor(fit, t, pr[1], pr[2])))
-  matplot(yrs, cm, type = 'l', lty = 1, lwd = 2, col = pcols, ylim = c(-1, 1), xlab = "year",
-          ylab = "cor(log tau_a, log tau_b)", main = "Posterior correlation over time")
-  abline(h = 0, lty = 3)
-  legend("bottomleft", bty = "n", cex = 0.85, lwd = 2, col = pcols,
-         legend = sapply(pairs, function(pr) paste(pool.names[pr], collapse = " - ")))
-  mi <- cbind(sapply(pairs, function(pr) sapply(yrs, function(t) tau_mi(fit, t, pr))),
-              sapply(yrs, function(t) tau_mi(fit, t, 1:3)))
-  matplot(yrs, mi, type = 'l', lty = c(1, 1, 1, 2), lwd = 2, col = c(pcols, 1), xlab = "year",
-          ylab = "mutual information (nats)", main = "Dependence beyond the marginals")
-  legend("topleft", bty = "n", cex = 0.85, lwd = 2, lty = c(1, 1, 1, 2), col = c(pcols, 1),
-         legend = c(sapply(pairs, function(pr) paste(pool.names[pr], collapse = " - ")), "all three"))
-  plot.new()
-  txt <- c(sprintf("Year %d joint tau posterior", tt), "",
-           sprintf("cor(log tau): %s", paste(sprintf("%.2f", cm[tt, ]), collapse = ", ")),
-           sprintf("  (%s)", paste(sapply(pairs, function(pr) paste(substring(pool.names[pr], 2), collapse = "-")), collapse = ", ")),
-           sprintf("mutual information, all three: %.3f nats", mi[tt, 4]),
-           sprintf("max over years: %.3f nats (year %d)", max(mi[, 4]), which.max(mi[, 4])),
-           "", "0 nats = the joint posterior is exactly", "the product of its three marginals")
-  text(0, 1, paste(txt, collapse = "\n"), adj = c(0, 1), cex = 0.95, family = "mono")
+  ## colour key, shared by the three panels
+  par(mar = c(4.2, 9.5, 3, 7), mgp = c(3.6, 0.8, 0))
+  zs <- seq(0, zmax, length.out = length(cols) + 1)
+  image(1, (zs[-1] + zs[-length(zs)]) / 2, matrix(seq_along(cols), 1), col = cols, axes = FALSE,
+        xlab = "", ylab = "posterior probability per cell", main = "Colour key")
+  axis(2, las = 1); box()
+  mtext(sprintf("Joint posterior of the process precisions tau, year %d", tt), outer = TRUE, cex = 1.05, font = 2)
+  mtext(c("Shade: posterior probability of each pair of grid cells, summed over the third tau (each panel sums to 1).",
+          "Axes: process sd = 1/sqrt(tau), log scale.  Red x: true process sd.  cor: posterior correlation of log tau."),
+        side = 1, outer = TRUE, line = c(0.6, 1.7), cex = 0.72)
 }
-plot_tau_correlation(or.fit, sqrt(diag(Q)))
+
+## page 2: dependence between the taus over time -- posterior correlation of log tau for
+## each pair, and the mutual information, with their definitions
+plot_tau_dependence <- function(fit) {
+  pcols <- c("#1b9e77", "#d95f02", "#7570b3")
+  yrs <- seq_along(fit$tauJoint)
+  cm  <- sapply(tau_pairs, function(pr) sapply(yrs, function(t) tau_cor(fit, t, pr[1], pr[2])))
+  mi  <- cbind(sapply(tau_pairs, function(pr) sapply(yrs, function(t) tau_mi(fit, t, pr))),
+               sapply(yrs, function(t) tau_mi(fit, t, 1:3)))
+  op <- par(no.readonly = TRUE); on.exit(par(op))
+  layout(matrix(1:3, 3), heights = c(1, 1, 0.9))
+  par(mar = c(3.8, 4.6, 2.6, 1), mgp = c(2.5, 0.8, 0))
+  matplot(yrs, cm, type = 'l', lty = 1, lwd = 2, col = pcols, ylim = c(-1, 1), xlab = "year",
+          ylab = "cor(log tau)", main = "Posterior correlation of log tau, by pair")
+  abline(h = 0, lty = 3)
+  legend("bottomleft", bty = "n", cex = 0.85, lwd = 2, col = pcols, legend = pair_names, horiz = TRUE)
+  matplot(yrs, mi, type = 'l', lty = c(1, 1, 1, 2), lwd = 2, col = c(pcols, 1), xlab = "year",
+          ylim = c(0, max(mi) * 1.15), ylab = "mutual information (nats)",
+          main = "Mutual information between the taus")
+  legend("topleft", bty = "n", cex = 0.85, lwd = 2, lty = c(1, 1, 1, 2), col = c(pcols, 1),
+         legend = c(pair_names, "all three"), horiz = TRUE)
+  par(mar = c(0.5, 1, 0.5, 1))
+  plot.new()
+  text(0, 0.98, "Definitions (p = the posterior on the tau grid after year t's observation):", adj = c(0, 1), font = 2, cex = 0.9)
+  text(0.02, 0.80, adj = c(0, 0.5), cex = 0.9, quote(
+    "Correlation:  " ~ cor(log~tau[a], log~tau[b]) ~ "  under  " ~ p(tau[a], tau[b])))
+  text(0.02, 0.57, adj = c(0, 0.5), cex = 0.9, quote(
+    "Mutual information, all three:  " ~ I == sum(p(tau)~log~frac(p(tau), p(tau[1])~p(tau[2])~p(tau[3])), tau)))
+  text(0.02, 0.34, adj = c(0, 0.5), cex = 0.9, quote(
+    "Mutual information, a pair:  " ~ I[ab] == sum(p(tau[a], tau[b])~log~frac(p(tau[a], tau[b]), p(tau[a])~p(tau[b])), list(tau[a], tau[b]))))
+  text(0, 0.11, adj = c(0, 0.5), cex = 0.82,
+       "I is the KL divergence from the joint posterior to the product of its marginals, in nats (natural log):")
+  text(0, 0.02, adj = c(0, 0.5), cex = 0.82,
+       "0 when the taus are independent, and larger the more the joint posterior departs from that product.")
+  invisible(list(cor = cm, mi = mi))
+}
+plot_tau_joint(or.fit, sqrt(diag(Q)))
+plot_tau_dependence(or.fit)
 
 ## forecast vs analysis at the disturbance year, leaf vs stem (cf. the Rmd's ensemble-adjustment plot)
 td <- which(disturbance_at == 1)
@@ -658,9 +692,11 @@ legend("topleft", legend = c("forecast", "analysis", "data", "truth"), pch = c(1
 
 dev.off()
 
-## cairo: the default quartz device crashes in forked workers (the seed sweep runs this file in mclapply)
-png(file.path(outdir, "tau_correlation.png"), width = 1500, height = 950, res = 120, type = "cairo")
-plot_tau_correlation(or.fit, sqrt(diag(Q)))
+## the tau-correlation pages on their own (pdf: the quartz png device crashes in the seed
+## sweep's forked workers, and cairo needs XQuartz)
+pdf(file.path(outdir, "tau_correlation.pdf"), width = 7, height = 6)
+plot_tau_joint(or.fit, sqrt(diag(Q)))
+plot_tau_dependence(or.fit)
 dev.off()
 
 ## ---- Save outputs -------------------------------------------------------------------
