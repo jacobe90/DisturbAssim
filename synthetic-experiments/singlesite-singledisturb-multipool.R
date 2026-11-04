@@ -318,8 +318,10 @@ project_grid <- function(w, mu, sig) {
 ##'   mean (NT x 3), q / fq (5 x NT x 3 analysis / forecast quantiles at qs5), pDist,
 ##'   pit (NT x 3, marginal one-step-ahead PIT of each observed pool), wDrop,
 ##'   procVar (NT x 3) = E[1/tau | y_{1:t}] per pool, tauAxes, tauMarg (per-pool marginal
-##'   posterior on its axis, G_a x NT), nActive (grid points kept at each step), and
-##'   mixF / mixA (per-t forecast / analysis mixtures: w, mu, sig) for sampling
+##'   posterior on its axis, G_a x NT), tauJoint (per-t joint posterior on the 3-D grid:
+##'   idx = axis indices of the active grid points, w = their weights), nActive (grid
+##'   points kept at each step), and mixF / mixA (per-t forecast / analysis mixtures:
+##'   w, mu, sig) for sampling
 qs5 <- c(0.025,0.25,0.5,0.75,0.975)
 ORJointUpdateMP <- function(Y, R, PAR, met, THETA, Xic, dist, N = 100, prior, grid, pruneLog = 30) {
   NT <- nrow(Y)
@@ -341,7 +343,7 @@ ORJointUpdateMP <- function(Y, R, PAR, met, THETA, Xic, dist, N = 100, prior, gr
     mean = matrix(NA_real_, NT, 3), q = array(NA_real_, c(5, NT, 3)), fq = array(NA_real_, c(5, NT, 3)),
     pDist = rep(NA_real_, NT), pit = matrix(NA_real_, NT, 3), wDrop = rep(NA_real_, NT),
     procVar = matrix(NA_real_, NT, 3), tauAxes = tauAxes,
-    tauMarg = lapply(tauAxes, function(x) matrix(NA_real_, length(x), NT)),
+    tauMarg = lapply(tauAxes, function(x) matrix(NA_real_, length(x), NT)), tauJoint = vector("list", NT),
     nActive = rep(NA_integer_, NT), mixF = vector("list", NT), mixA = vector("list", NT)
   )
   ia <- rep(1:3, 3); ib <- rep(1:3, each = 3)   # column (a, b) of a flattened 3 x 3
@@ -455,6 +457,7 @@ ORJointUpdateMP <- function(Y, R, PAR, met, THETA, Xic, dist, N = 100, prior, gr
       m[as.integer(rownames(s))] <- s
       hist$tauMarg[[a]][, t] <- m
     }
+    hist$tauJoint[[t]] <- list(idx = gridIdx[active, , drop = FALSE], w = ws)
 
     # analysis weights
     wA <- exp(lwl - logz)
@@ -579,6 +582,69 @@ for (a in 1:3) {
 }
 par(op)
 
+## correlation between the three taus in the joint posterior on the 3-D grid
+## posterior correlation of (log tau_a, log tau_b), from the stored joint weights
+tau_cor <- function(fit, tt, a, b) {
+  j <- fit$tauJoint[[tt]]
+  x <- log(fit$tauAxes[[a]][j$idx[, a]]); y <- log(fit$tauAxes[[b]][j$idx[, b]])
+  mx <- sum(j$w * x); my <- sum(j$w * y)
+  sum(j$w * (x - mx) * (y - my)) / sqrt(sum(j$w * (x - mx)^2) * sum(j$w * (y - my)^2))
+}
+## mutual information (nats) between the axes in `ax`: KL(joint marginal || product of the
+## single-axis marginals); 0 when the posterior factorises over those axes
+tau_mi <- function(fit, tt, ax = 1:3) {
+  j <- fit$tauJoint[[tt]]
+  key <- do.call(paste, c(as.data.frame(j$idx[, ax, drop = FALSE]), sep = "_"))
+  pj  <- tapply(j$w, key, sum)
+  ij  <- do.call(rbind, strsplit(names(pj), "_")); storage.mode(ij) <- "integer"
+  pm  <- Reduce(`*`, lapply(seq_along(ax), function(i) fit$tauMarg[[ax[i]]][ij[, i], tt]))
+  ok  <- pj > 0
+  sum(pj[ok] * log(pj[ok] / pm[ok]))
+}
+plot_tau_correlation <- function(fit, truth.sd, tt = length(fit$tauJoint)) {
+  pairs <- list(c(1, 2), c(1, 3), c(2, 3))
+  pcols <- c("#1b9e77", "#d95f02", "#7570b3")
+  op <- par(mfrow = c(2, 3), mar = c(4.2, 4.4, 2.8, 1), mgp = c(2.6, 0.8, 0)); on.exit(par(op))
+  cols <- hcl.colors(40, "Blues 3", rev = TRUE)
+  j <- fit$tauJoint[[tt]]
+  for (p in seq_along(pairs)) {
+    a <- pairs[[p]][1]; b <- pairs[[p]][2]
+    Ga <- length(fit$tauAxes[[a]]); Gb <- length(fit$tauAxes[[b]])
+    M  <- matrix(0, Ga, Gb)
+    agg <- tapply(j$w, list(factor(j$idx[, a], 1:Ga), factor(j$idx[, b], 1:Gb)), sum)
+    M[!is.na(agg)] <- agg[!is.na(agg)]
+    sa <- 1/sqrt(fit$tauAxes[[a]]); sb <- 1/sqrt(fit$tauAxes[[b]])   # descending in tau order
+    image(log10(rev(sa)), log10(rev(sb)), M[Ga:1, Gb:1], col = cols, axes = FALSE,
+          xlab = sprintf("%s process sd", pool.names[a]), ylab = sprintf("%s process sd", pool.names[b]),
+          main = sprintf("%s vs %s, year %d: cor %.2f", pool.names[a], pool.names[b], tt, tau_cor(fit, tt, a, b)))
+    at <- c(0.01, 0.03, 0.1, 0.3, 1, 3)
+    axis(1, at = log10(at), labels = at); axis(2, at = log10(at), labels = at, las = 1); box()
+    points(log10(truth.sd[a]), log10(truth.sd[b]), pch = 4, cex = 2, lwd = 2, col = "#e41a1c")
+  }
+  yrs <- seq_along(fit$tauJoint)
+  cm  <- sapply(pairs, function(pr) sapply(yrs, function(t) tau_cor(fit, t, pr[1], pr[2])))
+  matplot(yrs, cm, type = 'l', lty = 1, lwd = 2, col = pcols, ylim = c(-1, 1), xlab = "year",
+          ylab = "cor(log tau_a, log tau_b)", main = "Posterior correlation over time")
+  abline(h = 0, lty = 3)
+  legend("bottomleft", bty = "n", cex = 0.85, lwd = 2, col = pcols,
+         legend = sapply(pairs, function(pr) paste(pool.names[pr], collapse = " - ")))
+  mi <- cbind(sapply(pairs, function(pr) sapply(yrs, function(t) tau_mi(fit, t, pr))),
+              sapply(yrs, function(t) tau_mi(fit, t, 1:3)))
+  matplot(yrs, mi, type = 'l', lty = c(1, 1, 1, 2), lwd = 2, col = c(pcols, 1), xlab = "year",
+          ylab = "mutual information (nats)", main = "Dependence beyond the marginals")
+  legend("topleft", bty = "n", cex = 0.85, lwd = 2, lty = c(1, 1, 1, 2), col = c(pcols, 1),
+         legend = c(sapply(pairs, function(pr) paste(pool.names[pr], collapse = " - ")), "all three"))
+  plot.new()
+  txt <- c(sprintf("Year %d joint tau posterior", tt), "",
+           sprintf("cor(log tau): %s", paste(sprintf("%.2f", cm[tt, ]), collapse = ", ")),
+           sprintf("  (%s)", paste(sapply(pairs, function(pr) paste(substring(pool.names[pr], 2), collapse = "-")), collapse = ", ")),
+           sprintf("mutual information, all three: %.3f nats", mi[tt, 4]),
+           sprintf("max over years: %.3f nats (year %d)", max(mi[, 4]), which.max(mi[, 4])),
+           "", "0 nats = the joint posterior is exactly", "the product of its three marginals")
+  text(0, 1, paste(txt, collapse = "\n"), adj = c(0, 1), cex = 0.95, family = "mono")
+}
+plot_tau_correlation(or.fit, sqrt(diag(Q)))
+
 ## forecast vs analysis at the disturbance year, leaf vs stem (cf. the Rmd's ensemble-adjustment plot)
 td <- which(disturbance_at == 1)
 xf <- rmix(or.fit$mixF[[td]], 1000); xa <- rmix(or.fit$mixA[[td]], 1000)
@@ -590,6 +656,11 @@ points(True_states[td, 1], True_states[td, 3], cex = 2, pch = 4, lwd = 2)
 legend("topleft", legend = c("forecast", "analysis", "data", "truth"), pch = c(1, 3, 18, 4),
        col = c(1, 2, "purple", 1))
 
+dev.off()
+
+## cairo: the default quartz device crashes in forked workers (the seed sweep runs this file in mclapply)
+png(file.path(outdir, "tau_correlation.png"), width = 1500, height = 950, res = 120, type = "cairo")
+plot_tau_correlation(or.fit, sqrt(diag(Q)))
 dev.off()
 
 ## ---- Save outputs -------------------------------------------------------------------
