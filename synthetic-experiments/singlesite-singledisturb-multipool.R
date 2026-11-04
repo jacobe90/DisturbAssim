@@ -13,12 +13,16 @@
 ##     (ORJointUpdate observes only the wood pool); NA entries are skipped
 ##   - each importance sample is paired with a random ensemble member's VSEM parameters
 ##     and PAR driver, so the forecast moments include parameter and driver uncertainty
-##   - disturbance is the Rmd's absolute draw of leaf and stem from N(mu0, V0), capped at
-##     the pre-disturbance values, with alloc.soil of the removed C added to the soil
+##   - disturbance removes a percentage of the existing biomass, as disturbance2 in
+##     SingleSite_MultiDisturb_MultiPool.Rmd (its harvest type): leaf and stem become
+##     N(mu0 * old, V0), capped at the old values, with alloc.soil of the removed C added
+##     to the soil. (SingleSite_SingleDisturb_MultiPool.Rmd drew leaf and stem from an
+##     absolute N(mu0, V0) instead.)
 ##   - the process error is diag(1/tau_leaf, 1/tau_soil, 1/tau_stem), all three learned on
-##     a 3-D log-spaced product grid (ORJointUpdate learns only the wood pool's tau); the
-##     disturbed branch keeps the soil process variance, since the soil is not reset by a
-##     disturbance
+##     a 3-D log-spaced product grid (ORJointUpdate learns only the wood pool's tau). Under
+##     a disturbance, leaf and stem keep a fraction mu0 of a state that already carries
+##     process error, so their process variance is scaled by mu0^2; the soil keeps its full
+##     process variance
 ##   - with thousands of grid points, the per-component 3 x 3 algebra (densities, Kalman
 ##     updates, proposal draws) is done in closed form across all components at once, and
 ##     grid points whose posterior weight becomes negligible are dropped
@@ -39,16 +43,17 @@ tobit <- function(x){
   x
 }
 
-### Constants to be used for disturbance function
-mu0 <- c(1,1)                   ## mean leaf & stem biomass after disturbance
-V0  <- diag(c(0.15,0.25))^2     ## var in post disturbance leaf and stem biomass
+### Constants to be used for disturbance function: the harvest of
+### SingleSite_MultiDisturb_MultiPool.Rmd (disturbance2, type 1)
+mu0 <- c(0.1,0.1)               ## mean leaf & stem biomass after disturbance as % of original
+V0  <- diag(c(0.15,0.15))^2     ## var in post disturbance leaf and stem biomass
 alloc.soil = 0.25               ## fraction of removed C that goes in the soil
 
-## x = (Cleaf, Csoil, Cstem); draws new leaf and stem, which can only decrease, and moves
-## alloc.soil of the removed biomass to the soil
+## x = (Cleaf, Csoil, Cstem); keeps a fraction ~ mu0 of leaf and stem (they can only
+## decrease) and moves alloc.soil of the removed biomass to the soil (as disturbance2)
 disturbance <- function(x){
   old.biomass <- x[c(1,3)]
-  new.biomass <- tobit(mvtnorm::rmvnorm(1,mu0,V0)) ## draw disturbed leaf and stem
+  new.biomass <- tobit(mvtnorm::rmvnorm(1,mu0*old.biomass,V0)) ## draw disturbed leaf and stem
   check.max <- which(new.biomass > old.biomass)
   if(length(check.max)>0) new.biomass[check.max] = old.biomass[check.max]
   residual = sum(old.biomass-new.biomass)
@@ -60,7 +65,8 @@ disturbance <- function(x){
 ## disturbance() applied to every row of X (n x 3)
 disturbance.rows <- function(X, mu0, V0, alloc.soil){
   old.biomass <- X[, c(1,3), drop = FALSE]
-  new.biomass <- pmin(tobit(mvtnorm::rmvnorm(nrow(X), mu0, V0)), old.biomass)
+  new.biomass <- old.biomass * rep(mu0, each = nrow(X)) + mvtnorm::rmvnorm(nrow(X), c(0,0), V0)
+  new.biomass <- pmin(tobit(new.biomass), old.biomass)
   X[, c(1,3)] <- new.biomass
   X[, 2] <- X[, 2] + rowSums(old.biomass - new.biomass)*alloc.soil
   X
@@ -401,7 +407,10 @@ ORJointUpdateMP <- function(Y, R, PAR, met, THETA, Xic, dist, N = 1000, prior, g
       if (k == 0) {
         S[, c(1, 5, 9)] <- S[, c(1, 5, 9)] + 1 / tauP                   # process variance 1/tau
       } else {
-        S[, 5] <- S[, 5] + 1 / tauP[, 2]                                # soil is not reset by disturbance
+        # the disturbance keeps a fraction mu0 of leaf and stem, which already carry process
+        # error, so their variance is scaled by mu0^2; the soil keeps its full variance
+        f2 <- c(dist$vals[[k]]$mu0[1]^2, 1, dist$vals[[k]]$mu0[2]^2)
+        S[, c(1, 5, 9)] <- S[, c(1, 5, 9)] + sweep(1 / tauP, 2, f2, "*")
       }
       rows <- k * P + seq_len(P)
       muF[rows, ]  <- MU
