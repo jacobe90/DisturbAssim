@@ -1,0 +1,378 @@
+## Postprocessing and analyses of the OR joint-update runs saved by run-model-or.R.
+##
+## Ported from OR_joint_update_analysis.Rmd (now legacy/models/). Each run is the `hist`
+## list returned by `ORJointUpdate`, saved to
+## `<indir>/site_<idx>_distprod_<TF>_<source>_<model>_tau<prior>[_bias].rds`,
+## with per-timestep
+##   * `year`, `obs`: calendar year of each DA timestep and the assimilated observation;
+##   * `mean`, `var`, `ci95`: wood-pool analysis mean, variance and 95% interval (2.5% /
+##     97.5% quantiles of the analysis mixture), marginalised over the tau posterior and the
+##     mixture components;
+##   * `pDist`: posterior probability of disturbance;
+##   * `pit`: probability integral transform of each observation under its one-step-ahead
+##     predictive (before that observation is assimilated, integrating over process error).
+## The formulas are written up in `claude-working-docs/or_joint_update2_analysis_plots.pdf`.
+##
+## Writes to <indir>: elist.RData, stats.RData, exps_summary.pdf, distprod_TRUE_vs_FALSE.pdf.
+##
+## run-model-or.R runs this on its output folder when it finishes. On its own, from the
+## repository root:
+##   Rscript or-model/analysis-or.R                                  # experiments/or-model/runs
+##   Rscript or-model/analysis-or.R --indir experiments/fullRunBias
+
+## ---- set up -----------------------------------------------------------------------
+
+source("or-model/R/config.R")                 # B2C, dtime, ctime, or.files, say
+check_repo_root()
+## run folder: set by run-model-or.R (analysis.indir), else --indir
+indir <- if (exists("analysis.indir", inherits = FALSE)) analysis.indir else
+  cli_opt("--indir", "experiments/or-model/runs")
+if (!dir.exists(indir)) stop("no run folder ", indir, " (set it with --indir)")
+## the site set the runs were made on (runs from before this was recorded: the tracked one)
+run1 <- dir(indir, pattern = "^site_.*\\.rds$", full.names = TRUE)[1]
+if (is.na(run1)) stop("no runs in ", indir)
+extract.file <- readRDS(run1)$extractFile
+if (is.null(extract.file)) extract.file <- or.files$extract
+say("OR analysis: runs in %s, sites from %s", indir, extract.file)
+load(extract.file)                            # bextract, dextract, points
+## The products cover different years, so every lookup goes through calendar year:
+##   dextract (disturbance product): 1985:2012
+##   bextract (biomass / Yw):        1990:2017
+##   DA timesteps:                   stored per run in hist$year (1990:2017)
+colnames(dextract) <- paste0("t", dtime)
+dextract[is.na(dextract)] <- 0
+Yw <- bextract * B2C * 1000 * 1e-4            # nsite x nyears observed
+colnames(Yw) <- paste0("t", ctime)
+
+yr.dist <- 2004               # disturbance-assessment year
+
+## turn an experiment label (e.g. "distprod_TRUE_GEDI_het_taugamma") into a readable title
+## (e.g. "Disturbance Product, Heteroskedastic R (GEDI magnitude)").
+pretty.exp <- function(e) {
+  p    <- strsplit(e, "_", fixed = TRUE)[[1]]   # distprod, TRUE/FALSE, source, het/con, tau<prior>[, bias]
+  prod <- if (length(p) >= 2 && p[2] == "TRUE") "Disturbance Product" else "No Disturbance Product"
+  src  <- if (length(p) >= 3) p[3] else "?"
+  rmod <- if (length(p) >= 4 && p[4] == "het") "Heteroskedastic R" else "Constant R"
+  bias <- if ("bias" %in% p) ", bias-corrected" else ""
+  sprintf("%s, %s (%s magnitude)%s", prod, rmod, src, bias)
+}
+
+## ---- postprocessing ---------------------------------------------------------------
+
+## Detect the joint-update run files and parse site index + experiment label
+## (experiment = distprod + Rparams source + model + tau prior).
+runs  <- dir(indir, pattern = "^site_.*\\.rds$")
+parts <- strsplit(sub("\\.rds$", "", runs), "_", fixed = TRUE)
+sites <- sapply(parts, function(x) as.numeric(x[2]))
+exp   <- sapply(parts, function(x) paste(x[3:length(x)], collapse = "_"))
+exps  <- sort(unique(exp))
+say("%d runs, %d experiments:", length(runs), length(exps))
+message(paste0("  ", exps, collapse = "\n"))
+
+nsite <- nrow(dextract)
+elist <- list()
+for (i in seq_along(exps)) {
+  esel <- which(exp == exps[i])
+  pdist04 <- div <- pitT <- obsT <- rep(NA, nsite)
+  pit.all <- c()
+  say("reading experiment %d / %d: %s (%d runs)", i, length(exps), exps[i], length(esel))
+  for (j in esel) {
+    k <- sites[j]
+    if (is.na(k) || k < 1 || k > nsite) next     # skip runs from a different extract
+    res <- readRDS(file.path(indir, runs[j]))
+    if (is.null(res$year)) stop(runs[j], ": no $year axis -- stale run from before the 1990 alignment fix; rerun it")
+    if (is.null(res$ci95)) stop(runs[j], ": no $ci95 -- run from before the filter-divergence change; rerun it")
+
+    ## detection: posterior P(disturbed) in 2004
+    pdist04[k] <- res$pDist[res$year == yr.dist]
+
+    ## filter divergence at the last observed timestep T:
+    ## (y_T - analysis mean) / (half the width of the 95% analysis interval)
+    tT      <- max(which(!is.na(res$obs)))
+    obsT[k] <- res$obs[tT]
+    div[k]  <- (res$obs[tT] - res$mean[tT]) / ((res$ci95[tT, "hi"] - res$ci95[tT, "lo"]) / 2)
+
+    ## PIT of the last observation under its one-step-ahead predictive, and all PITs
+    pitT[k] <- res$pit[tT]
+    pit.all <- c(pit.all, res$pit[!is.na(res$pit)])
+  }
+  elist[[exps[i]]] <- list(pdist04 = pdist04, div = div, pitT = pitT, obsT = obsT,
+                           pit.all = pit.all)
+}
+
+## matching observations
+obs.pre   <- Yw[, paste0("t", yr.dist - 1)]   # 2003 AGB
+obs.dist  <- Yw[, paste0("t", yr.dist)]       # 2004 AGB
+distabs   <- obs.pre - obs.dist               # absolute AGB change 2003 -> 2004 (loss > 0)
+obs.class <- dextract[, paste0("t", yr.dist)] / 10   # 2004 disturbance-product label
+save(elist, obs.pre, obs.dist, obs.class, distabs,
+     file = file.path(indir, "elist.RData"))
+
+## ---- analyses ---------------------------------------------------------------------
+
+## Summary PDF: one page per plot, every experiment drawn as its own panel with shared
+## axes. Points are coloured by the 2004 disturbance-product label.
+
+classnames  <- c("other", "cut", "road", "fire", "biotic")          # codes 10..50
+class.cols  <- c("grey60", "black", "red", "green3", "blue", "cyan")  # index = class + 1
+pt.col      <- class.cols[obs.class + 1]
+class.vals  <- sort(unique(obs.class[obs.class != 0]))
+legend.labels <- c("undisturbed", classnames[class.vals])
+legend.cols   <- c(class.cols[1], class.cols[class.vals + 1])
+
+nexp <- length(exps)
+grid <- c(2, ceiling(nexp / 2))
+has  <- lapply(elist, function(e) which(is.finite(e$div)))   # sites run per experiment
+all.sites <- sort(unique(unlist(has)))
+pct  <- function(x) sprintf("%.0f%%", 100 * mean(x, na.rm = TRUE))
+pct1 <- function(x) sprintf("%.1f%%", 100 * mean(x, na.rm = TRUE))
+
+## Trend of P(disturbed) in 2004 vs AGB loss: a penalised-spline logistic GAM
+## (quasibinomial, logit link, k = 5 basis, smoothness chosen by REML), fitted to the
+## sites the product flags in 2004. (Unflagged sites are left out: with the product they
+## sit near P = 0 at any loss, so a curve through both groups would fit neither.)
+## Not fitted with fewer than min.fit.sites sites. P is clamped to [0.001, 0.999] first: runs that
+## saturate at exactly 0 or 1 would otherwise push the logit fit to +-Inf there (and its
+## confidence band to the whole [0, 1]), and some P exceed 1 by rounding error.
+flag04 <- obs.class > 0
+min.fit.sites <- 10
+fit_trend <- function(p, grp) {
+  p <- pmin(pmax(p, 0.001), 0.999)
+  d <- data.frame(p = p, x = distabs)[grp & is.finite(p) & is.finite(distabs), ]
+  if (nrow(d) < min.fit.sites || length(unique(d$x)) < 5) return(NULL)
+  tryCatch(mgcv::gam(p ~ s(x, k = 5), family = quasibinomial, data = d, method = "REML"),
+           error = function(e) { warning("trend fit failed: ", conditionMessage(e)); NULL })
+}
+## mean curve and its 95% confidence band over the group's own range of loss
+trend_curve <- function(fit, n = 200) {
+  xx <- seq(min(fit$model$x), max(fit$model$x), length.out = n)
+  pr <- predict(fit, data.frame(x = xx), se.fit = TRUE)
+  list(x = xx, mean = plogis(pr$fit),
+       lo = plogis(pr$fit - 1.96 * pr$se.fit), hi = plogis(pr$fit + 1.96 * pr$se.fit))
+}
+## loss at which the mean curve first crosses P = 0.5; -Inf / Inf if it stays above /
+## below 0.5 over the fitted range, NA without a fit
+x50_value <- function(fit) {
+  if (is.null(fit)) return(NA_real_)
+  cv <- trend_curve(fit, 1000); up <- cv$mean >= 0.5
+  if (all(up))  return(-Inf)
+  if (!any(up)) return(Inf)
+  i <- which(diff(up) != 0)[1]
+  approx(cv$mean[i:(i + 1)], cv$x[i:(i + 1)], 0.5)$y
+}
+x50_label <- function(fit) {
+  v <- x50_value(fit)
+  if (is.na(v)) return("--")
+  if (v == -Inf) return(sprintf("<%.1f", min(fit$model$x)))
+  if (v ==  Inf) return(sprintf(">%.1f", max(fit$model$x)))
+  sprintf("%.2f", v)
+}
+stats <- list()
+for (i in seq_along(exps)) stats[[exps[i]]] <- list(flag = fit_trend(elist[[i]]$pdist04, flag04))
+
+say("writing %s", file.path(indir, "exps_summary.pdf"))
+pdf(file.path(indir, "exps_summary.pdf"), width = 14, height = 7)
+obsT.xlim <- range(unlist(lapply(elist, function(e) e$obsT)), na.rm = TRUE)
+
+## ---- Page 1: filter divergence per site ----
+## (y_T - analysis mean_T) / half-width of the 95% analysis interval; inside [-1, 1]
+## means the final observation falls inside the interval.
+div.ylim <- range(c(-1.5, 1.5, unlist(lapply(elist, function(e) e$div))), na.rm = TRUE)
+par(mfrow = grid, mar = c(4, 4, 3, 1), oma = c(0, 0, 2, 0))
+for (i in seq_along(exps)) {
+  e <- elist[[i]]
+  plot(e$obsT, e$div, col = pt.col, pch = 19, xlim = obsT.xlim, ylim = div.ylim,
+       xlab = "final observed AGB (kgC m-2)", ylab = "filter divergence", cex.main = 0.8,
+       main = sprintf("%s\n%s of sites in [-1, 1]", pretty.exp(exps[i]), pct(abs(e$div) <= 1)))
+  rect(par("usr")[1], -1, par("usr")[2], 1, col = adjustcolor("grey", 0.25), border = NA)
+  abline(h = 0, lty = 2)
+  if (i == 1)
+    legend("topright", legend = legend.labels, col = legend.cols,
+           pch = 19, bty = "n", cex = 0.8, title = "2004 product label")
+}
+mtext("filter divergence at the final observation (grey = [-1, 1])", outer = TRUE, cex = 1.2)
+
+## ---- Page 2: PIT calibration of the final observation, pooled over all runs ----
+## u = P(y' <= y_T | y_{1:T-1}) for every (experiment, site) run. If the one-step-ahead
+## predictive is calibrated, u ~ Uniform(0, 1), so (left) the histogram of u over all runs
+## is flat, and (right) the central p-interval of the predictive contains y_T in a
+## fraction p of runs, for every p. Grey bands: 95% range expected from binomial
+## sampling noise alone if the predictive were calibrated.
+pitT.exp  <- lapply(elist, function(e) e$pitT[is.finite(e$pitT)])
+pitT.pool <- unlist(pitT.exp, use.names = FALSE)
+n.pool    <- length(pitT.pool)
+exp.cols  <- hcl.colors(nexp, "Dark 3")
+layout(matrix(c(1, 2, 3, 3), 2, byrow = TRUE), heights = c(5, 1))   # legend strip below
+par(mar = c(4.5, 4.5, 3.5, 1), oma = c(0, 0, 2, 0))
+
+## (a) histogram of u, all runs pooled
+nb   <- 20; br <- seq(0, 1, length.out = nb + 1)
+dens <- hist(pitT.pool, breaks = br, plot = FALSE)$counts * nb / n.pool
+band <- qbinom(c(0.025, 0.975), n.pool, 1 / nb) * nb / n.pool
+in95 <- qbinom(c(0.025, 0.975), n.pool, 0.95) / n.pool
+plot(NA, xlim = c(0, 1), ylim = c(0, max(dens, band[2]) * 1.1), xaxs = "i",
+     xlab = "PIT u of the final observation", ylab = "density", cex.main = 0.9,
+     main = sprintf("all %d runs pooled\n%s in the central 95%% (expected %.1f-%.1f%%)",
+                    n.pool, pct1(abs(2 * pitT.pool - 1) <= 0.95), 100 * in95[1], 100 * in95[2]))
+rect(0, band[1], 1, band[2], col = adjustcolor("grey", 0.35), border = NA)
+rect(br[-(nb + 1)], 0, br[-1], dens, col = "grey55", border = "white")
+abline(h = 1, lty = 2)
+
+## (b) central-interval coverage error, per experiment and pooled
+lev   <- c(seq(0.05, 0.95, by = 0.05), 0.99)
+cover <- function(u) sapply(lev, function(p) mean(abs(2 * u - 1) <= p))
+n.exp <- min(lengths(pitT.exp))
+bandE <- sapply(lev, function(p) qbinom(c(0.025, 0.975), n.exp, p) / n.exp - p)
+bandP <- sapply(lev, function(p) qbinom(c(0.025, 0.975), n.pool, p) / n.pool - p)
+err   <- sapply(pitT.exp, function(u) cover(u) - lev)
+errP  <- cover(pitT.pool) - lev
+plot(NA, xlim = c(0, 1), ylim = range(c(bandE, err, errP)), cex.main = 0.9,
+     xlab = "nominal coverage p of the central predictive interval",
+     ylab = "empirical - nominal coverage",
+     main = "coverage error (> 0: predictive too wide, < 0: too narrow)")
+polygon(c(lev, rev(lev)), c(bandE[1, ], rev(bandE[2, ])), col = adjustcolor("grey", 0.25), border = NA)
+polygon(c(lev, rev(lev)), c(bandP[1, ], rev(bandP[2, ])), col = adjustcolor("grey", 0.45), border = NA)
+abline(h = 0, lty = 2)
+matlines(lev, err, col = exp.cols, lty = 1, lwd = 1.3)
+lines(lev, errP, lwd = 3)
+par(mar = c(0, 0, 0, 0)); plot.new()
+legend("center", bty = "n", cex = 0.75, ncol = 3, lwd = c(3, rep(1.3, nexp)),
+       col = c("black", exp.cols),
+       legend = c(sprintf("all runs pooled (n = %d)", n.pool),
+                  sprintf("%s (n = %d)", sapply(exps, pretty.exp), lengths(pitT.exp))))
+mtext(sprintf("one-step-ahead PIT calibration of the final observation, %d experiments x %d sites",
+              nexp, length(all.sites)), outer = TRUE, cex = 1.2)
+layout(1)
+
+## ---- Page 3: PIT histogram over all sites and years ----
+## flat at density 1 if calibrated; U-shape = predictive too narrow, hump = too wide,
+## slope = biased.
+pit.br <- seq(0, 1, by = 0.05)
+pit.ymax <- max(sapply(elist, function(e) max(hist(e$pit.all, breaks = pit.br, plot = FALSE)$density)))
+par(mfrow = grid, mar = c(4, 4, 3, 1), oma = c(0, 0, 2, 0))
+for (i in seq_along(exps)) {
+  e <- elist[[i]]
+  hist(e$pit.all, breaks = pit.br, freq = FALSE, col = "grey80", border = "white",
+       ylim = c(0, pit.ymax), xlab = "PIT u", cex.main = 0.8,
+       main = sprintf("%s\n%d site-years", pretty.exp(exps[i]), length(e$pit.all)))
+  abline(h = 1, lty = 2)
+}
+mtext("one-step-ahead PIT of every observation, all sites and years (dashed = uniform)",
+      outer = TRUE, cex = 1.2)
+
+## ---- Page 4: disturbance detection vs absolute disturbance size ----
+distabs.xlim <- range(distabs[all.sites], na.rm = TRUE)
+par(mfrow = grid, mar = c(4, 4, 3, 1), oma = c(0, 0, 2, 0))
+for (i in seq_along(exps)) {
+  plot(distabs, elist[[i]]$pdist04, col = pt.col, pch = 19,
+       xlim = distabs.xlim, ylim = c(0, 1), cex.main = 0.8,
+       xlab = "AGB loss 2003 -> 2004 (kgC m-2)", ylab = "P(disturbed) in 2004",
+       main = pretty.exp(exps[i]))
+  abline(v = 0, col = "grey80")
+  fit <- stats[[i]]$flag
+  if (!is.null(fit)) {
+    cv <- trend_curve(fit)
+    polygon(c(cv$x, rev(cv$x)), c(cv$lo, rev(cv$hi)), col = adjustcolor("black", 0.15), border = NA)
+    lines(cv$x, cv$mean, lwd = 2.5)
+    ## dashed drop line from the x-axis up to where the trend crosses P = 0.5
+    x50 <- x50_value(fit)
+    if (is.finite(x50)) {
+      segments(x50, par("usr")[3], x50, 0.5, lty = 2, lwd = 1.5)
+      lab <- sprintf("%.2f", x50); w <- strwidth(lab, cex = 0.8); h <- strheight(lab, cex = 0.8)
+      x0  <- x50 + 0.4 * strwidth("m", cex = 0.8)                 # boxed label right of the line
+      rect(x0, 0.5 - 0.9 * h, x0 + w * 1.3, 0.5 + 0.9 * h, col = "white", border = "grey40")
+      text(x0 + w * 0.65, 0.5, lab, cex = 0.8)
+    }
+  }
+  if (i == 1) {
+    legend("topleft", legend = legend.labels, col = legend.cols,
+           pch = 19, bty = "n", cex = 0.8, title = "2004 product label")
+    legend("bottomright", legend = c("trend, sites flagged in 2004", "loss at P = 0.5"),
+           lty = c(1, 2), lwd = c(2.5, 1.5), bty = "n", cex = 0.8)
+  }
+}
+mtext("disturbance detection vs absolute disturbance size (line: logistic GAM mean for sites flagged in 2004, band = 95% CI)",
+      outer = TRUE, cex = 1.2)
+
+## ---- Page 5: summary table ----
+## AGB loss at which the flagged-site trend curve crosses P = 0.5
+x50 <- sapply(stats, function(s) x50_label(s$flag))
+tab <- data.frame(
+  experiment = sapply(exps, pretty.exp),
+  div.in     = sapply(elist, function(e) pct(abs(e$div) <= 1)),
+  div.med    = sapply(elist, function(e) sprintf("%.2f", median(abs(e$div), na.rm = TRUE))),
+  pit.in     = sapply(elist, function(e) pct(abs(2 * e$pitT - 1) <= 0.95)),
+  pit.all.in = sapply(elist, function(e) pct(abs(2 * e$pit.all - 1) <= 0.95)),
+  x50        = x50)
+## pooled over every run of every experiment
+pool <- function(f) unlist(lapply(elist, `[[`, f), use.names = FALSE)
+tab <- rbind(tab, data.frame(
+  experiment = "All experiments pooled",
+  div.in     = pct1(abs(pool("div")) <= 1),
+  div.med    = sprintf("%.2f", median(abs(pool("div")), na.rm = TRUE)),
+  pit.in     = pct1(abs(2 * pool("pitT") - 1) <= 0.95),
+  pit.all.in = pct1(abs(2 * pool("pit.all") - 1) <= 0.95),
+  x50        = "--"))
+heads <- c("Experiment", "|div| <= 1", "median |div|", "final PIT\nin 95%",
+           "all PITs\nin 95%", "loss at P = 0.5\n(flagged sites)")
+par(mfrow = c(1, 1), mar = c(1, 1, 4, 1))
+plot.new()
+title("Summary by experiment")
+xs <- c(0.01, 0.46, 0.56, 0.66, 0.76, 0.86)
+yy <- 0.86 - seq_len(nrow(tab)) * min(0.08, 0.8 / nrow(tab))
+text(xs, 0.92, heads, adj = c(0, 0.5), font = 2, cex = 0.8)
+for (c in seq_along(xs)) text(xs[c], yy, tab[[c]], adj = 0, cex = 0.8)
+segments(0, c(0.97, 0.87, mean(yy[nexp + 0:1])), 1, c(0.97, 0.87, mean(yy[nexp + 0:1])), col = "grey55")
+invisible(dev.off())
+save(stats, tab, file = file.path(indir, "stats.RData"))
+
+## ---- disturbance product: where does pDist change? --------------------------------
+
+## Compares the runs with and without the disturbance product (same R model and tau prior)
+## (a) at the assessment year `yr.dist` (2004) and (b) averaged over each site's own flagged years.
+
+## (only settings run both with and without the product)
+combos <- unique(sub("^distprod_(TRUE|FALSE)_", "", exps))
+combos <- combos[paste0("distprod_TRUE_", combos) %in% exps & paste0("distprod_FALSE_", combos) %in% exps]
+if (!length(combos)) {
+  say("no setting was run both with and without the product: no distprod_TRUE_vs_FALSE.pdf")
+} else {
+say("writing %s", file.path(indir, "distprod_TRUE_vs_FALSE.pdf"))
+pdf(file.path(indir, "distprod_TRUE_vs_FALSE.pdf"), width = 10, height = 5)
+for (cb in combos) {
+  eT <- paste0("distprod_TRUE_", cb); eF <- paste0("distprod_FALSE_", cb)
+  if (!all(c(eT, eF) %in% exps)) next
+  both <- intersect(sites[exp == eT], sites[exp == eF])
+  if (length(both) == 0) next
+
+  pT04 <- pF04 <- pTfl <- pFfl <- rep(NA, length(both))
+  flag04 <- dextract[both, paste0("t", yr.dist)] > 0
+  for (m in seq_along(both)) {
+    s  <- both[m]
+    rT <- readRDS(file.path(indir, sprintf("site_%d_%s.rds", s, eT)))
+    rF <- readRDS(file.path(indir, sprintf("site_%d_%s.rds", s, eF)))
+    fyrs <- dtime[dextract[s, ] > 0]                 # this site's flagged calendar years
+    fyrs <- which(rT$year %in% fyrs)                 # ... as DA timesteps
+    pT04[m] <- rT$pDist[rT$year == yr.dist]; pF04[m] <- rF$pDist[rF$year == yr.dist]
+    if (length(fyrs) > 0) {
+      pTfl[m] <- mean(rT$pDist[fyrs], na.rm = TRUE)
+      pFfl[m] <- mean(rF$pDist[fyrs], na.rm = TRUE)
+    }
+  }
+
+  par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+  plot(pF04, pT04, col = ifelse(flag04, "red", "grey50"), pch = 19,
+       xlim = c(0, 1), ylim = c(0, 1),
+       xlab = "pDist without product", ylab = "pDist with product",
+       main = sprintf("%s @ %d", cb, yr.dist))
+  abline(0, 1, lty = 2)
+  legend("topleft", legend = c("flagged in 2004", "not flagged in 2004"),
+         col = c("red", "grey50"), pch = 19, bty = "n", cex = 0.8)
+  plot(pFfl, pTfl, col = "darkgreen", pch = 19, xlim = c(0, 1), ylim = c(0, 1),
+       xlab = "mean pDist without product", ylab = "mean pDist with product",
+       main = sprintf("%s, over flagged years", cb))
+  abline(0, 1, lty = 2)
+}
+invisible(dev.off())
+}
+say("OR analysis done: %s", indir)

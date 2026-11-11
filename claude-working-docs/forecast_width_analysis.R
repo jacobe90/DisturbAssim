@@ -2,7 +2,7 @@
 ## Figures and numbers for claude-working-docs/claude-forecast-width-10.8.26.tex.
 ##
 ## Inputs (run from the repo root):
-##   experiments/fullRunBias    full grid, bias correction on   (OR_joint_update2.Rmd run-grid)
+##   experiments/fullRunBias    full grid, bias correction on   (or-model/run-model-or.R --dist-proc-err off)
 ##   experiments/fullRunNoBias  full grid, bias correction off  (same, grid.bias <- NULL)
 ## Runs a 100-site subset of both grids again into experiments/forecastWidth, with the
 ## same seeds as the grid, to get the no-disturbance predictive (predMean0 / predVar0 /
@@ -15,16 +15,15 @@ out.dir <- "claude-working-docs"
 exp.dir <- Sys.getenv("EXP_DIR", "experiments")   # override if the runs live elsewhere
 n.sub   <- 100
 
-## ---- model setup + grid definitions from OR_joint_update2.Rmd --------------------
-pdf(NULL)
-rfile <- tempfile(fileext = ".R")
-knitr::purl("OR_joint_update2.Rmd", output = rfile, quiet = TRUE)
-code <- readLines(rfile)
-hdr  <- grep("^## ----", code); rs <- grep("^## ----run-single", code); rg <- grep("^## ----run-grid", code)
-g    <- code[rg:(min(hdr[hdr > rg]) - 1)]
-g    <- g[seq_len(grep("^fmt_secs", g) - 1)]          # grid definitions, not the worker pool
-source(textConnection(c(code[seq_len(rs - 1)], g)))
-dev.off()
+## ---- model code + the grid definitions of the original full-grid runs ---------------
+## (moved from OR_joint_update2.Rmd to or-model/; needs  Rscript or-model/load-data-or.R
+## first). The grid runs predate the process error of disturbed components, so it is
+## off here, and row i of exp.grid is run with seed i, as in the grid.
+source("or-model/R/load-or-model.R")
+formals(run_joint_update_sites)$distProcErr <- FALSE
+grid.bias  <- list(rho = 0.9, denom = "N", skip = 1)
+grid.cores <- max(1, parallel::detectCores() - 2)
+exp.grid   <- make_exp_grid(outdir = file.path(exp.dir, "fullRunBias"), bias = grid.bias)
 
 exps <- expand.grid(R = names(Rparams.grid), useDistProduct = c(FALSE, TRUE), stringsAsFactors = FALSE)
 exps$label <- sprintf("%s %s R, %s", sapply(Rparams.grid[exps$R], `[[`, "source"),

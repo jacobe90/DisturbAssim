@@ -5,7 +5,7 @@
 ##   2. the blind (free-run) forecast without and with disturbance,
 ##   3. the standard EnKF without and with disturbance,
 ##   4. the multinomial (disturbed / undisturbed mixture) filter -- here the joint
-##      disturbance + process-precision filter of OR_joint_update2.Rmd (ORJointUpdate),
+##      disturbance + process-precision filter of or-model/R/or-joint-update.R (ORJointUpdate),
 ##      ported from the 3-pool VSEM model to the 1-pool logistic LAI model,
 ## and the comparison figure of the three filters.
 ##
@@ -118,7 +118,7 @@ mix_quantile <- function(p, w, mu, sd) {
 }
 
 # Initial tau weights: grid point g gets the prior mass of its cell, with the cell
-# edges at the midpoints to the neighbouring grid points (see OR_joint_update2.Rmd).
+# edges at the midpoints to the neighbouring grid points (see or-model/R/or-joint-update.R).
 cell_prior_mass <- function(tauGrid, prior) {
   G   <- length(tauGrid)
   if (G == 1) return(1)
@@ -157,7 +157,7 @@ project_grid <- function(w, mu, sig) {
 
 ##' Approximate joint disturbance + process-precision update, logistic LAI model
 ##'
-##' Port of ORJointUpdate (OR_joint_update2.Rmd) to a 1-pool state. Per tau grid point g
+##' Port of ORJointUpdate (or-model/R/or-joint-update.R) to a 1-pool state. Per tau grid point g
 ##' the analysis is a 2-component Gaussian mixture (j = undisturbed / disturbed history).
 ##' Forecast: importance-sample the previous analysis mixture, push the samples through
 ##' the logistic model and take weighted moments for every (g, j); the undisturbed branch

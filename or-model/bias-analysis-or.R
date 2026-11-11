@@ -1,4 +1,4 @@
-## Bias-correction analysis for ORJointUpdate (OR_joint_update2.Rmd).
+## Bias-correction analysis for ORJointUpdate (or-model/R/or-joint-update.R).
 ##
 ## Runs the joint update for one site without bias correction and with the online
 ## bias correction (posterior-weighted, undisturbed components only; see the `bias`
@@ -12,9 +12,11 @@
 ##   (d) posterior probability of disturbance
 ##   (e) the summary-score table
 ##
-## Run from the repo root:  Rscript OR_joint_update_bias_analysis.R
-## Needs the same data files as OR_joint_update2.Rmd (STprior, extract.h03v04,
-## dis.postprocessed, fit, daymet.h03v04 .RData).
+## Run from the repo root, after  Rscript or-model/load-data-or.R :
+##   Rscript or-model/bias-analysis-or.R
+## (Moved from OR_joint_update_bias_analysis.R. Its earlier runs, in experiments/
+## biasCorrection, predate the process error of disturbed components; new runs go to
+## experiments/or-model/biasCorrection.)
 
 ## ---- settings ---------------------------------------------------------------
 site    <- 300
@@ -29,8 +31,8 @@ cfgs <- list(
 run.dir <- c("no correction" = "none", "denom = N" = "denomN", "denom = t" = "denomT")
 run.col <- c("no correction" = "#8a8984", "denom = N" = "#2a78d6", "denom = t" = "#eb6834")
 run.lty <- c("no correction" = 2, "denom = N" = 1, "denom = t" = 4)
-outdir  <- "experiments/biasCorrection"
-figfile <- sprintf("claude-working-docs/bias_correction_site%d.png", site)
+outdir  <- "experiments/or-model/biasCorrection"
+figfile <- file.path(outdir, sprintf("bias_correction_site%d.png", site))
 tabfile <- sub("\\.png$", "_scores.csv", figfile)
 rerun   <- FALSE   # TRUE: rerun even if saved runs exist
 
@@ -144,17 +146,8 @@ plot_bias_comparison <- function(H, scores, figfile, site, keep) {
   invisible(figfile)
 }
 
-## ---- load the model setup and ORJointUpdate from OR_joint_update2.Rmd ---------
-## Everything before the `run-single` chunk: data, VSEM setup, make_or_args,
-## ORJointUpdate and run_joint_update_sites. The run / grid chunks are not executed.
-pdf(NULL)   # swallow the diagnostic plots drawn by the setup chunks
-rfile <- tempfile(fileext = ".R")
-knitr::purl("OR_joint_update2.Rmd", output = rfile, quiet = TRUE)
-code  <- readLines(rfile)
-stop.at <- grep("^## ----run-single", code)
-stopifnot(length(stop.at) == 1)
-source(textConnection(code[seq_len(stop.at - 1)]))
-dev.off()
+## ---- model code and the inputs cached by or-model/load-data-or.R ---------------------
+source("or-model/R/load-or-model.R")
 
 ## ---- run (or load) every configuration ---------------------------------------
 tag <- sprintf("site_%d_distprod_TRUE_GEDI_het_taugamma", site)

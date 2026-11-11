@@ -1,7 +1,7 @@
 ## Generalised ORJointUpdate filter shared by the multi-pool synthetic experiments.
 ##
 ## Extends the filter of singlesite-singledisturb-multipool.R (itself a port of
-## ORJointUpdate in OR_joint_update2.Rmd) along three directions:
+## ORJointUpdate in or-model/R/or-joint-update.R) along three directions:
 ##   - any state dimension d (e.g. 3 pools x 2 sites)
 ##   - any number of disturbance scenarios k = 0..K (k = 0: undisturbed) and of discrete
 ##     history groups h = 1..H. The analysis at every tau grid point is a mixture of one
@@ -26,7 +26,7 @@ mix_quantile <- function(p, w, mu, sd) {
                                  c(lo, hi), tol = 1e-6 * (hi - lo))$root)
 }
 
-# Initial tau weights on one grid axis: prior mass of each grid cell (see OR_joint_update2.Rmd)
+# Initial tau weights on one grid axis: prior mass of each grid cell (see or-model/R/or-joint-update.R)
 cell_prior_mass <- function(tauGrid, prior) {
   G   <- length(tauGrid)
   if (G == 1) return(1)

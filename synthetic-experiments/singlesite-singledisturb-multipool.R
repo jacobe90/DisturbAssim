@@ -4,7 +4,7 @@
 ##   1. the drivers, parameter ensemble, spin-up and "true" run / observations,
 ##   2. the EnKF without disturbance and the EnKF with disturbance,
 ##   3. the multinomial (disturbed / undisturbed mixture) filter -- here the joint
-##      disturbance + process-precision filter of OR_joint_update2.Rmd (ORJointUpdate)
+##      disturbance + process-precision filter of or-model/R/or-joint-update.R (ORJointUpdate)
 ##      in place of the JAGS analysis + multi.ens.adj,
 ## and the comparison figures.
 ##
@@ -186,7 +186,7 @@ mix_quantile <- function(p, w, mu, sd) {
                                  c(lo, hi), tol = 1e-8)$root)
 }
 
-# Initial tau weights on one grid axis: prior mass of each grid cell (see OR_joint_update2.Rmd)
+# Initial tau weights on one grid axis: prior mass of each grid cell (see or-model/R/or-joint-update.R)
 cell_prior_mass <- function(tauGrid, prior) {
   G   <- length(tauGrid)
   if (G == 1) return(1)
@@ -264,7 +264,7 @@ kalman_batch <- function(mu, sig, y, R, o) {
   list(mu = muA, sig = sigA, logL = -0.5 * qf - 0.5 * log(iv$det) - 0.5 * d * log(2 * pi))
 }
 
-# Moment-matching projection onto 2 Gaussians per tau grid point (from OR_joint_update2.Rmd).
+# Moment-matching projection onto 2 Gaussians per tau grid point (from or-model/R/or-joint-update.R).
 # w: G x 2 x (D+1), mu: G x 2 x (D+1) x 3, sig: G x 2 x (D+1) x 3 x 3. Group 1 is the
 # undisturbed components (k = 0), group 2 the disturbed ones (k >= 1).
 project_grid <- function(w, mu, sig) {

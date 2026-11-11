@@ -9,6 +9,16 @@ experiments/*
 # experiment data
 *.RData
 
+# data/: only the small inputs in data/inputs and data/paper are tracked; raw rasters,
+# derived rasters, the daymet / model-input caches and old results stay local
+# (see data/README.md)
+data/*
+!data/README.md
+!data/inputs/
+!data/paper/
+!data/inputs/*.RData
+!data/paper/*.RData
+
 # History files
 .Rhistory
 .Rapp.history

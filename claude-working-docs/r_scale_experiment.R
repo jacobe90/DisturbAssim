@@ -15,16 +15,15 @@ exp.dir <- Sys.getenv("EXP_DIR", "experiments")
 c.grid  <- c(1, 0.5, 0.25, 0.1, 0.05, 0.02, 0.01, 0.005)
 n.sub   <- 100
 
-## ---- model setup + grid definitions from OR_joint_update2.Rmd --------------------
-pdf(NULL)
-rfile <- tempfile(fileext = ".R")
-knitr::purl("OR_joint_update2.Rmd", output = rfile, quiet = TRUE)
-code <- readLines(rfile)
-hdr  <- grep("^## ----", code); rs <- grep("^## ----run-single", code); rg <- grep("^## ----run-grid", code)
-g    <- code[rg:(min(hdr[hdr > rg]) - 1)]
-g    <- g[seq_len(grep("^fmt_secs", g) - 1)]          # grid definitions, not the worker pool
-source(textConnection(c(code[seq_len(rs - 1)], g)))
-dev.off()
+## ---- model code + the grid definitions of the original full-grid runs ---------------
+## (moved from OR_joint_update2.Rmd to or-model/; needs  Rscript or-model/load-data-or.R
+## first). The grid runs predate the process error of disturbed components, so it is
+## off here, and row i of exp.grid is run with seed i, as in the grid.
+source("or-model/R/load-or-model.R")
+formals(run_joint_update_sites)$distProcErr <- FALSE
+grid.bias  <- list(rho = 0.9, denom = "N", skip = 1)
+grid.cores <- max(1, parallel::detectCores() - 2)
+exp.grid   <- make_exp_grid(outdir = file.path(exp.dir, "fullRunBias"), bias = grid.bias)
 NS <- nrow(dextract)
 
 ## same subset as forecast_width_analysis.R
