@@ -1,0 +1,81 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{listings}
+\lstset{basicstyle=\ttfamily\small,columns=fullflexible}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{6pt}
+
+\begin{document}
+\section*{Forecast weights and forecast quantiles}
+
+\textbf{Code} (\texttt{or-joint-update-filter.R}, step 4):
+\begin{lstlisting}
+wF <- as.vector(wPrior * piPrev); wF <- wF / sum(wF)
+if (forecastQuantiles)
+  for (a in 1:d) hist$fq[, t, a] <- mix_quantile(qs5, wF, muF[, a],
+                                                 sqrt(sigF[, mi(a, a, d)]))
+\end{lstlisting}
+
+\subsection*{Notation}
+Components are indexed by $g$ (active $\tau$ grid point), $h$ (history group) and
+$k$ (disturbance scenario at step $t$).
+\begin{itemize}
+  \item $\pi_g = p(\tau_g \mid y_{1:t-1})$: the $\tau$ posterior after step $t-1$ (\texttt{piPrev}, normalised \texttt{exp(qs)}).
+  \item $\omega_{gh} = p(h \mid \tau_g, y_{1:t-1})$: history-group weight within grid point $g$, $\sum_h \omega_{gh} = 1$ (\texttt{prevW}).
+  \item $\beta_k = p(k)$: prior probability of scenario $k$ at step $t$ (\texttt{dist.p[, t]}).
+  \item $m_{ghk} \in \mathbb{R}^d$, $S_{ghk} \in \mathbb{R}^{d\times d}$: forecast mean and covariance of component $(g,h,k)$ (\texttt{muF}, \texttt{sigF}).
+\end{itemize}
+
+\subsection*{1. Forecast weights}
+The prior weight of each component (\texttt{wPrior}) is
+\[
+  \tilde w_{ghk} = \omega_{gh}\,\beta_k\, \delta_{ghk},
+  \qquad
+  \delta_{ghk} =
+  \begin{cases}
+    0 & \text{component dropped},\\
+    1 & \text{otherwise,}
+  \end{cases}
+\]
+where a component is dropped if its importance weights collapsed or $S_{ghk}$ is singular,
+except that a grid point with every $\delta_{ghk} = 0$ has all of its $\delta_{ghk}$ reset to 1.
+Multiplying by the $\tau$ weight and normalising gives the forecast weights
+\[
+  w^F_{ghk} = \frac{\pi_g\, \tilde w_{ghk}}{\sum_{g',h',k'} \pi_{g'}\, \tilde w_{g'h'k'}} .
+\]
+(\texttt{wPrior * piPrev} multiplies element $[g,h,k]$ by $\pi_g$, since $g$ is the
+fastest-varying index of the $G\times H\times K_1$ array.)
+Without dropped components the denominator is 1, and $w^F_{ghk} = p(\tau_g, h, k \mid y_{1:t-1})$.
+
+\subsection*{2. Forecast distribution}
+The one-step-ahead forecast is the Gaussian mixture
+\[
+  p(x_t \mid y_{1:t-1}) \approx \sum_{g,h,k} w^F_{ghk}\; \mathcal{N}\!\left(x_t;\, m_{ghk},\, S_{ghk}\right).
+\]
+The marginal of a Gaussian mixture is the mixture of the component marginals, so state
+element $a$ has forecast CDF
+\[
+  F_a(x) = \sum_{g,h,k} w^F_{ghk}\; \Phi\!\left( \frac{x - m_{ghk,a}}{\sqrt{S_{ghk,aa}}} \right).
+\]
+
+\subsection*{3. Forecast quantiles}
+For each $p \in \{0.025,\ 0.25,\ 0.5,\ 0.75,\ 0.975\}$ (\texttt{qs5}), the stored quantile
+\texttt{hist\$fq[, t, a]} is the root $q_{a,p}$ of
+\[
+  F_a(q_{a,p}) = p .
+\]
+\texttt{mix\_quantile} solves this numerically:
+\begin{itemize}
+  \item components with $w^F_{ghk} \le 10^{-10} \sum w^F$ are dropped and the remaining weights renormalised;
+  \item \texttt{uniroot} searches the bracket
+    $\bigl[\min (m_{ghk,a} - 8 s_{ghk,a}),\ \max (m_{ghk,a} + 8 s_{ghk,a})\bigr]$, with $s_{ghk,a} = \sqrt{S_{ghk,aa}}$,
+    on which $F_a$ goes from $\approx 0$ to $\approx 1$ (so a root exists, and is unique since $F_a$ is increasing);
+  \item the tolerance is $10^{-6}$ times the bracket width.
+\end{itemize}
+These are quantiles of the forecast \emph{before} $y_t$ is assimilated. The analysis
+quantiles (\texttt{hist\$q}) are computed the same way from the posterior weights and the
+Kalman-updated moments. The forecast quantiles are returned in the output but are not
+currently plotted by any of the experiment scripts.
+
+\end{document}

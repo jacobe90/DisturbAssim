@@ -161,6 +161,7 @@ for (a in 1:3) plot_state(or.fit, a, Ntrue, No, main = pool.names[a], ylab = poo
                           dist.years = td, known = or.known)
 
 plot_process_sd(or.fit, sqrt(diag(Q)), pool.names)
+plot_dropped_mass(or.fit, "Tau learned: dropped forecast components")
 
 ## forecast vs analysis at the disturbance year, leaf vs stem (cf. the Rmd's ensemble-adjustment plot)
 xf <- rmix(or.fit$mixF[[as.character(td)]], 1000); xa <- rmix(or.fit$mixA[[as.character(td)]], 1000)
@@ -186,3 +187,4 @@ cat(sprintf("year %d posterior: %s (tau known %s)\n", td, fmt(or.fit$pK[td, ], d
 cat(sprintf("max P(disturbed) in other years: %.3f\n", max(1 - or.fit$pK[-td, 1])))
 cat(sprintf("process sd, sqrt(E[1/tau]) at year %d: %s (truth %.3f each)\n", NT,
             fmt(sqrt(or.fit$procVar[NT, ])), sqrt(Q[1,1])))
+cat(dropped_summary(or.fit, "tau learned: "), "\n")

@@ -70,7 +70,8 @@ ORJointUpdateFactorized <- function(Y, R, Xic, simulate, nMembers, labels, distu
     pGroup = matrix(NA_real_, NT, H), pit = matrix(NA_real_, NT, d),
     wDrop = rep(NA_real_, NT), procVar = matrix(NA_real_, NT, 3), tauHat = matrix(NA_real_, NT, 3),
     tauAxes = tauAxes, tauMarg = lapply(tauAxes, function(x) matrix(NA_real_, length(x), NT)),
-    nActive = rep(NA_integer_, NT), nBad = rep(NA_integer_, NT), mixF = list(), mixA = list()
+    nActive = rep(NA_integer_, NT), nBad = rep(NA_integer_, NT), mixF = list(), mixA = list(),
+    wDropIS = rep(NA_real_, NT), wDropCov = rep(NA_real_, NT), nNone = rep(NA_integer_, NT)
   )
 
   ## weights of the active grid points: normalised within each block, then 1/3 per block,
@@ -135,11 +136,11 @@ ORJointUpdateFactorized <- function(Y, R, Xic, simulate, nMembers, labels, distu
       rowsP <- as.vector(outer(seq_len(G), (hs - 1) * G, "+"))
       Wl  <- W[rowsP, , drop = FALSE]; cNl <- cN[rowsP]
       for (k in 0:(K1 - 1)) {
-        sim <- sims[[as.character(lab)]][[k + 1]]
+        sim <- sims[[as.character(lab)]][[k + 1]] # N x d
         MU  <- Wl %*% sim
         ctr <- colMeans(sim)
-        Xc  <- sweep(sim, 2, ctr)
-        MUc <- sweep(MU, 2, ctr)
+        Xc  <- sweep(sim, 2, ctr) # N x d
+        MUc <- sweep(MU, 2, ctr)  # (G |hs|) x d: one row per component of these groups
         S   <- (Wl %*% (Xc[, ia] * Xc[, ib]) - MUc[, ia] * MUc[, ib]) / cNl
         S0  <- matrix(as.vector(cov(sim)), nrow(S), d * d, byrow = TRUE)
         tl  <- tg[rep(seq_len(G), length(hs)), , drop = FALSE]
@@ -163,13 +164,15 @@ ORJointUpdateFactorized <- function(Y, R, Xic, simulate, nMembers, labels, distu
 
     beta   <- dist.p[, t]
     piPrev <- block_weights(qs, ax)
-    wPrior <- wPrior0 <- outer(prevW, beta)                              # G x H x K1
-    for (k in 1:K1) wPrior[, , k][dropF] <- 0
-    wPrior[badC] <- 0
-    none <- rowSums(matrix(wPrior, G)) == 0
-    if (any(none)) wPrior[none, , ] <- wPrior0[none, , ]
-    hist$wDrop[t] <- 1 - sum(as.vector(wPrior) * piPrev)
-    hist$nBad[t]  <- sum(badC)
+    # set weights to 0 for components with undefined forecast / singular covariance, and
+    # restore the components of grid points left with no weight (filter-diagnostics.R)
+    dr     <- apply_drops(outer(prevW, beta), dropF, badC, piPrev)        # G x H x K1
+    wPrior <- dr$w
+    hist$wDrop[t]    <- dr$massNet
+    hist$wDropIS[t]  <- dr$massIS
+    hist$wDropCov[t] <- dr$massCov
+    hist$nNone[t]    <- sum(dr$none)
+    hist$nBad[t]     <- sum(badC)
 
     wF <- as.vector(wPrior * piPrev); wF <- wF / sum(wF)
     if (forecastQuantiles)
@@ -313,6 +316,9 @@ compare_report <- function(fits, times, truth, obs, state.names, pool.names, tru
   }
   mtext(sprintf("Marginal tau posterior, year %d", NT), outer = TRUE, font = 2)
   par(op)
+
+  ## dropped forecast mass and zero-mass grid points of each fit (filter-diagnostics.R)
+  for (m in names(fits)) plot_dropped_mass(fits[[m]], sprintf("%s: dropped forecast components", m))
   dev.off()
 
   ## summary
@@ -329,7 +335,9 @@ compare_report <- function(fits, times, truth, obs, state.names, pool.names, tru
       lines.out <- c(lines.out, sprintf("  max |factorized - joint| over years: %.3f", max(abs(ev$factorized[, e] - ev$joint[, e]))))
   }
   lines.out <- c(lines.out, "", sprintf("process sd, sqrt(E[1/tau]) at year %d (truth %s):", NT, paste(sprintf("%.3f", truth.sd), collapse = ", ")),
-                 sapply(learned, function(m) sprintf("  %-10s %s", m, fmt(sqrt(fits[[m]]$procVar[NT, ]), pool.names))))
+                 sapply(learned, function(m) sprintf("  %-10s %s", m, fmt(sqrt(fits[[m]]$procVar[NT, ]), pool.names))),
+                 "", "dropped forecast components:",
+                 sapply(names(fits), function(m) dropped_summary(fits[[m]], sprintf("  %-10s ", m))))
   writeLines(lines.out, file.path(outdir, "summary.txt"))
   cat(lines.out, sep = "\n")
   saveRDS(list(fits = lapply(fits, function(f) f[setdiff(names(f), c("mixF", "mixA"))]), times = times,

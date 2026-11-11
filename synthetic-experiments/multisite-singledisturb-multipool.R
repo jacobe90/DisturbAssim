@@ -14,8 +14,12 @@
 ##   - four history groups (the scenario at the last step)
 ##   - the process error is diag(1/tau_leaf, 1/tau_soil, 1/tau_stem) at both sites: one
 ##     3-D tau grid shared by the two sites, as the truth uses the same Q at both
-##   - disturbance() resets leaf and stem, so they get no process variance under a
-##     disturbance at that site; the soil keeps its full process variance
+##   - the disturbance is the proportional harvest of singlesite-singledisturb-multipool.R
+##     (in the truth and the filter): leaf and stem keep a fraction ~ mu0 = 0.1 of their
+##     biomass (sd 0.15, never more than before) and alloc.soil = 0.25 of the removed biomass
+##     goes to the soil. The process error is added before the disturbance, so a disturbed
+##     site's leaf and stem process variance is scaled by mu0^2; the soil keeps its full
+##     process variance. (The Rmd instead resets leaf and stem to an absolute draw.)
 ##   - each importance sample takes one random ensemble member's parameters and driver for
 ##     both sites every year, so a systematic gap between the true member and the
 ##     ensemble shows up as extra process error. oracle <- TRUE gives every member the
@@ -27,7 +31,7 @@
 
 library(BayesianTools)
 library(mvnfast)
-source("disturbance.R")                              # tobit, disturbance
+source("disturbance.R")                              # tobit
 source("synthetic-experiments/or-joint-update-filter.R")
 
 oracle <- FALSE   ## TRUE: every ensemble member uses the true parameters and driver
@@ -77,6 +81,21 @@ pool.names = c("Cleaf","Csoil","Cstem")
 state.names = paste(rep(pool.names, nsite), rep(paste("site", 1:nsite), each = 3))
 scen.names = c("none", "site 1", "site 2", "both")
 
+## disturbance (proportional, as singlesite-singledisturb-multipool.R) applied to every row
+## of X (n x 3 pools of one site): keeps a fraction ~ mu0 of leaf and stem (they can only
+## decrease) and moves alloc.soil of the removed biomass to the soil
+mu0 <- c(0.1,0.1)               ## mean leaf & stem biomass after disturbance as % of original
+V0  <- diag(c(0.15,0.15))^2     ## var in post disturbance leaf and stem biomass
+alloc.soil <- 0.25              ## fraction of removed C that goes in the soil
+disturbance.rows <- function(X){
+  old.biomass <- X[, c(1,3), drop = FALSE]
+  new.biomass <- old.biomass * rep(mu0, each = nrow(X)) + mvtnorm::rmvnorm(nrow(X), c(0,0), V0)
+  new.biomass <- pmin(tobit(new.biomass), old.biomass)
+  X[, c(1,3)] <- new.biomass
+  X[, 2] <- X[, 2] + rowSums(old.biomass - new.biomass)*alloc.soil
+  X
+}
+
 ## pseudodata
 No = matrix(NA,NT,3*nsite)
 Ntrue = matrix(NA,NT,3*nsite)
@@ -92,7 +111,7 @@ for(t in 1:NT){
     ref.mu = VSEM(refpar[s,],PAR[met[true],tsel])[365,2:4]
     ref.f[[s]]  = mvtnorm::rmvnorm(1,ref.mu,Q)
     if(D.true[s,t]){
-      ref.f[[s]] = disturbance(ref.f[[s]])
+      ref.f[[s]] = disturbance.rows(ref.f[[s]])
     }
     ref.f[[s]] = tobit(ref.f[[s]])
     refpar[s,9:11] = ref.f[[s]]
@@ -115,16 +134,7 @@ p.both <- mvtnorm::pmvnorm(lower = c(cut, cut), upper = c(Inf, Inf), sigma = SIG
 p.one  <- 1 - pnorm(cut, sd = sqrt(SIGMA[1, 1])) - p.both          # one site only (each)
 p.scen <- c(1 - 2 * p.one - p.both, p.one, p.one, p.both)
 
-## disturbance (absolute leaf / stem draw, from disturbance.R) applied to every row of X
-## (n x 3): defaults mu0 = c(1, 1), V0 = diag(c(0.15, 0.25))^2, alloc.soil = 0.25
-mu0 <- c(1,1); V0 <- diag(c(0.15,0.25))^2; alloc.soil <- 0.25
-disturbance.rows <- function(X){
-  old.biomass <- X[, c(1,3), drop = FALSE]
-  new.biomass <- pmin(tobit(mvtnorm::rmvnorm(nrow(X), mu0, V0)), old.biomass)
-  X[, c(1,3)] <- new.biomass
-  X[, 2] <- X[, 2] + rowSums(old.biomass - new.biomass)*alloc.soil
-  X
-}
+## the disturbance of each scenario, applied to the disturbed sites' columns
 site.cols <- lapply(1:nsite, function(s) 3*(s-1) + 1:3)
 scen.sites <- list(integer(0), 1, 2, 1:2)            # disturbed sites of scenario k = 0..3
 disturb <- function(x, k) {
@@ -146,10 +156,10 @@ simulate <- function(x, t, label, mem) {
   out
 }
 
-## process variance under each scenario: none for leaf / stem of a disturbed site
+## process variance under each scenario: scaled by mu0^2 for leaf / stem of a disturbed site
 procScale <- t(sapply(scen.sites, function(ss) {
   v <- rep(1, 3*nsite)
-  for (s in ss) v[site.cols[[s]][c(1, 3)]] <- 0
+  for (s in ss) v[site.cols[[s]][c(1, 3)]] <- mu0^2
   v
 }))
 
@@ -188,6 +198,7 @@ for (a in 1:(3*nsite)) plot_state(or.fit, a, Ntrue, No, main = state.names[a], y
                                   dist.years = td, known = or.known)
 
 plot_process_sd(or.fit, sqrt(diag(Q)), pool.names)
+plot_dropped_mass(or.fit, "Tau learned: dropped forecast components")
 
 ## forecast vs analysis at the disturbance year, site 1 leaf vs stem (cf. the Rmd's ensemble-adjustment plot)
 xf <- rmix(or.fit$mixF[[as.character(td)]], 1000); xa <- rmix(or.fit$mixA[[as.character(td)]], 1000)
@@ -218,3 +229,4 @@ cat(sprintf("max P(site 1 disturbed) in other years %.3f; max P(site 2 disturbed
             max(pSite(or.fit)[-td, 1]), max(pSite(or.fit)[, 2])))
 cat(sprintf("process sd, sqrt(E[1/tau]) at year %d: %s (truth %.3f each)\n", NT,
             fmt(sqrt(or.fit$procVar[NT, ]), pool.names), sqrt(Q[1,1])))
+cat(dropped_summary(or.fit, "tau learned: "), "\n")

@@ -12,6 +12,8 @@
 ##
 ## Usage: source("synthetic-experiments/or-joint-update-filter.R") from the repository root.
 
+source("synthetic-experiments/filter-diagnostics.R")   # apply_drops, plot_dropped_mass
+
 qs5 <- c(0.025, 0.25, 0.5, 0.75, 0.975)
 
 # Quantiles of a 1-d Gaussian mixture sum_i w_i N(mu_i, sd_i^2), by root-finding on its
@@ -180,7 +182,9 @@ project_groups <- function(w, mu, sig, grp, H) {
 ##'   pK (NT x (K+1)) posterior probability of each scenario at that step,
 ##'   pGroup (NT x H) posterior weight of each history group after the step,
 ##'   pit (NT x d) marginal one-step-ahead PIT, wDrop (forecast weight of dropped
-##'   components), nBad (components dropped for a singular covariance), procVar (NT x 3) = E[1/tau],
+##'   components, net of restored grid points), wDropIS / wDropCov (forecast weight dropped for
+##'   collapsed importance weights / a singular covariance), nNone (grid points left with no
+##'   weight, restored), nBad (components dropped for a singular covariance), procVar (NT x 3) = E[1/tau],
 ##'   tauAxes, tauMarg (per-axis marginal posterior, G_a x NT), nActive, and mixF / mixA
 ##'   (list of w, mu, sig at the keepMix steps)
 ORJointUpdateGeneral <- function(Y, R, Xic, simulate, nMembers, labels, disturb, dist.p,
@@ -208,7 +212,8 @@ ORJointUpdateGeneral <- function(Y, R, Xic, simulate, nMembers, labels, disturb,
     pK = matrix(NA_real_, NT, K1), pGroup = matrix(NA_real_, NT, H), pit = matrix(NA_real_, NT, d),
     wDrop = rep(NA_real_, NT), procVar = matrix(NA_real_, NT, 3), tauAxes = tauAxes,
     tauMarg = lapply(tauAxes, function(x) matrix(NA_real_, length(x), NT)),
-    nActive = rep(NA_integer_, NT), nBad = rep(NA_integer_, NT), mixF = list(), mixA = list()
+    nActive = rep(NA_integer_, NT), nBad = rep(NA_integer_, NT), mixF = list(), mixA = list(),
+    wDropIS = rep(NA_real_, NT), wDropCov = rep(NA_real_, NT), nNone = rep(NA_integer_, NT)
   )
 
   for (t in 1:NT) {
@@ -295,15 +300,16 @@ ORJointUpdateGeneral <- function(Y, R, Xic, simulate, nMembers, labels, disturb,
 
     beta   <- dist.p[, t]
     piPrev <- exp(qs - max(qs)); piPrev <- piPrev / sum(piPrev)
-    wPrior <- wPrior0 <- outer(prevW, beta)                              # G x H x K1
-    for (k in 1:K1) wPrior[, , k][dropF] <- 0
-    wPrior[badC] <- 0
-    # a grid point left with no usable component keeps its placeholder moments at their
-    # prior weights rather than dropping out
-    none <- rowSums(matrix(wPrior, G)) == 0
-    if (any(none)) wPrior[none, , ] <- wPrior0[none, , ]
-    hist$wDrop[t] <- 1 - sum(as.vector(wPrior) * piPrev)                # forecast weight dropped
-    hist$nBad[t]  <- sum(badC)
+    # drop the collapsed and singular components; a grid point left with no usable
+    # component keeps its placeholder moments at their prior weights rather than dropping
+    # out (filter-diagnostics.R)
+    dr     <- apply_drops(outer(prevW, beta), dropF, badC, piPrev)        # G x H x K1
+    wPrior <- dr$w
+    hist$wDrop[t]    <- dr$massNet                                       # forecast weight dropped
+    hist$wDropIS[t]  <- dr$massIS
+    hist$wDropCov[t] <- dr$massCov
+    hist$nNone[t]    <- sum(dr$none)
+    hist$nBad[t]     <- sum(badC)
 
     wF <- as.vector(wPrior * piPrev); wF <- wF / sum(wF)
     if (forecastQuantiles)

@@ -194,6 +194,7 @@ for (a in 1:3) plot_state(or.fit, a, Ntrue, No, main = pool.names[a], ylab = poo
                           dist.years = td, known = or.known)
 
 plot_process_sd(or.fit, sqrt(diag(Q)), pool.names)
+plot_dropped_mass(or.fit, "Tau learned: dropped forecast components")
 
 ## forecast vs analysis at the disturbance year, leaf vs stem
 xf <- rmix(or.fit$mixF[[as.character(td)]], 1000); xa <- rmix(or.fit$mixA[[as.character(td)]], 1000)
@@ -223,3 +224,4 @@ cat(sprintf("P(PFT 2): before year %d max %.3f, from year %d min %.3f (tau known
             max(pPFT2(or.known)[1:(td-1)]), min(pPFT2(or.known)[td:NT])))
 cat(sprintf("process sd, sqrt(E[1/tau]) at year %d: %s (truth %.3f each)\n", NT,
             fmt(sqrt(or.fit$procVar[NT, ])), sqrt(Q[1,1])))
+cat(dropped_summary(or.fit, "tau learned: "), "\n")

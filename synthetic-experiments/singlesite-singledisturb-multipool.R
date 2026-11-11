@@ -34,6 +34,7 @@
 
 library(BayesianTools)
 library(mvnfast)
+source("synthetic-experiments/filter-diagnostics.R")   # apply_drops, plot_dropped_mass
 
 if (!exists("seed", inherits = FALSE))   seed   <- 42
 if (!exists("outdir", inherits = FALSE)) outdir <- "experiments/synthetic/singlesite-singledisturb-multipool"
@@ -316,7 +317,9 @@ project_grid <- function(w, mu, sig) {
 ##'   maximum are dropped for the rest of the run (their weight is < exp(-pruneLog))
 ##' @return list with, marginalised over the tau posterior and the mixture components:
 ##'   mean (NT x 3), q / fq (5 x NT x 3 analysis / forecast quantiles at qs5), pDist,
-##'   pit (NT x 3, marginal one-step-ahead PIT of each observed pool), wDrop,
+##'   pit (NT x 3, marginal one-step-ahead PIT of each observed pool), wDrop / wDropIS (forecast
+##'   weight dropped for collapsed importance weights, net of / before restoring grid points
+##'   left with none), nNone (such grid points),
 ##'   procVar (NT x 3) = E[1/tau | y_{1:t}] per pool, tauAxes, tauMarg (per-pool marginal
 ##'   posterior on its axis, G_a x NT), tauJoint (per-t joint posterior on the 3-D grid:
 ##'   idx = axis indices of the active grid points, w = their weights), nActive (grid
@@ -341,7 +344,8 @@ ORJointUpdateMP <- function(Y, R, PAR, met, THETA, Xic, dist, N = 100, prior, gr
 
   hist <- list(
     mean = matrix(NA_real_, NT, 3), q = array(NA_real_, c(5, NT, 3)), fq = array(NA_real_, c(5, NT, 3)),
-    pDist = rep(NA_real_, NT), pit = matrix(NA_real_, NT, 3), wDrop = rep(NA_real_, NT),
+    pDist = rep(NA_real_, NT), pit = matrix(NA_real_, NT, 3), wDrop = rep(NA_real_, NT), wDropIS = rep(NA_real_, NT),
+    wDropCov = rep(0, NT), nBad = rep(0L, NT), nNone = rep(NA_integer_, NT),
     procVar = matrix(NA_real_, NT, 3), tauAxes = tauAxes,
     tauMarg = lapply(tauAxes, function(x) matrix(NA_real_, length(x), NT)), tauJoint = vector("list", NT),
     nActive = rep(NA_integer_, NT), mixF = vector("list", NT), mixA = vector("list", NT)
@@ -426,9 +430,14 @@ ORJointUpdateMP <- function(Y, R, PAR, met, THETA, Xic, dist, N = 100, prior, gr
 
     beta   <- dist$p[, t]
     piPrev <- exp(qs - max(qs)); piPrev <- piPrev / sum(piPrev)          # pi_{t-1}(g)
-    hist$wDrop[t] <- sum(piPrev * rowSums(prevW * dropF))
-    wPrior <- outer(prevW, beta)                                         # G x 2 x (D+1)
-    for (k in 0:D) wPrior[, , k + 1][dropF] <- 0
+    # drop components with collapsed importance weights; a grid point left with none keeps
+    # its (placeholder) components at their prior weights (filter-diagnostics.R). This
+    # filter has no singular-covariance check.
+    dr     <- apply_drops(outer(prevW, beta), dropF, NULL, piPrev)        # G x 2 x (D+1)
+    wPrior <- dr$w
+    hist$wDrop[t]   <- dr$massNet
+    hist$wDropIS[t] <- dr$massIS
+    hist$nNone[t]   <- sum(dr$none)
 
     # forecast mixture, marginalised over pi_{t-1}
     wF <- as.vector(wPrior * piPrev); wF <- wF / sum(wF)
@@ -690,6 +699,8 @@ points(True_states[td, 1], True_states[td, 3], cex = 2, pch = 4, lwd = 2)
 legend("topleft", legend = c("forecast", "analysis", "data", "truth"), pch = c(1, 3, 18, 4),
        col = c(1, 2, "purple", 1))
 
+plot_dropped_mass(or.fit, "Multinomial filter, tau learned: dropped forecast components")
+
 dev.off()
 
 ## the tau-correlation pages on their own (pdf: the quartz png device crashes in the seed
@@ -717,3 +728,4 @@ cat(sprintf("P(disturbed) at year %d: %.3f (tau known %.3f); max elsewhere %.3f\
             td, or.fit$pDist[td], or.known$pDist[td], max(or.fit$pDist[-td])))
 cat(sprintf("process sd, sqrt(E[1/tau]) at year %d: %s (truth %s)\n", NYears,
             fmt(sqrt(or.fit$procVar[NYears, ])), paste(sprintf("%.3f", sqrt(diag(Q))), collapse = ", ")))
+cat(dropped_summary(or.fit, "tau learned: "), "\n")
