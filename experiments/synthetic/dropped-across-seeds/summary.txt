@@ -1,0 +1,26 @@
+Factorized-tau filter: dropped forecast components across seeds (2026-11-11 11:16)
+
+singlesite-singledisturb-multipool
+  seeds 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,42
+  steps with dropped mass 0 of 525 (importance 0, covariance 0); max 0; seeds affected: none
+  zero-mass grid points 0 in 0 steps; seeds affected: none
+  run time per seed (set-up + filter): 0.04 min on average
+
+singlesite-multidisturb-multipool
+  seeds 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,42
+  steps with dropped mass 0 of 525 (importance 0, covariance 0); max 0; seeds affected: none
+  zero-mass grid points 0 in 0 steps; seeds affected: none
+  run time per seed (set-up + filter): 0.07 min on average
+
+singlesite-multidisturb-multipool-multipft
+  seeds 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,42
+  steps with dropped mass 1 of 525 (importance 1, covariance 0); max 5.04e-248; seeds affected: 5
+  zero-mass grid points 0 in 0 steps; seeds affected: none
+  run time per seed (set-up + filter): 0.08 min on average
+
+multisite-singledisturb-multipool
+  seeds 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,42
+  steps with dropped mass 0 of 525 (importance 0, covariance 0); max 0; seeds affected: none
+  zero-mass grid points 0 in 0 steps; seeds affected: none
+  run time per seed (set-up + filter): 0.10 min on average
+

@@ -185,7 +185,9 @@ project_groups <- function(w, mu, sig, grp, H) {
 ##'   components, net of restored grid points), wDropIS / wDropCov (forecast weight dropped for
 ##'   collapsed importance weights / a singular covariance), nNone (grid points left with no
 ##'   weight, restored), nBad (components dropped for a singular covariance), procVar (NT x 3) = E[1/tau],
-##'   tauAxes, tauMarg (per-axis marginal posterior, G_a x NT), nActive, and mixF / mixA
+##'   tauAxes, tauMarg (per-axis marginal posterior, G_a x NT), tauJoint (per-step joint
+##'   posterior on the grid: idx = axis indices of the active grid points, w = their weights),
+##'   nActive, and mixF / mixA
 ##'   (list of w, mu, sig at the keepMix steps)
 ORJointUpdateGeneral <- function(Y, R, Xic, simulate, nMembers, labels, disturb, dist.p,
                                  procScale, transition, w0, poolOf, prior, grid, N = 1000,
@@ -213,7 +215,8 @@ ORJointUpdateGeneral <- function(Y, R, Xic, simulate, nMembers, labels, disturb,
     wDrop = rep(NA_real_, NT), procVar = matrix(NA_real_, NT, 3), tauAxes = tauAxes,
     tauMarg = lapply(tauAxes, function(x) matrix(NA_real_, length(x), NT)),
     nActive = rep(NA_integer_, NT), nBad = rep(NA_integer_, NT), mixF = list(), mixA = list(),
-    wDropIS = rep(NA_real_, NT), wDropCov = rep(NA_real_, NT), nNone = rep(NA_integer_, NT)
+    wDropIS = rep(NA_real_, NT), wDropCov = rep(NA_real_, NT), nNone = rep(NA_integer_, NT),
+    tauJoint = vector("list", NT)
   )
 
   for (t in 1:NT) {
@@ -331,6 +334,7 @@ ORJointUpdateGeneral <- function(Y, R, Xic, simulate, nMembers, labels, disturb,
     qs <- qs + logz
     ws <- exp(qs - max(qs)); ws <- ws / sum(ws)
     hist$procVar[t, ] <- colSums(ws / tg)
+    hist$tauJoint[[t]] <- list(idx = gridIdx[active, , drop = FALSE], w = ws)
     for (a in 1:3) {
       m <- numeric(length(tauAxes[[a]]))
       s <- rowsum(ws, gridIdx[active, a])

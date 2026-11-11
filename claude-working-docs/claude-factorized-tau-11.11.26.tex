@@ -1,0 +1,210 @@
+\documentclass[aspectratio=169,14pt]{beamer}
+\usetheme{default}
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{footline}[frame number]
+\setbeamerfont{frametitle}{size=\Large,series=\bfseries}
+\setbeamercolor{frametitle}{fg=black}
+\usepackage{amsmath,amssymb,booktabs,graphicx,catchfile}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\tauhat}{\hat\tau}
+\newcommand{\code}[1]{\texttt{\small #1}}
+\newcommand{\dir}{claude-factorized-tau-11.11.26-files}
+% table rows written by claude-factorized-tau-11.11.26-analysis.R
+\CatchFileDef{\tablerowsgrid}{\dir/rows-grid.tex}{}
+\CatchFileDef{\tablerowsdep}{\dir/rows-dep.tex}{}
+\CatchFileDef{\tablerowsagreeP}{\dir/rows-agreeP.tex}{}
+\CatchFileDef{\tablerowsagreeSD}{\dir/rows-agreeSD.tex}{}
+\newcommand{\DroppedSummary}{\textbf{1} step of 2100, mass $5\times10^{-248}$ (PFT switching, seed 5)}
+
+\title{Factorized $\tau$ posterior}
+\subtitle{one 1-D grid per process precision instead of a 3-D grid}
+\author{Claude}
+\date{November 11, 2026}
+
+\begin{document}
+
+\begin{frame}
+  \titlepage
+\end{frame}
+
+%---------------------------------------------------------------------------
+\begin{frame}{Setting: $\tau$ learned on a grid}
+  Process error, per pool:
+  \[
+    Q = \operatorname{diag}\!\left(\tfrac{1}{\tau_1},\ \tfrac{1}{\tau_2},\ \tfrac{1}{\tau_3}\right)
+  \]
+  Each grid point $\tau^{(g)}$ runs its own mixture filter; its weight is updated by
+  \[
+    \pi_t(g) \;\propto\; \pi_{t-1}(g)\; p\!\left(y_t \mid \tau^{(g)}, y_{1:t-1}\right)
+  \]
+  3-D product grid: \quad $G_1 G_2 G_3$ filters \quad ($16^3 = 4096$)
+\end{frame}
+
+%---------------------------------------------------------------------------
+\begin{frame}{Factorized: one block per axis}
+  Block $a$: \;$\tau_a$ on its own grid, the others at plug-in values
+  \[
+    \tau^{(a,g)} = \big(\tau_a^{(g)},\ \tauhat_{-a}\big),
+    \qquad
+    \tauhat_b = \frac{1}{\E_{\pi_b}\!\left[1/\tau_b\right]} = \Big(\sum_g \frac{\pi_b(g)}{\tau_b^{(g)}}\Big)^{-1}
+  \]
+  \[
+    \pi_{a,t}(g) \;\propto\; \pi_{a,t-1}(g)\; p\!\left(y_t \mid \tau^{(a,g)}, y_{1:t-1}\right)
+  \]
+  \[
+    G_1 + G_2 + G_3 \text{ filters} \qquad (16 \cdot 3 = 48)
+  \]
+\end{frame}
+
+%---------------------------------------------------------------------------
+\begin{frame}{Factorized: what it assumes, and how it summarizes}
+  Assumes the posterior is close to a product, and each conditional is near its plug-in:
+  \[
+    p(\tau \mid y_{1:t}) \;\approx\; \prod_{a=1}^{3} p(\tau_a \mid y_{1:t}),
+    \qquad
+    p(\tau_a \mid y_{1:t}) \approx \pi_{a,t}
+  \]
+  State and scenario summaries average the three blocks:
+  \[
+    p(x_t, k \mid y_{1:t}) \;\approx\; \frac{1}{3}\sum_{a=1}^{3}\sum_{g} \pi_{a,t}(g)\;
+      p\!\left(x_t, k \mid \tau^{(a,g)}, y_{1:t}\right)
+  \]
+\end{frame}
+
+%---------------------------------------------------------------------------
+\begin{frame}{Metrics: is the joint posterior a product?}
+  From the 3-D grid posterior $\pi_t(i,j)$ of each pair $(\tau_a, \tau_b)$:
+  \[
+    \rho_{ab} = \frac{\operatorname{Cov}_\pi(\log\tau_a, \log\tau_b)}
+                     {\sqrt{\operatorname{Var}_\pi(\log\tau_a)\,\operatorname{Var}_\pi(\log\tau_b)}}
+  \]
+  \[
+    I(\tau_a;\tau_b) = \sum_{i,j}\pi(i,j)\,\log\frac{\pi(i,j)}{\pi_a(i)\,\pi_b(j)}
+      = \mathrm{KL}\big(\pi_{ab}\,\|\,\pi_a\pi_b\big) \;\ge 0
+  \]
+  \[
+    \mathrm{TV}\big(\pi_{ab},\,\pi_a\pi_b\big) \;\le\; \sqrt{I/2}
+    \qquad\text{(Pinsker)}
+  \]
+  {\small $\log\tau$: the grid and prior are log-uniform; $\rho$ is scale-free. $I = 0$ iff independent (nats).}
+\end{frame}
+
+%---------------------------------------------------------------------------
+\begin{frame}{Result 1: the $\tau$ pairs are nearly independent}
+  {\small 21 seeds $\times$ 25 years $\times$ 3 pairs per experiment, 3-D grid posterior}
+  \begin{center}
+  \small
+  \begin{tabular}{lcccc}
+    \toprule
+    & \multicolumn{2}{c}{$|\rho_{ab}|$} & \multicolumn{2}{c}{$I(\tau_a;\tau_b)$ (nats)} \\
+    experiment & median & max & median & max \\
+    \midrule
+    \tablerowsdep
+    \bottomrule
+  \end{tabular}
+  \end{center}
+\end{frame}
+
+%---------------------------------------------------------------------------
+\begin{frame}{Result 1: every seed, year and pair}
+  \begin{center}
+    \includegraphics[width=0.92\textwidth]{\dir/dependence.pdf}
+  \end{center}
+  {\footnotesize Median $|\rho| \le 0.03$, median $I \le 0.003$ nats. Largest $I = 0.13$ nats $\Rightarrow$ $\mathrm{TV}(\pi_{ab},\pi_a\pi_b) \le \sqrt{0.13/2} = 0.25$.}
+\end{frame}
+
+%---------------------------------------------------------------------------
+\begin{frame}{Metrics: does the factorized filter agree with the 3-D grid?}
+  {\small Same set-up and importance samples for both filters:}
+  \[
+    \Delta_P = \max_t \left|\, P_{\text{fact}}(k \ne 0 \mid y_{1:t}) - P_{\text{3-D}}(k \ne 0 \mid y_{1:t}) \,\right|
+  \]
+  \[
+    \Delta_{\sigma,a} = \left|\, \log \frac{\sigma_a^{\text{fact}}}{\sigma_a^{\text{3-D}}} \,\right|,
+    \qquad
+    \sigma_a = \sqrt{\E\!\left[1/\tau_a \mid y_{1:T}\right]}
+  \]
+  \[
+    z_a = \frac{\Delta_{\sigma,a}}{\operatorname{sd}_{\text{3-D}}(\log \sigma_a \mid y_{1:T})}
+  \]
+  {\small Baseline: the same $\Delta$s between two 3-D grid runs with different importance samples
+  (the filter's own Monte Carlo noise). $\Delta_\sigma = 0.1$: a 10\% difference; $z$: in posterior sds.}
+\end{frame}
+
+%---------------------------------------------------------------------------
+\begin{frame}{Result 2: 9--16$\times$ faster}
+  \begin{center}
+  \begin{tabular}{lccc}
+    \toprule
+    & \multicolumn{2}{c}{grid points} & \\
+    experiment & factorized & 3-D & speed-up \\
+    \midrule
+    \tablerowsgrid
+    \bottomrule
+  \end{tabular}
+  \end{center}
+  {\footnotesize Speed-up: median ratio of filter run times (3-D / factorized), 21 seeds.}
+\end{frame}
+
+%---------------------------------------------------------------------------
+\begin{frame}{Result 3: disturbance probabilities agree to within Monte Carlo noise}
+  \begin{center}
+  \begin{tabular}{lcccc}
+    \toprule
+    & \multicolumn{2}{c}{$\Delta_P$: fact.\ vs 3-D} & \multicolumn{2}{c}{baseline: 3-D vs 3-D} \\
+    experiment & median & max & median & max \\
+    \midrule
+    \tablerowsagreeP
+    \bottomrule
+  \end{tabular}
+  \end{center}
+  {\footnotesize 21 seeds per experiment; max over the 25 years of each run.}
+\end{frame}
+
+%---------------------------------------------------------------------------
+\begin{frame}{Result 4: process sd differs no more than Monte Carlo noise}
+  \begin{center}
+  \small
+  \begin{tabular}{lcccccc}
+    \toprule
+    & \multicolumn{2}{c}{$\Delta_\sigma$: fact.\ vs 3-D} & \multicolumn{2}{c}{baseline: 3-D vs 3-D} & \multicolumn{2}{c}{$z$} \\
+    experiment & median & max & median & max & median & $>1$ \\
+    \midrule
+    \tablerowsagreeSD
+    \bottomrule
+  \end{tabular}
+  \end{center}
+  {\footnotesize 21 seeds $\times$ 3 pools per experiment, at year 25.}
+\end{frame}
+
+%---------------------------------------------------------------------------
+\begin{frame}{Results 3--4: every seed}
+  \begin{center}
+    \includegraphics[width=\textwidth]{\dir/agreement.pdf}
+  \end{center}
+  {\footnotesize Left: $P(\text{disturbed})$ per year. Right: $\sigma_a$ at year 25, per pool and seed. Line: equality.}
+\end{frame}
+
+%---------------------------------------------------------------------------
+\begin{frame}{Numerical health}
+  Factorized filter, 21 seeds $\times$ 4 experiments $\times$ 25 years
+  (\code{experiments/synthetic/dropped-across-seeds}):
+  \begin{itemize}
+    \item forecast mass dropped (collapsed weights or singular covariance): \DroppedSummary
+    \item grid points left with zero mass after dropping: \textbf{none}
+  \end{itemize}
+\end{frame}
+
+%---------------------------------------------------------------------------
+\begin{frame}{Summary}
+  \begin{itemize}
+    \item The joint $\tau$ posterior is close to a product: median $|\rho_{ab}| \le 0.03$, $I \le 0.13$ nats.
+    \item Factorized vs 3-D grid differences ($\Delta_P$, $\Delta_\sigma$) are the size of the
+          differences between two 3-D grid runs with other importance samples.
+    \item Process-sd differences are small against the posterior width: median $z \le 0.21$;
+          $z > 1$ in 2 of 252 seed--pool cases.
+    \item Cost: $\sum_a G_a$ instead of $\prod_a G_a$ grid points, 9--16$\times$ faster.
+  \end{itemize}
+\end{frame}
+
+\end{document}

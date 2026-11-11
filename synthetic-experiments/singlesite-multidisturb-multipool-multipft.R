@@ -30,7 +30,8 @@ source("synthetic-experiments/or-joint-update-filter.R")
 oracle <- FALSE   ## TRUE: every ensemble member uses the true parameters and driver
 outdir <- file.path("experiments/synthetic", if (oracle) "singlesite-multidisturb-multipool-multipft-oracle" else "singlesite-multidisturb-multipool-multipft")
 if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
-set.seed(42)
+if (!exists("seed", inherits = FALSE)) seed <- 42   ## a runner may set seed first
+set.seed(seed)
 
 ## ---- Set-up (as in the Rmd) ------------------------------------------------------------
 ne = 200     ## number of ensemble members
