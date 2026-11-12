@@ -6,10 +6,13 @@
 \setbeamerfont{frametitle}{size=\Large,series=\bfseries}
 \setbeamercolor{frametitle}{fg=black}
 \setbeamercolor{structure}{fg=black!75}
-\usepackage{amsmath,amssymb,booktabs,graphicx,tikz}
+\usepackage{amsmath,amssymb,booktabs,graphicx,tikz,catchfile}
 \usetikzlibrary{arrows.meta,positioning}
 \newcommand{\dir}{claude-filter-explainer-11.12.26-files}
 \input{\dir/numbers.tex}   % written by claude-filter-explainer-11.12.26-figures.R
+\input{\dir/numbers-fullgrid.tex}   % written by claude-filter-explainer-11.12.26-fullgrid.R
+\CatchFileDef{\rowsfullgrid}{\dir/rows-fullgrid.tex}{}
+\CatchFileDef{\rowsfullgridcompare}{\dir/rows-fullgrid-compare.tex}{}
 \newcommand{\N}{\mathcal{N}}
 \newcommand{\muted}[1]{{\color{black!55}#1}}
 \definecolor{fc}{HTML}{EB6834}
@@ -290,6 +293,82 @@
 \end{frame}
 
 %---------------------------------------------------------------------------
+\begin{frame}{OR full grid: set-up and metrics}
+  All 538 sites $\times$ 4 observation-error models $\times$ with / without the disturbance product
+  = \FGRuns{} runs, with the defaults: bias correction on, process error propagated through
+  the disturbance, gamma prior on $\tau$. \muted{About 15 minutes on 8 cores.}
+  \medskip
+  \begin{itemize}\small
+    \item \textbf{PIT in 95\% / 50\%}: share of observations inside the central 95\% / 50\% of their
+          one-step-ahead forecast \muted{(calibrated: 95\% / 50\%)}
+    \item \textbf{final in band}: last observation inside the 95\% analysis band
+    \item \textbf{detect, loss $>$ 3}: $P(\text{disturbed}) > 0.5$ in years where observed wood fell
+          by more than 3 kg C m$^{-2}$ (\FGNBig{} site-years)
+    \item \textbf{detect, flagged}: $P(\text{disturbed}) > 0.5$ in the years the product flags
+    \item \textbf{false alarm}: $P(\text{disturbed}) > 0.5$ in unflagged years with $|$change$| < 0.5$ (\FGNQuiet{} site-years)
+    \item \textbf{process sd}: median over sites of $\sqrt{\mathbb{E}[1/\tau \mid y]}$ in 2017 (kg C m$^{-2}$)
+  \end{itemize}
+\end{frame}
+
+%---------------------------------------------------------------------------
+\begin{frame}{OR full grid: results by setting}
+  \centering\footnotesize\setlength{\tabcolsep}{4pt}
+  \begin{tabular}{llccccccc}
+    \toprule
+    & & \multicolumn{2}{c}{PIT in} & final & \multicolumn{2}{c}{detect} & false & process \\
+    observation error & product & 95\% & 50\% & in band & loss $>$ 3 & flagged & alarm & sd \\
+    \midrule
+    \rowsfullgrid
+    \bottomrule
+  \end{tabular}
+  \smallskip
+  \begin{itemize}\scriptsize
+    \item Forecasts are too wide everywhere (60--90\% in the central 50\%), most with LandTrendr's larger $R$.
+    \item Large losses are found without the product under GEDI errors (89--99\%); LandTrendr's larger
+          $R$ hides some (60--68\%). No false alarms in quiet years.
+    \item Many product-flagged years show little wood loss; under GEDI's small $R$ the data overrule the product.
+  \end{itemize}
+\end{frame}
+
+%---------------------------------------------------------------------------
+\begin{frame}{OR full grid: forecast calibration}
+  \centering
+  \includegraphics[width=\textwidth]{\dir/fullgrid-pit.pdf}\\[2pt]
+  {\footnotesize PIT of every observation after the first, all 538 sites. A calibrated forecast gives a flat
+  histogram (dashed). The hump means the forecasts are too wide; it is largest with LandTrendr's $R$.}
+\end{frame}
+
+%---------------------------------------------------------------------------
+\begin{frame}{OR full grid: detection}
+  \centering
+  \includegraphics[width=\textwidth]{\dir/fullgrid-detection.pdf}\\[2pt]
+  {\footnotesize Every site-year, 1991--2012, GEDI heteroskedastic $R$. Without the product, $P(\text{disturbed})$
+  jumps to 1 once the loss passes about 1--2 kg C m$^{-2}$. With it, flagged years with no visible loss
+  get intermediate probabilities: the prior says disturbed, the data disagree.}
+\end{frame}
+
+%---------------------------------------------------------------------------
+\begin{frame}{Does propagating the process error matter?}
+  Averages over the 8 settings; the earlier grid gave disturbed components no process error:
+  \medskip
+
+  \centering\footnotesize
+  \begin{tabular}{lccccccc}
+    \toprule
+    process error & \multicolumn{2}{c}{PIT in} & final & \multicolumn{2}{c}{detect} & false & process \\
+    after disturbance & 95\% & 50\% & in band & loss $>$ 3 & flagged & alarm & sd \\
+    \midrule
+    \rowsfullgridcompare
+    \bottomrule
+  \end{tabular}
+  \bigskip
+
+  \raggedright\small
+  Almost no difference. The added variance, $\mu_0^2 / \tau \lesssim 0.02$, is small next to the spread
+  of the disturbance size itself: $V_0 \cdot \text{old}^2$ is roughly 1--30 for a 15 kg C m$^{-2}$ stand.
+\end{frame}
+
+%---------------------------------------------------------------------------
 \begin{frame}{Summary}
   \begin{itemize}
     \item The posterior is a mixture: 2 Gaussians per process-error grid point, plus a weight per grid point.
@@ -300,6 +379,8 @@
     \item Collapse to 2 Gaussians per grid point keeps the cost fixed over time.
     \item Summaries average over everything: $P(\text{disturbed})$, mixture-quantile credible bands,
           the posterior of the process sd.
+    \item On the OR grid: large losses are detected without false alarms, but the one-step-ahead
+          forecasts are too wide; propagating the process error through the disturbance changes little.
   \end{itemize}
 \end{frame}
 
